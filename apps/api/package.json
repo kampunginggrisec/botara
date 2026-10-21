@@ -1,0 +1,19 @@
+{
+  "name": "@botara/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "hono": "^4.6.0",
+    "@hono/zod-openapi": "^0.18.0",
+    "zod": "^3.24.0",
+    "@botara/config": "workspace:*",
+    "@botara/shared": "workspace:*"
+  }
+}

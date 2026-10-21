@@ -1,0 +1,119 @@
+import {
+  pgTable, uuid, varchar, text, timestamp, boolean, jsonb, integer, numeric, uniqueIndex, index,
+} from "drizzle-orm/pg-core";
+
+/**
+ * Fase 0 core schema. Deliberately minimal but shaped for the blueprint:
+ * multi-workspace tenancy, channel accounts with capability snapshots and a
+ * token-vault reference (raw tokens are never stored in these tables),
+ * conversations carry last_user_message_at for messaging-window enforcement,
+ * templates carry latest_category for WhatsApp dual-API routing, and every
+ * billable send lands in cost_ledger.
+ */
+
+export const workspaces = pgTable("workspaces", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  name: varchar("name", { length: 200 }).notNull(),
+  slug: varchar("slug", { length: 120 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("workspaces_slug_idx").on(t.slug)]);
+
+export const users = pgTable("users", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  email: varchar("email", { length: 320 }).notNull(),
+  name: varchar("name", { length: 200 }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("users_email_idx").on(t.email)]);
+
+export const workspaceMembers = pgTable("workspace_members", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  role: varchar("role", { length: 40 }).notNull().default("member"), // owner|admin|member|agent
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("workspace_members_ws_user_idx").on(t.workspaceId, t.userId)]);
+
+export const channelAccounts = pgTable("channel_accounts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channel: varchar("channel", { length: 40 }).notNull(), // whatsapp|instagram|messenger|threads|telegram|email
+  externalId: varchar("external_id", { length: 200 }).notNull(), // WABA/phone id, IG id, page id, threads user id...
+  displayName: varchar("display_name", { length: 200 }),
+  authMode: varchar("auth_mode", { length: 60 }), // e.g. instagram: "instagram-login" | "facebook-login"
+  apiVersion: varchar("api_version", { length: 20 }), // pinned provider API version, e.g. "v26.0"
+  capabilities: jsonb("capabilities").notNull().default({}), // CapabilitySet snapshot at connect time
+  isCoexistence: boolean("is_coexistence").notNull().default(false), // WhatsApp Business App + Cloud API same number
+  // Token vault references only - raw access tokens live in the vault, never here.
+  tokenVaultRef: varchar("token_vault_ref", { length: 200 }),
+  tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
+  status: varchar("status", { length: 40 }).notNull().default("connected"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("channel_accounts_ws_idx").on(t.workspaceId)]);
+
+export const contacts = pgTable("contacts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channel: varchar("channel", { length: 40 }).notNull(),
+  externalId: varchar("external_id", { length: 200 }).notNull(),
+  displayName: varchar("display_name", { length: 200 }),
+  tags: jsonb("tags").notNull().default([]),
+  customFields: jsonb("custom_fields").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [uniqueIndex("contacts_ws_channel_ext_idx").on(t.workspaceId, t.channel, t.externalId)]);
+
+export const conversations = pgTable("conversations", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  status: varchar("status", { length: 40 }).notNull().default("open"), // open|pending|resolved
+  assignedUserId: uuid("assigned_user_id").references(() => users.id),
+  /** Drives messaging-window enforcement (Meta 24h window, human-agent 7d). */
+  lastUserMessageAt: timestamp("last_user_message_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("conversations_ws_idx").on(t.workspaceId)]);
+
+export const messages = pgTable("messages", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id),
+  direction: varchar("direction", { length: 10 }).notNull(), // in|out
+  type: varchar("type", { length: 40 }).notNull().default("text"),
+  body: text("body"),
+  externalId: varchar("external_id", { length: 200 }),
+  status: varchar("status", { length: 40 }).notNull().default("queued"), // queued|sent|delivered|read|failed
+  /** Idempotency key used on the provider send call; safe retries depend on it. */
+  idempotencyKey: varchar("idempotency_key", { length: 256 }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("messages_conversation_idx").on(t.conversationId)]);
+
+export const templates = pgTable("templates", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  externalId: varchar("external_id", { length: 200 }),
+  name: varchar("name", { length: 200 }).notNull(),
+  language: varchar("language", { length: 20 }).notNull().default("en"),
+  /** Original provider category at approval time. */
+  category: varchar("category", { length: 40 }),
+  /**
+   * Latest category after provider reclassification webhooks.
+   * WhatsApp routing MUST use this, never `category` (see ADR-008).
+   */
+  latestCategory: varchar("latest_category", { length: 40 }),
+  status: varchar("status", { length: 40 }).notNull().default("draft"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export const costLedger = pgTable("cost_ledger", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").references(() => channelAccounts.id),
+  channel: varchar("channel", { length: 40 }).notNull(),
+  category: varchar("category", { length: 40 }).notNull(), // marketing|utility|authentication|service|...
+  country: varchar("country", { length: 8 }), // recipient country (dial code / ISO) used for rating
+  units: integer("units").notNull().default(1), // messages, tokens, etc.
+  amount: numeric("amount", { precision: 14, scale: 6 }).notNull().default("0"),
+  currency: varchar("currency", { length: 8 }).notNull().default("USD"),
+  referenceId: varchar("reference_id", { length: 200 }), // message id / job id
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("cost_ledger_ws_created_idx").on(t.workspaceId, t.createdAt)]);
