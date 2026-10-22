@@ -9,6 +9,12 @@ video focused: one permission group per video, 1–3 minutes each.
 General setup for every video:
 
 - Web app: `https://botara.my.id` (log in with the review test user).
+- **The UI defaults to English** (since the Fase 4 i18n pass) - exactly
+  what reviewers see. If the UI ever shows Indonesian, switch it back
+  with the **EN | ID** control in the top-right of the app (also present
+  on the sign-in page); the choice is stored per-browser in
+  localStorage (`botara.lang`). A light/dark theme toggle (sun/moon)
+  sits next to it - record in light mode for maximum legibility.
 - Keep a second tab open on the channel itself (WhatsApp phone /
   Instagram app / Messenger / Threads) to show cause → effect.
 - Start each video on the Botara Dashboard with the workspace switcher

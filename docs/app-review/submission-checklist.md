@@ -19,6 +19,13 @@ app secrets go into the server env / Secure Vault, NOT into git).
       (trial: `https://botara.my.id`).
 - [ ] **[PREPARED]** Privacy + Terms pages live at
       `https://botara.my.id/privacy` and `/terms`.
+- [ ] **[PREPARED]** UI language: the web app **defaults to English**
+      (Fase 4 i18n, EN + ID dictionaries). Reviewers see English without
+      touching anything; the EN | ID switcher is in the top-right of the
+      app shell and on the sign-in page (persisted per-browser as
+      `botara.lang`). Privacy/Terms pages follow the selected language.
+      The app also ships a light/dark theme toggle next to the language
+      switcher (default follows the OS setting).
 - [ ] **[OWNER]** ⚠️ The /privacy and /terms texts in the app are
       TEMPLATES (marked as such). Have them reviewed/adjusted for the
       real business (legal name, address, privacy contact email, dates)

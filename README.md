@@ -190,10 +190,49 @@ needs the external items in the checklist below):
 - **Web:** login/register, token-based API client, workspace switcher,
   Knowledge Base page, and public `/privacy` + `/terms` template pages.
 
+## Completion package status (post Fase 4)
+
+The placeholder screens the owner found on the trial deployment are gone —
+**every screen is functional now**:
+
+- **i18n EN + ID, default English** (Meta App Review readiness): a typed
+  dictionary pair with identical key sets (type-enforced + parity test),
+  an EN | ID switcher in the shell header, on the sign-in page, and on the
+  legal pages; choice persists per browser (`botara.lang`). Privacy/Terms
+  bodies follow the selected language (marked templates in both).
+- **Dark / light theme:** class-based dark mode (Tailwind v4 custom
+  variant), defaulting to the OS `prefers-color-scheme`, persisted
+  (`botara.theme`), with a pre-paint script (no flash) and a sun/moon
+  toggle next to the language switcher. The webchat widget accepts
+  `data-theme="light|dark|auto"` and `data-lang="en|id"`.
+- **Flows:** a `flows` table + CRUD API, graph validation against the
+  flow-engine node schemas, a **visual builder** (@xyflow/react: palette,
+  condition true/false branches, per-node config panel, save, activate,
+  dry-run test panel), and **inbound trigger wiring** — WhatsApp/Telegram
+  (plus IG/Messenger/Threads) webhooks persist messages and enqueue
+  flow-runs for keyword/postback matches; the worker resolves id-based
+  jobs from repositories.
+- **Sequences UI:** list with step + enrollment counts, step editor
+  (delay hours, text/template), enroll-by-tag, delete.
+- **Channels page with real connect paths:** Telegram bot-token connect
+  (getMe-validated, vaulted, webhook auto-registration), WhatsApp
+  Embedded Signup launcher (rendered only when the Meta app + config id
+  are configured — otherwise an honest "not configured" card), and OAuth
+  for Instagram (both login modes), Threads, and Messenger (including
+  the multi-Page picker). Webchat embed snippet with copy button.
+- **Dashboard stats:** `GET /stats/overview` (contacts, conversations,
+  messages 30d, broadcasts, monthly cost by currency, pending posts,
+  active flows) rendered as cards + recent conversations.
+- **Settings:** profile + workspace rename, change password (audited),
+  member list/invite/role/remove.
+- **Feature parity:** `docs/feature-parity.md` maps ChatbotX's public
+  feature list against Botara, item by item, honestly.
+
 ## Production readiness checklist
 
-Done in code (Fase 0-4): everything above, plus the Fase 1-2 feature set,
-the production deployment package, and the trial deployment.
+Done in code (Fase 0-4 + completion package): everything above, plus the
+Fase 1-2 feature set, the production deployment package, and the trial
+deployment.
 
 Still external — required before real go-live:
 
@@ -214,7 +253,9 @@ Still external — required before real go-live:
       version (estimates/ledger math already stamps the version).
 - [ ] **Production VPS + domain + DNS:** point the real domain at the
       production deployment (compose + Caddy in `docs/deploy/vps.md`),
-      set `CORS_ORIGINS`, `APP_PUBLIC_URL`, and webhook URLs at Meta.
+      set `CORS_ORIGINS`, `APP_PUBLIC_URL`, `PUBLIC_WEBHOOK_BASE_URL`
+      (OAuth redirect URIs + Telegram webhook derive from it), and
+      webhook URLs at Meta.
 - [ ] **First decisions still open:** first LLM provider + first data
       region (drives the R2 bucket jurisdiction — fixed at creation).
 - [ ] **Optional:** enable pgvector for very large knowledge bases

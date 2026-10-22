@@ -87,6 +87,39 @@ Daftarkan URL berikut persis seperti ini:
     -d "url=https://DOMAIN/api/webhooks/telegram" \
     -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
   ```
+  Sejak Fase 4, menghubungkan bot dari halaman **Channels** dashboard
+  juga memanggil setWebhook otomatis ke URL yang sama bila
+  `PUBLIC_WEBHOOK_BASE_URL` terisi.
+
+## Onboarding channel dari dashboard (Fase 4)
+
+Dashboard sekarang punya alur koneksi asli di halaman **Channels**
+(Telegram via token bot, WhatsApp via Embedded Signup, Instagram /
+Threads / Messenger via OAuth). Agar berfungsi di produksi, isi di
+`.env.production`:
+
+- `PUBLIC_WEBHOOK_BASE_URL=https://DOMAIN/api` — basis publik API
+  (termasuk prefix `/api` dari reverse proxy). Dipakai untuk:
+  - Redirect URI OAuth yang WAJIB didaftarkan persis di dashboard
+    aplikasi Meta/Threads:
+    - `https://DOMAIN/api/channels/instagram/oauth/callback`
+    - `https://DOMAIN/api/channels/threads/oauth/callback`
+    - `https://DOMAIN/api/channels/messenger/oauth/callback`
+  - URL webhook Telegram saat bot dihubungkan dari dashboard:
+    `https://DOMAIN/api/webhooks/telegram`
+- `APP_PUBLIC_URL=https://DOMAIN` — tujuan redirect browser setelah
+  OAuth selesai (halaman Channels SPA).
+- `WHATSAPP_EMBEDDED_CONFIG_ID` — ID konfigurasi Embedded Signup dari
+  dashboard aplikasi Meta. Tombol "Connect WhatsApp" hanya muncul bila
+  ini dan `META_APP_ID` terisi; bila kosong, dashboard menampilkan
+  status "belum dikonfigurasi" secara jujur.
+- `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` — kredensial Instagram
+  Login (Business Login for Instagram); kosong = fallback ke
+  `META_APP_ID` / `META_APP_SECRET`.
+
+Tanpa variabel-variabel ini, endpoint OAuth membalas 503 CONFIGURATION
+dan kartu koneksi menampilkan status belum terkonfigurasi — tidak ada
+alur yang berpura-pura berhasil.
 
 ## Update (rilis baru)
 

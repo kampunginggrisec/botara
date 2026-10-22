@@ -54,6 +54,21 @@ export const envSchema = z.object({
   BOTARA_ALLOW_HEADER_WORKSPACE: z.string().optional(),
   /** Public base URL of this deployment (data-deletion status URLs etc.). */
   APP_PUBLIC_URL: z.string().url().optional(),
+
+  // Fase 4 channel onboarding
+  /**
+   * Public base URL under which THIS API is reachable from the internet,
+   * including any path prefix the reverse proxy exposes (e.g.
+   * https://bot.example.com/api when nginx strips /api). Used for OAuth
+   * redirect URIs and the Telegram setWebhook URL; must match what is
+   * registered in the Meta app dashboards. Falls back to APP_PUBLIC_URL.
+   */
+  PUBLIC_WEBHOOK_BASE_URL: z.string().url().optional(),
+  /** WhatsApp Embedded Signup configuration id (Meta app dashboard). */
+  WHATSAPP_EMBEDDED_CONFIG_ID: z.string().optional(),
+  /** Instagram Login app credentials (Business Login for Instagram). */
+  INSTAGRAM_APP_ID: z.string().optional(),
+INSTAGRAM_APP_SECRET: <redacted>
 });
 
 export type Env = z.infer<typeof envSchema>;
