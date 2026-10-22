@@ -234,7 +234,8 @@ function buildPublishPorts(db: Database): PublishPorts {
         if (!(adapter instanceof InstagramAdapter)) {
           throw new Error(`${channel} adapter has no media-container surface`);
         }
-        return adapter.createMediaContainer(input);
+        const created = await adapter.createMediaContainer(input.account, input);
+        return { containerId: created.creationId };
       },
       async containerStatus(channel, account, containerId) {
         const adapter = getAdapter(channel as ChannelKey);
