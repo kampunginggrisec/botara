@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type ChannelAccount, type Contact,
@@ -7,6 +7,10 @@ import {
   type SequenceStep, type StatsOverview, type Template, type WorkspaceSummary,
 } from "./api";
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
+import {
+  connectRealtime, decideInboxRefresh, isRealtimeDegraded,
+  type InboxMessageEvent, type RealtimeHandle,
+} from "./realtime";
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 
@@ -73,7 +77,7 @@ const errText = (err: unknown, fallback: string): string =>
 
 // ------------------------------------------------------------------- Inbox
 
-function InboxPage() {
+function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
   const { t } = useI18n();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<Conversation | null>(null);
@@ -99,6 +103,35 @@ function InboxPage() {
   }, [t]);
 
   useEffect(() => { void loadConversations(); }, [loadConversations]);
+
+  // Live updates (realtime socket owned by AuthedApp): an event for the
+  // current workspace refreshes the list; an event for the OPEN
+  // conversation refetches its messages too - no manual refresh.
+  const selectedRef = useRef<Conversation | null>(null);
+  selectedRef.current = selected;
+  useEffect(() => {
+    if (!liveEvent) return;
+    const decision = decideInboxRefresh(liveEvent, {
+      workspaceId: getWorkspaceId(),
+      openConversationId: selectedRef.current?.id ?? null,
+    });
+    if (decision.refreshList) void loadConversations();
+    if (decision.refreshMessages && selectedRef.current) void openConversation(selectedRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveEvent]);
+
+  // Degraded fallback: while the realtime socket cannot connect, poll
+  // every 30s so the inbox still self-refreshes (checked per tick - as
+  // soon as the socket recovers, polling goes quiet again).
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (!isRealtimeDegraded()) return;
+      void loadConversations();
+      if (selectedRef.current) void openConversation(selectedRef.current);
+    }, 30_000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const openConversation = async (conv: Conversation) => {
     setSelected(conv);
@@ -2325,6 +2358,28 @@ function AuthedApp() {
     });
   }, []);
 
+  // Realtime socket lifecycle: one connection per signed-in session,
+  // re-subscribed on workspace switches, torn down on logout (the
+  // cleanup runs when `user` clears). Events land in state and the
+  // Inbox page decides what to refresh.
+  const [liveEvent, setLiveEvent] = useState<InboxMessageEvent | null>(null);
+  const realtimeRef = useRef<RealtimeHandle | null>(null);
+  useEffect(() => {
+    if (!user) return;
+    const handle = connectRealtime({
+      workspaceId: getWorkspaceId(),
+      onInboxMessage: (event) => setLiveEvent(event),
+    });
+    realtimeRef.current = handle;
+    return () => {
+      handle.close();
+      realtimeRef.current = null;
+    };
+  }, [user]);
+  useEffect(() => {
+    realtimeRef.current?.setWorkspace(workspaceId);
+  }, [workspaceId]);
+
   if (!ready) {
     return (
       <div className="min-h-screen bg-slate-50 dark:bg-slate-950 flex items-center justify-center text-sm text-slate-500 dark:text-slate-400">
@@ -2405,7 +2460,7 @@ function AuthedApp() {
           <ThemeToggle />
         </div>
         {page === "dashboard" && <DashboardPage goTo={setPage} />}
-        {page === "inbox" && <InboxPage />}
+        {page === "inbox" && <InboxPage liveEvent={liveEvent} />}
         {page === "contacts" && <ContactsPage />}
         {page === "flows" && <FlowsPage />}
         {page === "broadcast" && <BroadcastPage />}
