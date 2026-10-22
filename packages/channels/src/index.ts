@@ -2,21 +2,44 @@ export {
   CHANNEL_CAPABILITIES, type CapabilitySet, type ChannelKey, type InboundEvent,
   type ChannelAccountRef, type SendInput, type SendTemplateInput, type SendResult,
   type PublishInput, type AdapterHealth, type ChannelAdapter, type MessageMedia,
-  type MessageStatusError, type ChannelSecrets, type CredentialProvider, type FetchLike,
-  type RealAdapterOptions,
+  type MessageAttachment, type MessageStatusError, type ChannelSecrets,
+  type CredentialProvider, type FetchLike, type RealAdapterOptions,
 } from "./types";
 export { PlaceholderAdapter, registerAdapter, getAdapter, listAdapters } from "./registry";
 export {
   ProviderApiError, ProviderAuthError, ProviderRateLimitError,
-  TemplateCategoryMismatchError, MarketingPausedError, type ProviderErrorDetails,
+  TemplateCategoryMismatchError, MarketingPausedError, mapGraphError,
+  type ProviderErrorDetails, type GraphErrorBodyShape,
 } from "./errors";
 export {
   StaticCredentialProvider, EnvCredentialProvider, envWhatsAppCredentials,
-  envTelegramCredentials, type EnvCredentialProviderOptions,
+  envTelegramCredentials, envInstagramCredentials, envMessengerCredentials,
+  envThreadsCredentials, envEmailCredentials, type EnvCredentialProviderOptions,
 } from "./credentials";
+export {
+  evaluateLongLivedRefresh, type RefreshDecision, type LongLivedRefreshInput,
+} from "./token-lifecycle";
 export {
   WhatsAppAdapter, routeForTemplateCategory, mapWhatsAppError,
   verifyWebhookSignature, verifyWebhookChallenge,
   type WhatsAppAdapterOptions, type WhatsAppRoute,
 } from "./whatsapp";
 export { TelegramAdapter, type TelegramAdapterOptions } from "./telegram";
+export {
+  InstagramAdapter, buildInstagramAuthorizeUrl, instagramModeOf,
+  INSTAGRAM_LOGIN_SCOPES, FACEBOOK_LOGIN_SCOPES,
+  type InstagramAdapterOptions, type InstagramAuthMode,
+} from "./instagram";
+export { MessengerAdapter, type MessengerAdapterOptions } from "./messenger";
+export {
+  ThreadsAdapter, threadsRefreshDecision,
+  type ThreadsAdapterOptions,
+} from "./threads";
+export {
+  WebchatAdapter, UnconfiguredWebchatStore,
+  type WebchatStore, type WebchatAdapterOptions,
+} from "./webchat";
+export {
+  EmailAdapter, verifyResendWebhookSignature,
+  type EmailAdapterOptions, type InboundEmailContent,
+} from "./email";

@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CHANNEL_CAPABILITIES } from "./types";
-import { getAdapter } from "./registry";
+import { getAdapter, PlaceholderAdapter } from "./registry";
 
 describe("capability matrix", () => {
   test("threads has NO DM and NO like API", () => {
@@ -20,12 +20,28 @@ describe("capability matrix", () => {
   });
 
   test("placeholder adapters are honest stubs", async () => {
+    const placeholder = new PlaceholderAdapter("threads");
+    await expect(placeholder.send({
+      account: { id: "a", externalId: "x" }, toExternalId: "y", text: "hi", idempotencyKey: "k1",
+    })).rejects.toThrow("not implemented");
+    expect(await placeholder.parseWebhook({})).toEqual([]);
+    expect((await placeholder.health()).ok).toBe(false);
+  });
+
+  test("webchat is Botara's own channel (no external API)", () => {
+    expect(CHANNEL_CAPABILITIES.webchat.canDM).toBe(true);
+    expect(CHANNEL_CAPABILITIES.webchat.canPublish).toBe(false);
+  });
+
+  test("threads resolves to the REAL adapter in Fase 2, and it still cannot DM", async () => {
     const threads = getAdapter("threads");
     expect(threads.capabilities.canDM).toBe(false);
+    expect(threads.capabilities.canLike).toBe(false);
+    // send() is a DM - Threads has no DM API, so the real adapter refuses
+    // honestly instead of faking it.
     await expect(threads.send({
       account: { id: "a", externalId: "x" }, toExternalId: "y", text: "hi", idempotencyKey: "k1",
     })).rejects.toThrow("not implemented");
     expect(await threads.parseWebhook({})).toEqual([]);
-    expect((await threads.health()).ok).toBe(false);
   });
 });

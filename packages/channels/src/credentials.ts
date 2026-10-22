@@ -15,6 +15,8 @@ export interface EnvCredentialProviderOptions {
   botTokenEnv?: string;
   /** Env var holding the Meta app secret (webhook signature verification). */
   appSecretEnv?: string;
+  /** Env var holding a non-Meta webhook signing secret (Resend/Svix whsec_). */
+  webhookSecretEnv?: string;
   env?: Record<string, string | undefined>;
 }
 
@@ -33,12 +35,14 @@ export class EnvCredentialProvider implements CredentialProvider {
   private readonly tokenEnv?: string;
   private readonly botTokenEnv?: string;
   private readonly appSecretEnv?: string;
+  private readonly webhookSecretEnv?: string;
   private readonly env: Record<string, string | undefined>;
 
   constructor(options: EnvCredentialProviderOptions = {}) {
     this.tokenEnv = options.tokenEnv;
     this.botTokenEnv = options.botTokenEnv;
     this.appSecretEnv = options.appSecretEnv;
+    this.webhookSecretEnv = options.webhookSecretEnv;
     this.env = options.env ?? process.env;
   }
 
@@ -50,13 +54,26 @@ export class EnvCredentialProvider implements CredentialProvider {
       accessToken: fromRef ?? (this.tokenEnv ? this.env[this.tokenEnv] : undefined),
       botToken: fromRef ?? (this.botTokenEnv ? this.env[this.botTokenEnv] : undefined),
       appSecret: this.appSecretEnv ? this.env[this.appSecretEnv] : undefined,
+      webhookSecret: this.webhookSecretEnv ? this.env[this.webhookSecretEnv] : undefined,
     };
   }
 }
 
-/** Preconfigured providers for the two real Fase 1 channels. */
+/** Preconfigured providers for the real channels (Fase 1 + Fase 2). */
 export const envWhatsAppCredentials = (): CredentialProvider =>
   new EnvCredentialProvider({ tokenEnv: "WHATSAPP_ACCESS_TOKEN", appSecretEnv: "META_APP_SECRET" });
 
 export const envTelegramCredentials = (): CredentialProvider =>
   new EnvCredentialProvider({ botTokenEnv: "TELEGRAM_BOT_TOKEN" });
+
+export const envInstagramCredentials = (): CredentialProvider =>
+  new EnvCredentialProvider({ tokenEnv: "INSTAGRAM_ACCESS_TOKEN", appSecretEnv: "META_APP_SECRET" });
+
+export const envMessengerCredentials = (): CredentialProvider =>
+  new EnvCredentialProvider({ tokenEnv: "MESSENGER_ACCESS_TOKEN", appSecretEnv: "META_APP_SECRET" });
+
+export const envThreadsCredentials = (): CredentialProvider =>
+  new EnvCredentialProvider({ tokenEnv: "THREADS_ACCESS_TOKEN", appSecretEnv: "THREADS_APP_SECRET" });
+
+export const envEmailCredentials = (): CredentialProvider =>
+  new EnvCredentialProvider({ tokenEnv: "RESEND_API_KEY", webhookSecretEnv: "RESEND_WEBHOOK_SECRET" });

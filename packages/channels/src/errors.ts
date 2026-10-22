@@ -81,3 +81,43 @@ export class MarketingPausedError extends ProviderApiError {
     this.name = "MarketingPausedError";
   }
 }
+
+export interface GraphErrorBodyShape {
+  error?: {
+    message?: string;
+    type?: string;
+    code?: number;
+    error_subcode?: number;
+    fbtrace_id?: string;
+  };
+}
+
+/**
+ * Generic Graph API error mapper for the non-WhatsApp Meta surfaces
+ * (Instagram via Facebook Login, Messenger). WhatsApp has extra codes and
+ * its own mapper in whatsapp.ts; this one covers the shared family:
+ * 190 -> auth (dead token), 4/17/32/613/80007 -> rate limit, 5xx -> retryable.
+ */
+export function mapGraphError(body: GraphErrorBodyShape, httpStatus: number, provider: string): ProviderApiError {
+  const e = body.error ?? {};
+  const details: ProviderErrorDetails = {
+    provider,
+    providerCode: e.code,
+    providerSubcode: e.error_subcode,
+    fbtraceId: e.fbtrace_id,
+    retryable: httpStatus >= 500,
+  };
+  const message = e.message ?? `${provider} Graph API error (HTTP ${httpStatus})`;
+  switch (e.code) {
+    case 190:
+      return new ProviderAuthError(message, details);
+    case 4: // app-level rate limit
+    case 17: // user request limit reached
+    case 32: // page-level rate limit
+    case 613: // calls too many
+    case 80007: // account-level rate limit
+      return new ProviderRateLimitError(message, details);
+    default:
+      return new ProviderApiError(message, details);
+  }
+}

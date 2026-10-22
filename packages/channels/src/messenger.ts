@@ -1,0 +1,289 @@
+import { AppError, NotImplementedError } from "@botara/shared";
+import { mapGraphError, ProviderApiError, type GraphErrorBodyShape } from "./errors";
+import {
+  CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
+  type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
+  type SendInput, type SendResult,
+} from "./types";
+
+/**
+ * Messenger adapter (Fase 2 - real). Facebook Page messaging via the Send
+ * API on graph.facebook.com (pinned Graph version), authenticated with a
+ * Page access token resolved through the credential provider.
+ *
+ * Includes the handover protocol (pass/take thread control) so a Botara bot
+ * and a human-agent inbox app can share one thread, and messenger-profile
+ * setup helpers (Get Started button, persistent menu).
+ *
+ * Note: this adapter is for Page CONVERSATIONS. Botara's website chat is
+ * the self-built webchat widget - Meta's Customer Chat Plugin retired
+ * 2024-05-09 with no replacement and is deliberately NOT integrated.
+ */
+
+export interface MessengerAdapterOptions {
+  credentials: CredentialProvider;
+  fetchFn?: FetchLike;
+  graphVersion?: string;
+  baseUrl?: string;
+}
+
+const isoFromEpochMs = (ts: unknown): string =>
+  new Date(typeof ts === "number" ? ts : Number(ts)).toISOString();
+
+export class MessengerAdapter implements ChannelAdapter {
+  readonly key = "messenger" as const;
+  readonly apiVersion: string;
+  readonly capabilities = CHANNEL_CAPABILITIES.messenger;
+
+  private readonly credentials: CredentialProvider;
+  private readonly fetchFn: FetchLike;
+  private readonly baseUrl: string;
+
+  constructor(options: MessengerAdapterOptions) {
+    this.credentials = options.credentials;
+    this.fetchFn = options.fetchFn ?? ((input, init) => fetch(input, init));
+    this.apiVersion = options.graphVersion ?? "v26.0";
+    this.baseUrl = (options.baseUrl ?? "https://graph.facebook.com").replace(/\/$/, "");
+  }
+
+  // --- account lifecycle -----------------------------------------------------
+
+  async connect(): Promise<ChannelAccountRef> {
+    throw new NotImplementedError(
+      "messenger.connect (Facebook Login onboarding provisions Page accounts at the API layer)",
+    );
+  }
+
+  async disconnect(): Promise<void> {
+    // Page tokens are revoked app-side; nothing to call here in Fase 2.
+  }
+
+  async refreshTokenIfNeeded(): Promise<{ refreshed: boolean }> {
+    // Page access tokens derived from a long-lived user token do not expire.
+    return { refreshed: false };
+  }
+
+  async health(account?: ChannelAccountRef): Promise<AdapterHealth> {
+    if (!account) return { ok: false, detail: "messenger: an account is required for a health check" };
+    const secrets = await this.credentials.resolve(account);
+    return secrets.accessToken
+      ? { ok: true, detail: `messenger adapter ready (Graph ${this.apiVersion})` }
+      : { ok: false, detail: "messenger: no Page access token resolvable for this account (vault/env)" };
+  }
+
+  // --- HTTP plumbing -----------------------------------------------------------
+
+  private async tokenFor(account: ChannelAccountRef): Promise<string> {
+    const secrets = await this.credentials.resolve(account);
+    if (!secrets.accessToken) {
+      throw new AppError(
+        "CONFIGURATION",
+        "Messenger Page access token is not configured for this account (credential provider returned none)",
+        { status: 503 },
+      );
+    }
+    return secrets.accessToken;
+  }
+
+  private async graph(
+    account: ChannelAccountRef,
+    method: "GET" | "POST" | "DELETE",
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
+    const token = await this.tokenFor(account);
+    const res = await this.fetchFn(`${this.baseUrl}/${this.apiVersion}/${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${token}`,
+        ...(body ? { "Content-Type": "application/json" } : {}),
+      },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphErrorBodyShape & Record<string, unknown>;
+    if (!res.ok || json.error) throw mapGraphError(json, res.status, "messenger");
+    return json;
+  }
+
+  // --- sending ---------------------------------------------------------------------
+
+  async send(input: SendInput): Promise<SendResult> {
+    let message: Record<string, unknown>;
+    if (input.media?.link) {
+      message = {
+        attachment: {
+          type: input.media.type === "video" ? "file" : "image",
+          payload: { url: input.media.link, is_reusable: true },
+        },
+      };
+    } else if (input.text !== undefined) {
+      message = { text: input.text };
+    } else {
+      throw new AppError("VALIDATION", "messenger.send requires text or media with a public link");
+    }
+    const json = await this.graph(input.account, "POST", "me/messages", {
+      recipient: { id: input.toExternalId },
+      messaging_type: "RESPONSE",
+      message,
+    });
+    const messageId = json.message_id as string | undefined;
+    if (!messageId) {
+      throw new ProviderApiError("Messenger send returned no message id", { provider: "messenger", retryable: false });
+    }
+    return { externalMessageId: messageId, status: "sent" };
+  }
+
+  // --- handover protocol -----------------------------------------------------------------
+
+  /** Hand the thread to another app (e.g. the Page inbox / a human-agent app). */
+  async passThreadControl(
+    account: ChannelAccountRef,
+    psid: string,
+    input: { targetAppId: number | string; metadata?: string },
+  ): Promise<void> {
+    await this.graph(account, "POST", "me/pass_thread_control", {
+      recipient: { id: psid },
+      target_app_id: input.targetAppId,
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+    });
+  }
+
+  /** Take the thread back from the secondary receiver. */
+  async takeThreadControl(
+    account: ChannelAccountRef,
+    psid: string,
+    input: { metadata?: string } = {},
+  ): Promise<void> {
+    await this.graph(account, "POST", "me/take_thread_control", {
+      recipient: { id: psid },
+      ...(input.metadata ? { metadata: input.metadata } : {}),
+    });
+  }
+
+  // --- messenger profile setup ---------------------------------------------------------
+
+  /** Get Started button shown to first-time users (payload arrives as a postback). */
+  async setGetStarted(account: ChannelAccountRef, payload: string): Promise<void> {
+    await this.graph(account, "POST", "me/messenger_profile", {
+      get_started: { payload },
+    });
+  }
+
+  /** Persistent menu (composer-level navigation). Items are postback or web_url entries. */
+  async setPersistentMenu(
+    account: ChannelAccountRef,
+    items: Array<Record<string, unknown>>,
+    input: { locale?: string; composerInputDisabled?: boolean } = {},
+  ): Promise<void> {
+    await this.graph(account, "POST", "me/messenger_profile", {
+      persistent_menu: [{
+        locale: input.locale ?? "default",
+        composer_input_disabled: input.composerInputDisabled ?? false,
+        call_to_actions: items,
+      }],
+    });
+  }
+
+  // --- page posts + comment moderation -----------------------------------------------------
+
+  /** Publish a post to the Page feed (the Messenger account IS a Page). */
+  async publish(input: PublishInput): Promise<{ externalPostId: string }> {
+    const pageId = input.account.externalId;
+    const json = await this.graph(input.account, "POST", `${pageId}/feed`, {
+      ...(input.text ? { message: input.text } : {}),
+      ...(input.mediaUrls?.[0] ? { link: input.mediaUrls[0] } : {}),
+    });
+    const postId = json.id as string | undefined;
+    if (!postId) {
+      throw new ProviderApiError("Messenger page post returned no id", { provider: "messenger", retryable: false });
+    }
+    return { externalPostId: postId };
+  }
+
+  async moderate(input: {
+    account: ChannelAccountRef;
+    targetExternalId: string;
+    action: "hide" | "unhide" | "delete" | "reply";
+    text?: string;
+  }): Promise<void> {
+    const commentId = input.targetExternalId;
+    switch (input.action) {
+      case "hide":
+        await this.graph(input.account, "POST", commentId, { is_hidden: true });
+        return;
+      case "unhide":
+        await this.graph(input.account, "POST", commentId, { is_hidden: false });
+        return;
+      case "delete":
+        await this.graph(input.account, "DELETE", commentId);
+        return;
+      case "reply": {
+        if (!input.text) throw new AppError("VALIDATION", "messenger comment reply requires text");
+        await this.graph(input.account, "POST", `${commentId}/comments`, { message: input.text });
+        return;
+      }
+    }
+  }
+
+  async fetchInsights(input: {
+    account: ChannelAccountRef;
+    targetExternalId?: string;
+  }): Promise<Record<string, number>> {
+    // Views family only, same retirement rule as Instagram.
+    const target = input.targetExternalId ?? input.account.externalId;
+    const json = await this.graph(
+      input.account, "GET",
+      `${target}/insights?metric=page_views_total,page_post_views&period=day`,
+    );
+    const data = (json.data as Array<{ name: string; values?: Array<{ value: number }> }> | undefined) ?? [];
+    const out: Record<string, number> = {};
+    for (const metric of data) out[metric.name] = metric.values?.[metric.values.length - 1]?.value ?? 0;
+    return out;
+  }
+
+  // --- webhooks --------------------------------------------------------------------------------
+
+  async parseWebhook(payload: unknown): Promise<InboundEvent[]> {
+    const events: InboundEvent[] = [];
+    const root = payload as { entry?: Array<Record<string, any>> } | null;
+    for (const entry of root?.entry ?? []) {
+      const accountExternalId = String(entry.id ?? "");
+      for (const item of (entry.messaging as Array<Record<string, any>> | undefined) ?? []) {
+        const contactExternalId = String(item.sender?.id ?? "");
+        const receivedAt = isoFromEpochMs(item.timestamp ?? Date.now());
+        if (item.message?.mid) {
+          events.push({
+            type: "message.received",
+            channel: "messenger",
+            accountExternalId,
+            contactExternalId,
+            messageExternalId: String(item.message.mid),
+            text: item.message.text,
+            receivedAt,
+          });
+        } else if (item.postback) {
+          events.push({
+            type: "postback.received",
+            channel: "messenger",
+            accountExternalId,
+            contactExternalId,
+            payload: String(item.postback.payload ?? ""),
+            title: item.postback.title,
+            receivedAt,
+          });
+        } else if (item.referral) {
+          events.push({
+            type: "referral.received",
+            channel: "messenger",
+            accountExternalId,
+            contactExternalId,
+            ref: item.referral.ref,
+            source: item.referral.source,
+            receivedAt,
+          });
+        }
+      }
+    }
+    return events;
+  }
+}

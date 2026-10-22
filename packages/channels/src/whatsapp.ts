@@ -323,6 +323,9 @@ export class WhatsAppAdapter implements ChannelAdapter {
             language: value.message_template_language,
             previousCategory: typeof value.previous_category === "string" ? value.previous_category.toLowerCase() : undefined,
             newCategory: String(value.new_category ?? "").toLowerCase(),
+            // entry.id is the WABA (messaging account) id for this event; the
+            // API layer persists it on the template row (messaging_account_id).
+            accountExternalId: entry.id !== undefined ? String(entry.id) : undefined,
             receivedAt: new Date().toISOString(),
           });
           continue;

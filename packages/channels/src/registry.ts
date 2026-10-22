@@ -1,6 +1,14 @@
 import { NotImplementedError } from "@botara/shared";
-import { envTelegramCredentials, envWhatsAppCredentials } from "./credentials";
+import {
+  envEmailCredentials, envInstagramCredentials, envMessengerCredentials,
+  envTelegramCredentials, envThreadsCredentials, envWhatsAppCredentials,
+} from "./credentials";
+import { EmailAdapter } from "./email";
+import { InstagramAdapter } from "./instagram";
+import { MessengerAdapter } from "./messenger";
 import { TelegramAdapter } from "./telegram";
+import { ThreadsAdapter } from "./threads";
+import { WebchatAdapter } from "./webchat";
 import { WhatsAppAdapter } from "./whatsapp";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
@@ -46,9 +54,12 @@ export function registerAdapter(adapter: ChannelAdapter): void {
 }
 
 /**
- * Default adapter factory. Fase 1: whatsapp and telegram resolve to the REAL
- * adapters (credentials from the env-backed provider until the vault lands).
- * Every other channel stays an honest placeholder.
+ * Default adapter factory. Fase 1 made whatsapp + telegram real; Fase 2
+ * completes the set: instagram (dual-mode), messenger, threads, email
+ * (Resend), and webchat (self-built; its registry instance has no store, so
+ * send() fails honestly with CONFIGURATION until apps/api wires the
+ * DB-backed store - see apps/api webchat wiring). Credentials always come
+ * from the env-backed providers until the vault lands.
  */
 function createDefaultAdapter(key: ChannelKey): ChannelAdapter {
   switch (key) {
@@ -56,8 +67,16 @@ function createDefaultAdapter(key: ChannelKey): ChannelAdapter {
       return new WhatsAppAdapter({ credentials: envWhatsAppCredentials() });
     case "telegram":
       return new TelegramAdapter({ credentials: envTelegramCredentials() });
-    default:
-      return new PlaceholderAdapter(key);
+    case "instagram":
+      return new InstagramAdapter({ credentials: envInstagramCredentials() });
+    case "messenger":
+      return new MessengerAdapter({ credentials: envMessengerCredentials() });
+    case "threads":
+      return new ThreadsAdapter({ credentials: envThreadsCredentials() });
+    case "email":
+      return new EmailAdapter({ credentials: envEmailCredentials() });
+    case "webchat":
+      return new WebchatAdapter();
   }
 }
 
