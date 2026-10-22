@@ -1,8 +1,10 @@
 import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
-  broadcasts, channelAccounts, contacts, conversations, costLedger, messages,
-  scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
+  auditLog, broadcasts, channelAccounts, contacts, conversations, costLedger,
+  dataDeletionRequests, kbChunks, kbDocuments, messages,
+  scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
+  users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
 } from "./schema";
 
 /**
@@ -932,4 +934,455 @@ export async function updateEnrollment(
       ...(patch.lastStepAt !== undefined ? { lastStepAt: patch.lastStepAt } : {}),
     })
     .where(eq(sequenceEnrollments.id, id));
+}
+
+// ------------------------------------------------- users + workspaces (Fase 3)
+
+export type UserRow = typeof users.$inferSelect;
+export type WorkspaceRow = typeof workspaces.$inferSelect;
+export type WorkspaceMemberRow = typeof workspaceMembers.$inferSelect;
+
+export async function createUser(
+  db: Database,
+  input: { email: string; name?: string; passwordHash?: string },
+): Promise<UserRow> {
+  const [row] = await db
+    .insert(users)
+    .values({
+      email: input.email.toLowerCase(),
+      name: input.name,
+      passwordHash: input.passwordHash,
+    })
+    .returning();
+  return row!;
+}
+
+export async function getUserByEmail(db: Database, email: string): Promise<UserRow | null> {
+  const [row] = await db
+    .select()
+    .from(users)
+    .where(eq(users.email, email.toLowerCase()))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function getUserById(db: Database, id: string): Promise<UserRow | null> {
+  const [row] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+  return row ?? null;
+}
+
+/** Set (or replace) a user's password hash - registration claiming an invited row, password change. */
+export async function setUserPasswordHash(db: Database, userId: string, passwordHash: string): Promise<void> {
+  await db.update(users).set({ passwordHash }).where(eq(users.id, userId));
+}
+
+export async function createWorkspace(
+  db: Database,
+  input: { name: string; slug: string },
+): Promise<WorkspaceRow> {
+  const [row] = await db.insert(workspaces).values(input).returning();
+  return row!;
+}
+
+export async function getWorkspaceById(db: Database, id: string): Promise<WorkspaceRow | null> {
+  const [row] = await db.select().from(workspaces).where(eq(workspaces.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function getWorkspaceBySlug(db: Database, slug: string): Promise<WorkspaceRow | null> {
+  const [row] = await db.select().from(workspaces).where(eq(workspaces.slug, slug)).limit(1);
+  return row ?? null;
+}
+
+/** Add a member, or update the role when the membership already exists. */
+export async function upsertWorkspaceMember(
+  db: Database,
+  input: { workspaceId: string; userId: string; role: string },
+): Promise<WorkspaceMemberRow> {
+  const [row] = await db
+    .insert(workspaceMembers)
+    .values(input)
+    .onConflictDoUpdate({
+      target: [workspaceMembers.workspaceId, workspaceMembers.userId],
+      set: { role: input.role },
+    })
+    .returning();
+  return row!;
+}
+
+export async function getWorkspaceMember(
+  db: Database,
+  workspaceId: string,
+  userId: string,
+): Promise<WorkspaceMemberRow | null> {
+  const [row] = await db
+    .select()
+    .from(workspaceMembers)
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)))
+    .limit(1);
+  return row ?? null;
+}
+
+export interface WorkspaceMembershipView {
+  workspaceId: string;
+  workspaceName: string;
+  slug: string;
+  role: string;
+  createdAt: Date;
+}
+
+/** Every workspace a user belongs to, with their role - /auth/me + /workspaces. */
+export async function listWorkspacesForUser(db: Database, userId: string): Promise<WorkspaceMembershipView[]> {
+  const rows = await db
+    .select({
+      workspaceId: workspaces.id,
+      workspaceName: workspaces.name,
+      slug: workspaces.slug,
+      role: workspaceMembers.role,
+      createdAt: workspaces.createdAt,
+    })
+    .from(workspaceMembers)
+    .innerJoin(workspaces, eq(workspaceMembers.workspaceId, workspaces.id))
+    .where(eq(workspaceMembers.userId, userId))
+    .orderBy(asc(workspaces.createdAt));
+  return rows;
+}
+
+export interface WorkspaceMemberView {
+  userId: string;
+  email: string;
+  name: string | null;
+  role: string;
+  createdAt: Date;
+}
+
+export async function listWorkspaceMembers(db: Database, workspaceId: string): Promise<WorkspaceMemberView[]> {
+  return db
+    .select({
+      userId: users.id,
+      email: users.email,
+      name: users.name,
+      role: workspaceMembers.role,
+      createdAt: workspaceMembers.createdAt,
+    })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(workspaceMembers.userId, users.id))
+    .where(eq(workspaceMembers.workspaceId, workspaceId))
+    .orderBy(asc(workspaceMembers.createdAt));
+}
+
+export async function removeWorkspaceMember(
+  db: Database,
+  workspaceId: string,
+  userId: string,
+): Promise<boolean> {
+  const existing = await getWorkspaceMember(db, workspaceId, userId);
+  if (!existing) return false;
+  await db
+    .delete(workspaceMembers)
+    .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)));
+  return true;
+}
+
+// ------------------------------------------------------------ token vault (Fase 3)
+
+export type TokenVaultRow = typeof tokenVault.$inferSelect;
+
+export async function insertTokenVaultEntry(
+  db: Database,
+  input: {
+    workspaceId: string;
+    kind: string;
+    label?: string;
+    ciphertext: string;
+    iv: string;
+    authTag: string;
+  },
+): Promise<TokenVaultRow> {
+  const [row] = await db.insert(tokenVault).values(input).returning();
+  return row!;
+}
+
+export async function getTokenVaultEntry(db: Database, id: string): Promise<TokenVaultRow | null> {
+  const [row] = await db.select().from(tokenVault).where(eq(tokenVault.id, id)).limit(1);
+  return row ?? null;
+}
+
+/** Rotation replaces the sealed material in place - the vault ref stays stable. */
+export async function updateTokenVaultEntry(
+  db: Database,
+  id: string,
+  sealed: { ciphertext: string; iv: string; authTag: string },
+): Promise<void> {
+  await db
+    .update(tokenVault)
+    .set({ ...sealed, rotatedAt: new Date() })
+    .where(eq(tokenVault.id, id));
+}
+
+export async function deleteTokenVaultEntry(db: Database, id: string): Promise<void> {
+  await db.delete(tokenVault).where(eq(tokenVault.id, id));
+}
+
+// ------------------------------------------------------- workspace domains (Fase 3)
+
+export type WorkspaceDomainRow = typeof workspaceDomains.$inferSelect;
+
+export async function createWorkspaceDomain(
+  db: Database,
+  input: {
+    workspaceId: string;
+    domain: string;
+    channelAccountId?: string;
+    resendDomainId?: string;
+    status?: string;
+  },
+): Promise<WorkspaceDomainRow> {
+  const [row] = await db
+    .insert(workspaceDomains)
+    .values({ ...input, domain: input.domain.toLowerCase() })
+    .returning();
+  return row!;
+}
+
+export async function listWorkspaceDomains(db: Database, workspaceId: string): Promise<WorkspaceDomainRow[]> {
+  return db
+    .select()
+    .from(workspaceDomains)
+    .where(eq(workspaceDomains.workspaceId, workspaceId))
+    .orderBy(asc(workspaceDomains.domain));
+}
+
+/** Inbound routing lookup: which workspace owns mail for this recipient domain. */
+export async function findWorkspaceDomain(db: Database, domain: string): Promise<WorkspaceDomainRow | null> {
+  const [row] = await db
+    .select()
+    .from(workspaceDomains)
+    .where(eq(workspaceDomains.domain, domain.toLowerCase()))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function deleteWorkspaceDomain(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const [row] = await db
+    .select()
+    .from(workspaceDomains)
+    .where(and(eq(workspaceDomains.id, id), eq(workspaceDomains.workspaceId, workspaceId)))
+    .limit(1);
+  if (!row) return false;
+  await db.delete(workspaceDomains).where(eq(workspaceDomains.id, id));
+  return true;
+}
+
+/** The workspace's email channel account (inbound routing fallback). */
+export async function findEmailAccountForWorkspace(
+  db: Database,
+  workspaceId: string,
+): Promise<ChannelAccountRow | null> {
+  const [row] = await db
+    .select()
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.workspaceId, workspaceId), eq(channelAccounts.channel, "email")))
+    .orderBy(asc(channelAccounts.createdAt))
+    .limit(1);
+  return row ?? null;
+}
+
+// ------------------------------------------------------------------ audit (Fase 3)
+
+export async function insertAuditLog(
+  db: Database,
+  input: {
+    workspaceId?: string;
+    userId?: string;
+    action: string;
+    details?: Record<string, unknown>;
+  },
+): Promise<void> {
+  await db.insert(auditLog).values({
+    workspaceId: input.workspaceId,
+    userId: input.userId,
+    action: input.action,
+    details: input.details ?? {},
+  });
+}
+
+// ------------------------------------------------- WhatsApp allowance count (Fase 3)
+
+/**
+ * Delivered service-message UNITS already rated for one phone number
+ * (channel account) inside [from, to) - the month-to-date figure the
+ * send-message processor consults before rating the next service message:
+ * the first 1,000 per number per month are free.
+ */
+export async function countServiceUnitsInRange(
+  db: Database,
+  channelAccountId: string,
+  from: Date,
+  to: Date,
+): Promise<number> {
+  const rows = await db
+    .select({ units: costLedger.units })
+    .from(costLedger)
+    .where(
+      and(
+        eq(costLedger.channelAccountId, channelAccountId),
+        eq(costLedger.category, "service"),
+        sql`${costLedger.createdAt} >= ${from}`,
+        sql`${costLedger.createdAt} < ${to}`,
+      ),
+    );
+  return rows.reduce((sum, r) => sum + r.units, 0);
+}
+
+// ------------------------------------------------------------- readiness (Fase 3)
+
+/** Cheap liveness probe for /health/ready. Throws when the DB is unreachable. */
+export async function pingDb(db: Database): Promise<void> {
+  await db.execute(sql`select 1`);
+}
+
+// --------------------------------------------------------------------- KB (Fase 3)
+
+export type KbDocumentRow = typeof kbDocuments.$inferSelect;
+export type KbChunkRow = typeof kbChunks.$inferSelect;
+
+export async function createKbDocument(
+  db: Database,
+  input: { workspaceId: string; title: string; sourceText: string },
+): Promise<KbDocumentRow> {
+  const [row] = await db.insert(kbDocuments).values(input).returning();
+  return row!;
+}
+
+export async function getKbDocument(db: Database, workspaceId: string, id: string): Promise<KbDocumentRow | null> {
+  const [row] = await db
+    .select()
+    .from(kbDocuments)
+    .where(and(eq(kbDocuments.id, id), eq(kbDocuments.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Worker-side lookup: ingest jobs carry only the document id. */
+export async function getKbDocumentById(db: Database, id: string): Promise<KbDocumentRow | null> {
+  const [row] = await db.select().from(kbDocuments).where(eq(kbDocuments.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function listKbDocuments(db: Database, workspaceId: string): Promise<KbDocumentRow[]> {
+  return db
+    .select()
+    .from(kbDocuments)
+    .where(eq(kbDocuments.workspaceId, workspaceId))
+    .orderBy(desc(kbDocuments.createdAt));
+}
+
+export async function updateKbDocument(
+  db: Database,
+  id: string,
+  patch: { status?: string; chunkCount?: number },
+): Promise<void> {
+  await db
+    .update(kbDocuments)
+    .set({
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.chunkCount !== undefined ? { chunkCount: patch.chunkCount } : {}),
+    })
+    .where(eq(kbDocuments.id, id));
+}
+
+export async function deleteKbDocument(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getKbDocument(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(kbChunks).where(eq(kbChunks.documentId, id));
+  await db.delete(kbDocuments).where(eq(kbDocuments.id, id));
+  return true;
+}
+
+/** Replace a document's chunks (re-ingestion is idempotent). */
+export async function replaceKbChunks(
+  db: Database,
+  document: { id: string; workspaceId: string },
+  chunks: Array<{ chunkIndex: number; text: string; embedding: number[] }>,
+): Promise<void> {
+  await db.delete(kbChunks).where(eq(kbChunks.documentId, document.id));
+  if (chunks.length === 0) return;
+  await db.insert(kbChunks).values(
+    chunks.map((c) => ({
+      workspaceId: document.workspaceId,
+      documentId: document.id,
+      chunkIndex: c.chunkIndex,
+      text: c.text,
+      embedding: c.embedding,
+    })),
+  );
+}
+
+/** Every chunk of a workspace - retrieval ranks them in code (cosine). */
+export async function listKbChunksByWorkspace(db: Database, workspaceId: string): Promise<KbChunkRow[]> {
+  return db
+    .select()
+    .from(kbChunks)
+    .where(eq(kbChunks.workspaceId, workspaceId))
+    .orderBy(asc(kbChunks.createdAt));
+}
+
+// ------------------------------------------------- Meta data deletion (Fase 3)
+
+export type DataDeletionRequestRow = typeof dataDeletionRequests.$inferSelect;
+
+export async function createDataDeletionRequest(
+  db: Database,
+  input: { confirmationCode: string; providerUserId: string },
+): Promise<DataDeletionRequestRow> {
+  const [row] = await db.insert(dataDeletionRequests).values(input).returning();
+  return row!;
+}
+
+export async function getDataDeletionRequestByCode(
+  db: Database,
+  confirmationCode: string,
+): Promise<DataDeletionRequestRow | null> {
+  const [row] = await db
+    .select()
+    .from(dataDeletionRequests)
+    .where(eq(dataDeletionRequests.confirmationCode, confirmationCode))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function completeDataDeletionRequest(db: Database, confirmationCode: string): Promise<void> {
+  await db
+    .update(dataDeletionRequests)
+    .set({ status: "completed", completedAt: new Date() })
+    .where(eq(dataDeletionRequests.confirmationCode, confirmationCode));
+}
+
+/**
+ * Best-effort purge of everything Botara holds for one provider user id
+ * (the id Meta puts in a data-deletion signed_request): contacts with that
+ * external id, plus their messages, webchat sessions, sequence enrollments
+ * and conversations. Channel accounts are the WORKSPACE's credentials, not
+ * the end user's data, and are never touched here.
+ */
+export async function purgeExternalUserData(
+  db: Database,
+  providerUserId: string,
+): Promise<{ contacts: number }> {
+  const rows = await db.select().from(contacts).where(eq(contacts.externalId, providerUserId));
+  for (const contact of rows) {
+    const convs = await db
+      .select({ id: conversations.id })
+      .from(conversations)
+      .where(eq(conversations.contactId, contact.id));
+    for (const conv of convs) {
+      await db.delete(messages).where(eq(messages.conversationId, conv.id));
+    }
+    await db.delete(webchatSessions).where(eq(webchatSessions.contactId, contact.id));
+    await db.delete(sequenceEnrollments).where(eq(sequenceEnrollments.contactId, contact.id));
+    await db.delete(conversations).where(eq(conversations.contactId, contact.id));
+    await db.delete(contacts).where(eq(contacts.id, contact.id));
+  }
+  return { contacts: rows.length };
 }

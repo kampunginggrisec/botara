@@ -22,6 +22,12 @@ export const users = pgTable("users", {
   id: uuid("id").primaryKey().defaultRandom(),
   email: varchar("email", { length: 320 }).notNull(),
   name: varchar("name", { length: 200 }),
+  /**
+   * Argon2id password hash (Bun.password). Nullable: a user row can exist
+   * before its owner ever logs in - workspace invites create the row by
+   * email, and registration later claims it by setting the hash.
+   */
+  passwordHash: varchar("password_hash", { length: 300 }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex("users_email_idx").on(t.email)]);
 
@@ -206,6 +212,112 @@ export const sequenceEnrollments = pgTable("sequence_enrollments", {
   uniqueIndex("sequence_enrollments_seq_contact_idx").on(t.sequenceId, t.contactId),
   index("sequence_enrollments_due_idx").on(t.status, t.nextStepAt),
 ]);
+
+/**
+ * Token vault (Fase 3). Raw channel secrets live ONLY here, AES-256-GCM
+ * encrypted with TOKEN_VAULT_KEY (see packages/db/src/vault.ts). Channel
+ * account rows carry nothing but the vault entry id as `token_vault_ref`
+ * (`vault:db:{id}`). iv/auth_tag are base64; rotatedAt records the last
+ * rotation (a rotate replaces ciphertext in place under the same ref).
+ */
+export const tokenVault = pgTable("token_vault", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  /** What the secret is for: a channel key ("whatsapp", "telegram", ...) or "generic". */
+  kind: varchar("kind", { length: 60 }).notNull(),
+  label: varchar("label", { length: 200 }),
+  ciphertext: text("ciphertext").notNull(),
+  iv: varchar("iv", { length: 64 }).notNull(),
+  authTag: varchar("auth_tag", { length: 64 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  rotatedAt: timestamp("rotated_at", { withTimezone: true }),
+}, (t) => [index("token_vault_ws_idx").on(t.workspaceId)]);
+
+/**
+ * Workspace email domains (Fase 3). An inbound Resend webhook resolves the
+ * owning workspace by the RECIPIENT domain through this table, then routes
+ * the message to the workspace's email channel account (explicit link wins,
+ * otherwise the workspace's email account is discovered).
+ */
+export const workspaceDomains = pgTable("workspace_domains", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  /** Lowercase ASCII domain, e.g. "mail.example.com". Unique platform-wide. */
+  domain: varchar("domain", { length: 255 }).notNull(),
+  channelAccountId: uuid("channel_account_id").references(() => channelAccounts.id),
+  /** Resend-side domain id once the domain is registered with Resend. */
+  resendDomainId: varchar("resend_domain_id", { length: 200 }),
+  status: varchar("status", { length: 40 }).notNull().default("pending"), // pending|verified
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("workspace_domains_domain_idx").on(t.domain),
+  index("workspace_domains_ws_idx").on(t.workspaceId),
+]);
+
+/**
+ * Security audit trail (Fase 3): logins, registrations, vault writes and
+ * rotations, member add/remove. `details` is jsonb and must NEVER contain
+ * secret material - ids and emails only.
+ */
+export const auditLog = pgTable("audit_log", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id"),
+  userId: uuid("user_id"),
+  action: varchar("action", { length: 80 }).notNull(), // auth.register|auth.login|vault.put|vault.rotate|workspace.member.add|workspace.member.remove
+  details: jsonb("details").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("audit_log_ws_created_idx").on(t.workspaceId, t.createdAt)]);
+
+/**
+ * Knowledge base (Fase 3). Documents are chunked + embedded by the worker's
+ * kb-ingest job. Chunk embeddings are stored as jsonb number arrays for
+ * portability (any Postgres, no extension required) and retrieval ranks by
+ * cosine similarity in application code.
+ *
+ * OPTIONAL pgvector path: on instances where the `vector` extension is
+ * available, an operator MAY add a `embedding_vec vector(1536)` column +
+ * ivfflat index via a manual migration and backfill from the jsonb arrays;
+ * the runtime deliberately does NOT depend on the extension (see the
+ * retrieval helper in packages/ai and docs/runbook.md).
+ */
+export const kbDocuments = pgTable("kb_documents", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  title: varchar("title", { length: 300 }).notNull(),
+  sourceText: text("source_text").notNull(),
+  status: varchar("status", { length: 40 }).notNull().default("pending"), // pending|processing|ready|failed
+  chunkCount: integer("chunk_count").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("kb_documents_ws_idx").on(t.workspaceId)]);
+
+export const kbChunks = pgTable("kb_chunks", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  documentId: uuid("document_id").notNull().references(() => kbDocuments.id),
+  chunkIndex: integer("chunk_index").notNull().default(0),
+  text: text("text").notNull(),
+  /** Embedding vector as a jsonb number array (portable; see table note). */
+  embedding: jsonb("embedding").notNull().default([]),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("kb_chunks_ws_idx").on(t.workspaceId),
+  index("kb_chunks_document_idx").on(t.documentId),
+]);
+
+/**
+ * Meta data-deletion requests (Fase 3). Meta's deletion callback posts a
+ * signed_request; we record one row per request, answer with a public
+ * status URL keyed by confirmation_code, and purge the provider user's
+ * contact data best-effort (see repositories.purgeExternalUserData).
+ */
+export const dataDeletionRequests = pgTable("data_deletion_requests", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  confirmationCode: varchar("confirmation_code", { length: 64 }).notNull(),
+  providerUserId: varchar("provider_user_id", { length: 200 }).notNull(),
+  status: varchar("status", { length: 40 }).notNull().default("received"), // received|completed
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  completedAt: timestamp("completed_at", { withTimezone: true }),
+}, (t) => [uniqueIndex("data_deletion_requests_code_idx").on(t.confirmationCode)]);
 
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),
