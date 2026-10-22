@@ -92,6 +92,12 @@ export interface WorkerPorts {
    * (the conservative default - never silently free).
    */
   countServiceMessagesThisMonth?(channelAccountId: string, now: Date): Promise<number>;
+  /**
+   * AI reply for flow ai_reply nodes (Fase 3): KB retrieval + AI chat in
+   * production. Return null when AI/KB have nothing - the flow executor
+   * then sends the node's configured fallback text.
+   */
+  aiReply?(input: { workspaceId: string; prompt: string; query: string }): Promise<string | null>;
   /** Enqueue a send-message job; `data.idempotencyKey` is the stable job identity. */
   enqueueSendMessage(data: SendMessageJobData): Promise<void>;
   setContactField(workspaceId: string, contactId: string, field: string, value: string): Promise<void>;
@@ -216,6 +222,10 @@ export async function processFlowRun(ports: WorkerPorts, data: FlowRunJobData): 
     },
     async setContactField({ field, value }) {
       await ports.setContactField(ctx.workspaceId, ctx.contactId, field, value);
+    },
+    async aiReply({ prompt, query }) {
+      if (!ports.aiReply) return null;
+      return ports.aiReply({ workspaceId: ctx.workspaceId, prompt, query });
     },
   };
   return runFlow(flowPorts, data.flow, data.state, data.event);

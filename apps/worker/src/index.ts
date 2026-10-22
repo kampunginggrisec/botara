@@ -1,9 +1,13 @@
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
 import {
+  createAIProviderFromEnv, DEFAULT_AI_MODEL, DEFAULT_EMBEDDING_MODEL, rankChunks,
+} from "@botara/ai";
+import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
+  getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
   listChannelAccountsDueForRefresh, updateChannelAccountToken,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
@@ -27,6 +31,7 @@ import {
 } from "./publish";
 import { processSequenceAdvance, type SequencePorts } from "./sequences";
 import { processEmailInbound, type EmailInboundJobData, type EmailInboundPorts } from "./email-inbound";
+import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-ingest";
 
 /**
  * Botara worker - Fase 2 entrypoint.
@@ -42,7 +47,7 @@ import { processEmailInbound, type EmailInboundJobData, type EmailInboundPorts }
  */
 
 export const QUEUE_NAMES = [
-  "broadcast", "sequence", "publish", "token-refresh", "email", "send-message", "flow-run",
+  "broadcast", "sequence", "publish", "token-refresh", "email", "send-message", "flow-run", "kb",
 ] as const;
 export type QueueName = (typeof QUEUE_NAMES)[number];
 
@@ -86,6 +91,39 @@ function buildProdPorts(db: Database): WorkerPorts {
       const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
       const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
       return countServiceUnitsInRange(db, channelAccountId, start, end);
+    },
+    async aiReply({ workspaceId, prompt, query }) {
+      // Fase 3: KB-grounded AI reply for flow ai_reply nodes. Retrieval =
+      // embed the query, cosine-rank the workspace's stored chunk
+      // embeddings in code (no pgvector dependency), top-3 into the chat
+      // context. Any gap (no provider, empty KB, no relevant chunk) -> null
+      // and the flow sends its configured fallback text.
+      const provider = createAIProviderFromEnv(process.env);
+      if (!provider) return null;
+      const stored = await listKbChunksByWorkspace(db, workspaceId);
+      if (stored.length === 0) return null;
+      const queryEmbedding = await provider.embedding({
+        model: process.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
+        text: query,
+      });
+      const top = rankChunks(
+        stored.map((c) => ({ text: c.text, embedding: c.embedding as number[] | null })),
+        queryEmbedding,
+        3,
+      );
+      if (top.length === 0) return null;
+      const context = top.map((r) => r.item.text).join("\n---\n");
+      const result = await provider.chatCompletion({
+        model: process.env.AI_MODEL ?? DEFAULT_AI_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: `${prompt}\n\nBasis pengetahuan (gunakan bila relevan, jangan mengarang di luar ini):\n${context}`,
+          },
+          { role: "user", content: query },
+        ],
+      });
+      return result.text;
     },
     async updateMessageStatus(messageId, status, externalId) {
       await updateMessageStatus(db, messageId, status, externalId);
@@ -363,6 +401,40 @@ function buildEmailPorts(db: Database): EmailInboundPorts {
   };
 }
 
+// --------------------------------------------------------------- kb ports
+
+function buildKbPorts(db: Database): KbIngestPorts {
+  return {
+    async loadDocument(workspaceId, documentId) {
+      const row = await getKbDocument(db, workspaceId, documentId);
+      return row
+        ? { id: row.id, workspaceId: row.workspaceId, title: row.title, content: row.sourceText }
+        : null;
+    },
+    async embed(texts) {
+      const provider = createAIProviderFromEnv(process.env);
+      if (!provider) {
+        throw new Error("AI provider is not configured (set AI_PROVIDER + provider API key) - cannot embed KB chunks");
+      }
+      const model = process.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
+      const vectors: number[][] = [];
+      for (const text of texts) {
+        vectors.push(await provider.embedding({ model, text }));
+      }
+      return vectors;
+    },
+    async replaceChunks(workspaceId, documentId, chunks) {
+      await replaceKbChunks(db, { id: documentId, workspaceId }, chunks);
+    },
+    async markReady(documentId, chunkCount) {
+      await updateKbDocument(db, documentId, { status: "ready", chunkCount });
+    },
+    async markFailed(documentId, error) {
+      await updateKbDocument(db, documentId, { status: "failed", error });
+    },
+  };
+}
+
 // ------------------------------------------------------------------ dispatch
 
 async function dispatch(queueName: string, job: Job): Promise<unknown> {
@@ -392,6 +464,8 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
       return processSequenceAdvance(buildSequencePorts(db), { now: new Date() });
     case "email":
       return processEmailInbound(buildEmailPorts(db), job.data as EmailInboundJobData);
+    case "kb":
+      return processKbIngest(buildKbPorts(db), job.data as KbIngestJobData);
     default:
       console.log(`[worker] ${queueName}: received job ${job.id} (${job.name}) - no handler`);
       return { stub: true };

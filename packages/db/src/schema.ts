@@ -287,6 +287,8 @@ export const kbDocuments = pgTable("kb_documents", {
   sourceText: text("source_text").notNull(),
   status: varchar("status", { length: 40 }).notNull().default("pending"), // pending|processing|ready|failed
   chunkCount: integer("chunk_count").notNull().default(0),
+  /** Last ingestion failure reason (status = failed), for the admin UI. */
+  error: text("error"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("kb_documents_ws_idx").on(t.workspaceId)]);
 

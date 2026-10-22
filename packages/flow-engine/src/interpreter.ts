@@ -21,6 +21,7 @@ export interface FlowEvent {
 
 export type FlowAction =
   | { type: "send_message"; text: string; channel?: string }
+  | { type: "ai_reply"; prompt: string; fallbackText: string; query: string; channel?: string }
   | { type: "schedule_delay"; seconds: number }
   | { type: "call_webhook"; url: string; method: "GET" | "POST" }
   | { type: "set_contact_field"; field: string; value: string }
@@ -65,6 +66,18 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
       return {
         state: advance(node.next),
         actions: [{ type: "set_contact_field", field: node.field, value }],
+      };
+    }
+    case "ai_reply": {
+      // The interpreter stays pure: it emits an ai_reply action carrying
+      // the (interpolated) instruction + the user's message as the
+      // retrieval query. The executor resolves it through its aiReply port
+      // (KB retrieval + AI chat) and falls back to fallbackText.
+      const prompt = node.prompt.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
+      const query = event.text ?? variables.messageText ?? "";
+      return {
+        state: advance(node.next),
+        actions: [{ type: "ai_reply", prompt, fallbackText: node.fallbackText, query, channel: node.channel }],
       };
     }
   }

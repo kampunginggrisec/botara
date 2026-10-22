@@ -22,7 +22,8 @@ import {
   createWorkspaceDomain, listWorkspaceDomains, deleteWorkspaceDomain,
   createDataDeletionRequest, getDataDeletionRequestByCode, completeDataDeletionRequest,
   purgeExternalUserData,
-  createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument, listKbChunksByWorkspace,
+  createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument,
+  listKbChunks, listKbChunksByWorkspace,
   type Database, type ScheduledPostTarget, type SequenceStep,
 } from "@botara/db";
 import {
@@ -38,7 +39,8 @@ import {
 } from "./auth";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
-  createAIProviderFromEnv, moderateText, DEFAULT_AI_MODEL, type AIProvider,
+  createAIProviderFromEnv, moderateText, rankChunks,
+  DEFAULT_AI_MODEL, DEFAULT_EMBEDDING_MODEL, type AIProvider,
 } from "@botara/ai";
 import {
   InMemoryVault, exchangeEmbeddedSignup,
@@ -120,7 +122,7 @@ export interface DataDeletionStore {
 
 /** Enqueues a kb-ingest job (worker "kb" queue) for a new knowledge-base document. */
 export interface KbEnqueuer {
-  enqueueKbIngest(documentId: string): Promise<void>;
+  enqueueKbIngest(input: { workspaceId: string; documentId: string }): Promise<void>;
 }
 
 export interface DependencyStatus {
@@ -241,7 +243,7 @@ export function createBullMqEmailEnqueuer(redisUrl: string): EmailInboundEnqueue
 export function createBullMqKbEnqueuer(redisUrl: string): KbEnqueuer {
   const inner = createBullMqEnqueuer(redisUrl, "kb", "ingest");
   return {
-    enqueueKbIngest: (documentId) => inner.enqueue({ documentId }, `kb-ingest:${documentId}`),
+    enqueueKbIngest: (input) => inner.enqueue(input, `kb-ingest:${input.documentId}`),
   };
 }
 
@@ -1655,6 +1657,39 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const conversation = await getConversation(db, ws, id);
     if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
     const history = (await listMessages(db, id)).slice(-20);
+    // Fase 3: ground the suggestion in the workspace KB when it exists -
+    // embed the latest customer message, cosine-rank the stored chunk
+    // embeddings in code, and hand the top-3 to the model as reference
+    // material. Retrieval is best-effort: any failure simply yields an
+    // ungrounded suggestion (the 503 above still guards "no AI at all").
+    let kbContext = "";
+    let kbChunksUsed = 0;
+    const lastInbound = [...history].reverse().find((m) => m.direction === "in")?.body;
+    if (lastInbound) {
+      try {
+        const stored = await listKbChunksByWorkspace(db, ws);
+        if (stored.length > 0) {
+          const queryEmbedding = await provider.embedding({
+            model: deps.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
+            text: lastInbound,
+          });
+          const top = rankChunks(
+            stored.map((row) => ({ text: row.text, embedding: row.embedding as number[] | null })),
+            queryEmbedding,
+            3,
+          );
+          if (top.length > 0) {
+            kbChunksUsed = top.length;
+            kbContext = "\n\nReference material from the workspace knowledge base (prefer it when relevant):\n"
+              + top.map((r) => r.item.text).join("\n---\n");
+          }
+        }
+      } catch (err) {
+        console.warn(
+          `[api] ai-suggest KB retrieval skipped: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
     const result = await provider.chatCompletion({
       model: deps.env.AI_MODEL ?? DEFAULT_AI_MODEL,
       messages: [
@@ -1662,7 +1697,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           role: "system",
           content:
             "You help a customer-support agent. Draft a helpful, concise reply to the customer, " +
-            "in the same language as the conversation. Return only the reply text.",
+            "in the same language as the conversation. Return only the reply text." + kbContext,
         },
         ...(history.length > 0
           ? history.map((m) => ({
@@ -1672,7 +1707,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           : [{ role: "user" as const, content: "(no prior messages)" }]),
       ],
     });
-    return c.json({ suggestion: result.text, model: result.model });
+    return c.json({ suggestion: result.text, model: result.model, kbChunksUsed });
   });
 
   const moderationRoute = createRoute({
@@ -1821,6 +1856,101 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const result = await deps.whatsappOnboarding(ws, c.req.valid("json"));
     // The result summary carries no token material by construction.
     return c.json({ result }, 201);
+  });
+
+  // ------------------------------------------------ knowledge base (Fase 3)
+
+  const serializeKbDocument = (d: Awaited<ReturnType<typeof listKbDocuments>>[number]) => ({
+    id: d.id,
+    title: d.title,
+    status: d.status,
+    chunkCount: d.chunkCount,
+    error: d.error ?? undefined,
+    createdAt: iso(d.createdAt),
+  });
+
+  const createKbDocumentRoute = createRoute({
+    method: "post", path: "/kb/documents",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              title: z.string().min(1).max(300),
+              content: z.string().min(1).max(1_000_000),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "KB document accepted for ingestion" } },
+  });
+  app.openapi(createKbDocumentRoute, async (c) => {
+    guardMutator(c);
+    // Ingestion EMBEDS the chunks - without an AI provider there is
+    // nothing honest to do with the document, so fail fast with 503
+    // before storing anything.
+    if (!deps.getAiProvider()) {
+      throw new AppError(
+        "CONFIGURATION",
+        "No AI provider is configured (AI_API_KEY); KB ingestion needs embeddings and is never faked.",
+        { status: 503 },
+      );
+    }
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const doc = await createKbDocument(db, { workspaceId: ws, title: body.title, sourceText: body.content });
+    // Enqueue the kb-ingest job (chunk + embed in the worker). A queue
+    // failure surfaces as 503; the document stays "pending" and visible.
+    await deps.kbEnqueuer.enqueueKbIngest({ workspaceId: ws, documentId: doc.id });
+    return c.json({ document: serializeKbDocument(doc) }, 201);
+  });
+
+  const listKbDocumentsRoute = createRoute({
+    method: "get", path: "/kb/documents",
+    responses: { 200: { description: "KB documents of the workspace" } },
+  });
+  app.openapi(listKbDocumentsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listKbDocuments(db, ws);
+    return c.json({ documents: rows.map(serializeKbDocument) });
+  });
+
+  const getKbDocumentRoute = createRoute({
+    method: "get", path: "/kb/documents/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "KB document with its chunks (embeddings omitted)" } },
+  });
+  app.openapi(getKbDocumentRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const doc = await getKbDocument(db, ws, id);
+    if (!doc) throw new AppError("NOT_FOUND", "KB document not found.", { status: 404 });
+    const chunks = await listKbChunks(db, ws, id);
+    return c.json({
+      document: {
+        ...serializeKbDocument(doc),
+        content: doc.sourceText,
+        chunks: chunks.map((ch) => ({ chunkIndex: ch.chunkIndex, text: ch.text })),
+      },
+    });
+  });
+
+  const deleteKbDocumentRoute = createRoute({
+    method: "delete", path: "/kb/documents/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "KB document deleted (chunks cascade)" } },
+  });
+  app.openapi(deleteKbDocumentRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const deleted = await deleteKbDocument(db, ws, c.req.valid("param").id);
+    if (!deleted) throw new AppError("NOT_FOUND", "KB document not found.", { status: 404 });
+    return c.json({ deleted: true });
   });
 
   // ------------------------------------------------------ webchat (Fase 2)

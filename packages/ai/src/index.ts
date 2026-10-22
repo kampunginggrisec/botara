@@ -196,3 +196,8 @@ export function moderateText(
   matches.sort((a, b) => a.index - b.index);
   return { flagged: matches.length > 0, matches };
 }
+
+export {
+  DEFAULT_EMBEDDING_MODEL, chunkText, cosineSimilarity, rankChunks,
+  type RankedChunk, type TextChunk,
+} from "./kb";

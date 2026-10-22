@@ -124,3 +124,53 @@ describe("flow executor", () => {
     expect(result.state.status).toBe("completed");
   });
 });
+
+describe("ai_reply node (Fase 3)", () => {
+  const aiFlow: Flow = {
+    id: "support-ai",
+    version: 1,
+    startNodeId: "t1",
+    nodes: [
+      { id: "t1", type: "trigger", trigger: "message.received", config: {}, next: "ai1" },
+      {
+        id: "ai1", type: "ai_reply",
+        prompt: "Jawab sebagai support untuk {{name}}.",
+        fallbackText: "Maaf, tim kami akan segera membantu.",
+        next: null,
+      },
+    ],
+  };
+
+  test("schema accepts the ai_reply node", async () => {
+    const { flowSchema } = await import("./schemas");
+    expect(flowSchema.parse(aiFlow).nodes[1]!.type).toBe("ai_reply");
+  });
+
+  test("generated reply is sent; the port receives prompt + the user message as query", async () => {
+    const f = fakePorts();
+    const seen: Array<{ prompt: string; query: string }> = [];
+    f.ports.aiReply = async (input) => {
+      seen.push(input);
+      return "Jam buka kami 09.00-17.00 WIB.";
+    };
+    const result = await runFlow(f.ports, aiFlow, undefined, {
+      type: "message.received", text: "jam buka?", variables: { name: "Romo" },
+    });
+    expect(seen).toEqual([{ prompt: "Jawab sebagai support untuk Romo.", query: "jam buka?" }]);
+    expect(f.sent).toEqual([{ text: "Jam buka kami 09.00-17.00 WIB.", channel: undefined }]);
+    expect(result.state.status).toBe("completed");
+  });
+
+  test("port returns null (AI down / KB empty) -> the configured fallback is sent", async () => {
+    const f = fakePorts();
+    f.ports.aiReply = async () => null;
+    await runFlow(f.ports, aiFlow, undefined, { type: "message.received", text: "halo" });
+    expect(f.sent).toEqual([{ text: "Maaf, tim kami akan segera membantu.", channel: undefined }]);
+  });
+
+  test("no aiReply port at all -> the fallback is sent (flow never dead-ends)", async () => {
+    const f = fakePorts();
+    await runFlow(f.ports, aiFlow, undefined, { type: "message.received", text: "halo" });
+    expect(f.sent).toEqual([{ text: "Maaf, tim kami akan segera membantu.", channel: undefined }]);
+  });
+});

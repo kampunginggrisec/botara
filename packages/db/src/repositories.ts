@@ -1281,13 +1281,14 @@ export async function listKbDocuments(db: Database, workspaceId: string): Promis
 export async function updateKbDocument(
   db: Database,
   id: string,
-  patch: { status?: string; chunkCount?: number },
+  patch: { status?: string; chunkCount?: number; error?: string | null },
 ): Promise<void> {
   await db
     .update(kbDocuments)
     .set({
       ...(patch.status !== undefined ? { status: patch.status } : {}),
       ...(patch.chunkCount !== undefined ? { chunkCount: patch.chunkCount } : {}),
+      ...(patch.error !== undefined ? { error: patch.error } : {}),
     })
     .where(eq(kbDocuments.id, id));
 }
@@ -1320,6 +1321,19 @@ export async function replaceKbChunks(
 }
 
 /** Every chunk of a workspace - retrieval ranks them in code (cosine). */
+/** Chunks of ONE document, in chunk order (document detail views). */
+export async function listKbChunks(
+  db: Database,
+  workspaceId: string,
+  documentId: string,
+): Promise<KbChunkRow[]> {
+  return db
+    .select()
+    .from(kbChunks)
+    .where(and(eq(kbChunks.workspaceId, workspaceId), eq(kbChunks.documentId, documentId)))
+    .orderBy(kbChunks.chunkIndex);
+}
+
 export async function listKbChunksByWorkspace(db: Database, workspaceId: string): Promise<KbChunkRow[]> {
   return db
     .select()

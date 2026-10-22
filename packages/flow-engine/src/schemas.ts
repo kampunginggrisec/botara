@@ -51,9 +51,26 @@ export const setFieldNodeSchema = z.object({
   value: z.string(),
 });
 
+/**
+ * AI reply node (Fase 3): answer the contact with an AI-generated reply
+ * grounded in the workspace knowledge base (top-3 chunks by cosine
+ * similarity) plus the triggering message. `fallbackText` is sent verbatim
+ * whenever AI is unconfigured or the KB has nothing relevant - flows must
+ * never dead-end on AI availability.
+ */
+export const aiReplyNodeSchema = z.object({
+  ...base,
+  type: z.literal("ai_reply"),
+  /** Instruction for the assistant: what to answer, tone, constraints. */
+  prompt: z.string().default(""),
+  /** Sent verbatim when AI/KB yield nothing. Required, never empty. */
+  fallbackText: z.string().min(1),
+  channel: z.string().optional(),
+});
+
 export const flowNodeSchema = z.discriminatedUnion("type", [
   triggerNodeSchema, sendMessageNodeSchema, conditionNodeSchema, delayNodeSchema, webhookNodeSchema,
-  setFieldNodeSchema,
+  setFieldNodeSchema, aiReplyNodeSchema,
 ]);
 
 export type FlowNode = z.infer<typeof flowNodeSchema>;

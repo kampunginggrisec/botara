@@ -21,6 +21,13 @@ export interface FlowPorts {
   scheduleDelay(input: { seconds: number; resumeState: FlowState }): Promise<void>;
   httpWebhook(input: { url: string; method: "GET" | "POST" }): Promise<void>;
   setContactField(input: { field: string; value: string }): Promise<void>;
+  /**
+   * AI reply port (Fase 3): KB retrieval + AI generation for ai_reply
+   * nodes. Return the reply text, or null when AI is unconfigured / the KB
+   * has nothing relevant - the executor then sends the node's configured
+   * fallbackText instead, so a flow never dead-ends on AI availability.
+   */
+  aiReply?(input: { prompt: string; query: string }): Promise<string | null>;
 }
 
 export interface FlowRunResult {
@@ -91,6 +98,15 @@ export async function runFlow(
           await ports.sendMessage({ text: action.text, channel: action.channel });
           executed.push(action);
           break;
+        case "ai_reply": {
+          const generated = ports.aiReply
+            ? await ports.aiReply({ prompt: action.prompt, query: action.query })
+            : null;
+          const text = generated ?? action.fallbackText;
+          await ports.sendMessage({ text, channel: action.channel });
+          executed.push({ type: "send_message", text, channel: action.channel });
+          break;
+        }
         case "call_webhook":
           await ports.httpWebhook({ url: action.url, method: action.method });
           executed.push(action);
