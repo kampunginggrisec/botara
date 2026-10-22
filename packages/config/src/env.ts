@@ -37,6 +37,23 @@ export const envSchema = z.object({
   AI_API_KEY: z.string().optional(),
   AI_BASE_URL: z.string().url().optional(),
   AI_MODEL: z.string().optional(),
+  AI_EMBEDDING_MODEL: z.string().optional(),
+
+  // Fase 3 auth + vault + hardening
+  /** HS256 signing secret for session JWTs. Required in production. */
+  SESSION_SECRET: z.string().optional(),
+  /** Base64-encoded 32-byte AES-256 key for the token vault. Required in production. */
+  TOKEN_VAULT_KEY: z.string().optional(),
+  /** Comma-separated CORS allowlist for the dashboard API (default: deny cross-origin). */
+  CORS_ORIGINS: z.string().optional(),
+  /**
+   * DEV ONLY escape hatch: when exactly "1", the API accepts the legacy
+   * X-Workspace-Id header as workspace context without a session token.
+   * Default off; never enable in production.
+   */
+  BOTARA_ALLOW_HEADER_WORKSPACE: z.string().optional(),
+  /** Public base URL of this deployment (data-deletion status URLs etc.). */
+  APP_PUBLIC_URL: z.string().url().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
