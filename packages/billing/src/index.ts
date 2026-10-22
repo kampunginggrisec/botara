@@ -67,6 +67,36 @@ export function getWhatsAppRate(
 /** Free service messages per business phone number per month (since 2026-10-01 model). */
 export const WHATSAPP_FREE_SERVICE_PER_MONTH = 1000;
 
+/** Fase 3 name for the monthly free service allowance. */
+export const WHATSAPP_FREE_SERVICE_ALLOWANCE = WHATSAPP_FREE_SERVICE_PER_MONTH;
+
+/**
+ * Rate ONE delivered WhatsApp message against the monthly service
+ * allowance (Fase 3 allowance tracking over the cost ledger).
+ *
+ * @param serviceMessagesThisMonth month-to-date count of delivered service
+ *   messages for the sending phone number BEFORE this message. Pass
+ *   Number.POSITIVE_INFINITY when the count is unknown, so an unwired
+ *   counting port can never silently under-bill: beyond the allowance,
+ *   service messages are charged at the UTILITY rate (Meta, 1 Oct 2026).
+ *   Non-service categories ignore the count entirely - only service
+ *   messages consume the allowance.
+ */
+export function rateWhatsAppMessage(input: {
+  country: string;
+  category: WhatsAppCategory;
+  serviceMessagesThisMonth: number;
+}): number {
+  if (
+    input.category === "service"
+    && input.serviceMessagesThisMonth < WHATSAPP_FREE_SERVICE_ALLOWANCE
+  ) {
+    return 0;
+  }
+  const effectiveCategory = input.category === "service" ? "utility" : input.category;
+  return getWhatsAppRate(input.country, effectiveCategory) ?? 0;
+}
+
 export interface WhatsAppEstimateInput {
   country: string;
   messages: Partial<Record<WhatsAppCategory, number>>;

@@ -1,4 +1,4 @@
-import { getWhatsAppRate, type WhatsAppCategory } from "@botara/billing";
+import { rateWhatsAppMessage, type WhatsAppCategory } from "@botara/billing";
 import { runFlow, type Flow, type FlowEvent, type FlowPorts, type FlowRunResult, type FlowState } from "@botara/flow-engine";
 import type { SendInput, SendResult } from "@botara/channels";
 
@@ -85,6 +85,13 @@ export interface WorkerPorts {
   incrementBroadcastCounts(broadcastId: string, delta: { sent?: number; failed?: number }): Promise<void>;
   loadBroadcast(broadcastId: string): Promise<BroadcastSnapshot | null>;
   listBroadcastTargets(broadcast: BroadcastSnapshot): Promise<BroadcastTarget[]>;
+  /**
+   * Month-to-date count of DELIVERED service messages for a channel
+   * account (Fase 3 allowance tracking over cost_ledger). Optional on
+   * purpose: without it, service messages are rated at the utility rate
+   * (the conservative default - never silently free).
+   */
+  countServiceMessagesThisMonth?(channelAccountId: string, now: Date): Promise<number>;
   /** Enqueue a send-message job; `data.idempotencyKey` is the stable job identity. */
   enqueueSendMessage(data: SendMessageJobData): Promise<void>;
   setContactField(workspaceId: string, contactId: string, field: string, value: string): Promise<void>;
@@ -116,9 +123,22 @@ export async function processSendMessage(
     });
     // Cost: WhatsApp is rated per delivered message by category + country
     // from the versioned rates table; other channels are free at Fase 1.
-    const costUsd = data.channel === "whatsapp"
-      ? getWhatsAppRate(data.country ?? "ID", category) ?? 0
-      : 0;
+    // Fase 3 allowance: service messages consult the month-to-date service
+    // count for this number - the first 1,000 are free, beyond that they
+    // bill at the utility rate (rateWhatsAppMessage).
+    let costUsd = 0;
+    if (data.channel === "whatsapp") {
+      const serviceMessagesThisMonth = category === "service"
+        ? (ports.countServiceMessagesThisMonth
+          ? await ports.countServiceMessagesThisMonth(data.channelAccountId, new Date())
+          : Number.POSITIVE_INFINITY)
+        : 0;
+      costUsd = rateWhatsAppMessage({
+        country: data.country ?? "ID",
+        category,
+        serviceMessagesThisMonth,
+      });
+    }
     await ports.writeCost({
       workspaceId: data.workspaceId,
       channelAccountId: data.channelAccountId,

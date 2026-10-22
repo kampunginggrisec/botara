@@ -120,3 +120,56 @@ describe("worker processors (fake ports)", () => {
     expect(f.sent).toHaveLength(0);
   });
 });
+
+describe("WhatsApp service allowance (Fase 3, fake counting port)", () => {
+  const serviceMsg = {
+    workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+    accountExternalId: "62812", toExternalId: "628999",
+    category: "service" as const, country: "ID",
+    idempotencyKey: "svc:1",
+  };
+
+  test("999 already sent this month -> this one is still free (allowance not exhausted)", async () => {
+    const f = fakePorts({
+      async countServiceMessagesThisMonth() { return 999; },
+    });
+    const result = await processSendMessage(f.ports, serviceMsg);
+    expect(result.costUsd).toBe(0);
+    expect(f.costs[0]!.amountUsd).toBe(0);
+  });
+
+  test("1000 already sent -> the allowance is exhausted, this one bills at the utility rate", async () => {
+    const f = fakePorts({
+      async countServiceMessagesThisMonth() { return 1000; },
+    });
+    const result = await processSendMessage(f.ports, serviceMsg);
+    expect(result.costUsd).toBe(0.0125); // sample ID utility rate
+  });
+
+  test("1001 already sent -> still utility rate (no double-free)", async () => {
+    const f = fakePorts({
+      async countServiceMessagesThisMonth() { return 1001; },
+    });
+    const result = await processSendMessage(f.ports, serviceMsg);
+    expect(result.costUsd).toBe(0.0125);
+  });
+
+  test("marketing messages ignore the allowance entirely", async () => {
+    let consulted = false;
+    const f = fakePorts({
+      async countServiceMessagesThisMonth() { consulted = true; return 0; },
+    });
+    const result = await processSendMessage(f.ports, {
+      ...serviceMsg, category: "marketing",
+      template: { name: "promo", language: "id", latestCategory: "marketing" },
+    });
+    expect(result.costUsd).toBe(0.0416); // sample ID marketing rate
+    expect(consulted).toBe(false);
+  });
+
+  test("without a counting port, service messages bill at utility (never silently free)", async () => {
+    const f = fakePorts();
+    const result = await processSendMessage(f.ports, serviceMsg);
+    expect(result.costUsd).toBe(0.0125);
+  });
+});

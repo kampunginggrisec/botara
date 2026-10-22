@@ -3,6 +3,7 @@ import IORedis from "ioredis";
 import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
+  countServiceUnitsInRange,
   listChannelAccountsDueForRefresh, updateChannelAccountToken,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
@@ -78,6 +79,13 @@ function buildProdPorts(db: Database): WorkerPorts {
     },
     async writeCost(entry) {
       await insertCostLedger(db, entry);
+    },
+    async countServiceMessagesThisMonth(channelAccountId, now) {
+      // WhatsApp free-service allowance: month-to-date delivered service
+      // units for this phone number, from the cost ledger (calendar month).
+      const start = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+      const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
+      return countServiceUnitsInRange(db, channelAccountId, start, end);
     },
     async updateMessageStatus(messageId, status, externalId) {
       await updateMessageStatus(db, messageId, status, externalId);
