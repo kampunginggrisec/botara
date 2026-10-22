@@ -104,6 +104,25 @@ export const templates = pgTable("templates", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
+export const broadcasts = pgTable("broadcasts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  templateId: uuid("template_id").references(() => templates.id),
+  name: varchar("name", { length: 200 }),
+  /** Targeting: contacts carrying this tag (null = caller-supplied recipientCount only). */
+  tag: varchar("tag", { length: 120 }),
+  /** Primary recipient country used for rating when no per-contact country is known. */
+  country: varchar("country", { length: 8 }),
+  recipientCount: integer("recipient_count").notNull().default(0),
+  status: varchar("status", { length: 40 }).notNull().default("draft"), // draft|queued|sending|sent|partial|failed
+  sentCount: integer("sent_count").notNull().default(0),
+  failedCount: integer("failed_count").notNull().default(0),
+  estimatedCostUsd: numeric("estimated_cost_usd", { precision: 14, scale: 6 }),
+  ratesVersion: varchar("rates_version", { length: 40 }), // rate card snapshot used for the estimate
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("broadcasts_ws_idx").on(t.workspaceId)]);
+
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
