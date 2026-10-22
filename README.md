@@ -63,10 +63,12 @@ tests; live credentials arrive with the VPS/domain):
   cost report from `cost_ledger`), `GET/POST /webhooks/whatsapp`,
   `POST /webhooks/telegram`. DB-backed routes return HTTP 503 with a
   `CONFIGURATION` error when `DATABASE_URL` is unset.
-- **Workspace context (Fase 1 stand-in):** DB-backed routes read the
-  workspace from the `X-Workspace-Id` header. This is a documented
-  placeholder until full auth lands in a later phase — it is NOT
-  authentication.
+- **Workspace context (Fase 1 stand-in, SUPERSEDED in Fase 3):** DB-backed
+  routes read the workspace from the `X-Workspace-Id` header. This was a
+  documented placeholder — Fase 3 replaced it with real session auth;
+  the header now only SELECTS a workspace for an authenticated,
+  membership-verified user (and survives as a tokenless dev fallback
+  behind `BOTARA_ALLOW_HEADER_WORKSPACE=1`, default off).
 - **Worker processors:** `send-message` (adapter send + cost ledger +
   status), `broadcast` (fan-out with stable idempotency key
   `broadcastId:contactId`), `flow-run` (flow-engine execution core with
@@ -131,6 +133,93 @@ code-complete against the real APIs with mocked-HTTP tests:
   /conversations/:id/ai-suggest` (503 when unconfigured — suggestions are
   never faked), and a keyword moderation helper behind
   `POST /moderation/check`.
+
+## Fase 3-4 status
+
+Production hardening + go-live readiness (code-complete; live verification
+needs the external items in the checklist below):
+
+- **Real auth:** email+password registration/login (argon2id via
+  `Bun.password`), HS256 session JWT (env `SESSION_SECRET`) as httpOnly
+  cookie + Bearer token, workspace membership with roles
+  (owner/admin/member/agent; mutating routes guarded), invite-by-email
+  members, `/auth/*` + `/workspaces*` endpoints, and a web login/register
+  flow with workspace switcher, route guard, and logout. `audit_log`
+  records register/login, vault put/rotate, and member add/remove.
+- **Token vault (real):** `token_vault` table + AES-256-GCM
+  (`TOKEN_VAULT_KEY`, base64 32 bytes, fails closed when missing);
+  WhatsApp onboarding now stores into the DB vault by default, and a
+  vault-backed CredentialProvider decrypts `token_vault_ref` at
+  send-time. InMemory vault remains for tests only.
+- **Email inbound producer:** `workspace_domains` maps recipient domains
+  to workspaces; the Resend webhook routes `email.received` into the
+  `email` queue (503 when Redis is down — never faked) for the existing
+  worker ingestion. Admin endpoints register/list/delete domains.
+- **WhatsApp allowance tracking:** sends consult the month-to-date
+  delivered-service count aggregated from `cost_ledger`; the first 1,000
+  service messages per number/month rate 0, beyond that utility.
+- **Instagram video publish:** the publish worker creates the media
+  container, polls its status with a bounded budget (injectable delay)
+  until FINISHED, then calls media_publish; images keep the one-shot path.
+- **Observability:** structured JSON request logs (request id, method,
+  path, status, ms — never bodies/tokens), `GET /health/ready` pinging DB
+  + Redis with a per-dependency 503 breakdown, structured worker job logs.
+- **Security:** in-process rate limiter on `/auth/*` + `/public/*`
+  (typed 429; single-instance assumption documented in the runbook),
+  security headers (+HSTS behind https), CORS allowlist from
+  `CORS_ORIGINS` (default deny; the embeddable webchat endpoints stay
+  permissive), and a production startup guard that refuses to boot when
+  `DATABASE_URL` / `SESSION_SECRET` / `TOKEN_VAULT_KEY` are missing.
+- **Knowledge base + AI:** `kb_documents`/`kb_chunks` (embeddings as jsonb
+  arrays — no pgvector dependency; guarded optional pgvector path noted
+  on the table), `POST /kb/documents` → worker chunking (~800/overlap 100)
+  + embeddings (503 at the API when AI is unconfigured), cosine retrieval
+  in code, a new flow node **`ai_reply`** (top-3 chunks + conversation →
+  AI → send, with a configured fallback message), and KB-grounded
+  `/conversations/:id/ai-suggest`.
+- **Meta data deletion:** `POST /webhooks/meta/data-deletion` verifies
+  the `signed_request` HMAC and returns `{url, confirmation_code}`;
+  `GET /data-deletion/status/:code` is the public status page.
+- **Ops:** `scripts/backup.sh` (pg_dump + 14-file rotation),
+  `docs/runbook.md`, GitHub CI (typecheck + tests + web build), and
+  `scripts/check-deprecations.ts` (fails on past-due/≤90-day Meta
+  deprecations; CI warning step).
+- **App Review package:** `docs/app-review/` — paste-ready permission
+  justifications, shot-by-shot screencast scripts, and a submission
+  checklist marking exactly which steps are the account owner's.
+- **Web:** login/register, token-based API client, workspace switcher,
+  Knowledge Base page, and public `/privacy` + `/terms` template pages.
+
+## Production readiness checklist
+
+Done in code (Fase 0-4): everything above, plus the Fase 1-2 feature set,
+the production deployment package, and the trial deployment.
+
+Still external — required before real go-live:
+
+- [ ] **Credentials via Secure Vault / server env:** Meta app id+secret,
+      WhatsApp Embedded Signup config id, Threads app credentials, R2
+      keys, Resend API key, an LLM provider key, and freshly generated
+      `SESSION_SECRET` + `TOKEN_VAULT_KEY` (the vault key must also be
+      backed up by the owner — losing it loses all channel credentials).
+- [ ] **Meta App Review submitted BY THE ACCOUNT OWNER:** business
+      verification, app creation, webhook/config ids, test users,
+      screencasts — see `docs/app-review/submission-checklist.md`
+      ([OWNER] vs [PREPARED] steps). Approval gates production Meta
+      access; dev-mode tokens are limited until then.
+- [ ] **Legal pages finalized by the owner:** `/privacy` and `/terms`
+      ship as marked templates.
+- [ ] **Live WhatsApp rate card:** replace the `sample-2026-q4` table in
+      `@botara/billing` with Meta's live per-country card and bump the
+      version (estimates/ledger math already stamps the version).
+- [ ] **Production VPS + domain + DNS:** point the real domain at the
+      production deployment (compose + Caddy in `docs/deploy/vps.md`),
+      set `CORS_ORIGINS`, `APP_PUBLIC_URL`, and webhook URLs at Meta.
+- [ ] **First decisions still open:** first LLM provider + first data
+      region (drives the R2 bucket jurisdiction — fixed at creation).
+- [ ] **Optional:** enable pgvector for very large knowledge bases
+      (guarded path documented on `kb_chunks`); move the rate limiter to
+      Redis before running multiple API replicas (see runbook).
 
 ## Deployment
 
