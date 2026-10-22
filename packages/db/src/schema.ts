@@ -100,6 +100,12 @@ export const templates = pgTable("templates", {
    * WhatsApp routing MUST use this, never `category` (see ADR-008).
    */
   latestCategory: varchar("latest_category", { length: 40 }),
+  /**
+   * WhatsApp messaging account (WABA) id that owns this template, learned
+   * from the message_template_category_update webhook (entry.id). Persisted
+   * by the Fase 2 webhook wiring whenever Meta reports a category change.
+   */
+  messagingAccountId: varchar("messaging_account_id", { length: 200 }),
   status: varchar("status", { length: 40 }).notNull().default("draft"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
@@ -122,6 +128,84 @@ export const broadcasts = pgTable("broadcasts", {
   ratesVersion: varchar("rates_version", { length: 40 }), // rate card snapshot used for the estimate
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("broadcasts_ws_idx").on(t.workspaceId)]);
+
+/**
+ * Webchat visitor sessions (Fase 2). A session binds a secret token (issued
+ * by the public widget API, presented by the visitor's browser on every
+ * poll/send) to a contact + conversation. The contact's externalId is
+ * `webchat-session:{session row id}` - the token itself never appears in
+ * conversation lists or URLs.
+ */
+export const webchatSessions = pgTable("webchat_sessions", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  /** Secret bearer token for the visitor's browser. Unique per session. */
+  token: varchar("token", { length: 200 }).notNull(),
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id),
+  visitorName: varchar("visitor_name", { length: 200 }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("webchat_sessions_token_idx").on(t.token),
+  index("webchat_sessions_ws_idx").on(t.workspaceId),
+]);
+
+/**
+ * Scheduled / published social posts (Fase 2 publishing suite). One post,
+ * many channel targets; `results` carries the per-target outcome keyed by
+ * channelAccountId: { status: "sent"|"failed", externalPostId?, error? }.
+ * Media is referenced by R2 keys + their public URLs (Meta fetches media
+ * from public URLs - the URLs are what adapters consume).
+ */
+export const scheduledPosts = pgTable("scheduled_posts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  text: text("text"),
+  /** Public media URLs (R2 custom domain) in publish order. */
+  mediaUrls: jsonb("media_urls").notNull().default([]),
+  /** R2 object keys backing mediaUrls, kept for lifecycle management. */
+  mediaKeys: jsonb("media_keys").notNull().default([]),
+  /** Targets: [{ channelAccountId, channel }]. */
+  targets: jsonb("targets").notNull().default([]),
+  /** Null = publish as soon as a worker picks it up (publish-now / draft). */
+  scheduledAt: timestamp("scheduled_at", { withTimezone: true }),
+  status: varchar("status", { length: 40 }).notNull().default("scheduled"), // draft|scheduled|publishing|published|partial|failed|cancelled
+  results: jsonb("results").notNull().default({}),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("scheduled_posts_ws_status_idx").on(t.workspaceId, t.status)]);
+
+/**
+ * Drip sequences (Fase 2). A sequence is an ordered list of steps stored as
+ * jsonb: [{ delaySeconds, text?, template?: { name, language, latestCategory } }].
+ * Step 0's delay counts from enrollment; each later step's delay counts from
+ * the previous step's send.
+ */
+export const sequences = pgTable("sequences", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  name: varchar("name", { length: 200 }).notNull(),
+  steps: jsonb("steps").notNull().default([]),
+  status: varchar("status", { length: 40 }).notNull().default("active"), // active|paused|archived
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("sequences_ws_idx").on(t.workspaceId)]);
+
+export const sequenceEnrollments = pgTable("sequence_enrollments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  sequenceId: uuid("sequence_id").notNull().references(() => sequences.id),
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  /** Index of the NEXT step to send. */
+  currentStep: integer("current_step").notNull().default(0),
+  status: varchar("status", { length: 40 }).notNull().default("active"), // active|completed|paused|failed
+  nextStepAt: timestamp("next_step_at", { withTimezone: true }),
+  lastStepAt: timestamp("last_step_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("sequence_enrollments_seq_contact_idx").on(t.sequenceId, t.contactId),
+  index("sequence_enrollments_due_idx").on(t.status, t.nextStepAt),
+]);
 
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),

@@ -1,7 +1,8 @@
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
-  broadcasts, channelAccounts, contacts, conversations, costLedger, messages, templates,
+  broadcasts, channelAccounts, contacts, conversations, costLedger, messages,
+  scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
 } from "./schema";
 
 /**
@@ -414,4 +415,498 @@ export async function getChannelAccount(
     .where(and(eq(channelAccounts.id, id), eq(channelAccounts.workspaceId, workspaceId)))
     .limit(1);
   return row ?? null;
+}
+
+export async function listChannelAccounts(db: Database, workspaceId: string): Promise<ChannelAccountRow[]> {
+  return db
+    .select()
+    .from(channelAccounts)
+    .where(eq(channelAccounts.workspaceId, workspaceId))
+    .orderBy(desc(channelAccounts.createdAt));
+}
+
+export async function createChannelAccount(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channel: string;
+    externalId: string;
+    displayName?: string;
+    authMode?: string;
+    apiVersion?: string;
+    capabilities?: Record<string, unknown>;
+    isCoexistence?: boolean;
+    /** Vault reference ONLY - raw tokens never land in this table. */
+    tokenVaultRef?: string;
+    tokenExpiresAt?: Date;
+    status?: string;
+  },
+): Promise<ChannelAccountRow> {
+  const [row] = await db
+    .insert(channelAccounts)
+    .values({
+      workspaceId: input.workspaceId,
+      channel: input.channel,
+      externalId: input.externalId,
+      displayName: input.displayName,
+      authMode: input.authMode,
+      apiVersion: input.apiVersion,
+      capabilities: input.capabilities ?? {},
+      isCoexistence: input.isCoexistence ?? false,
+      tokenVaultRef: input.tokenVaultRef,
+      tokenExpiresAt: input.tokenExpiresAt,
+      status: input.status ?? "connected",
+    })
+    .returning();
+  return row!;
+}
+
+/** Worker-side lookup by provider identity (webhooks carry no workspace). */
+export async function findChannelAccountByExternal(
+  db: Database,
+  channel: string,
+  externalId: string,
+): Promise<ChannelAccountRow | null> {
+  const [row] = await db
+    .select()
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.channel, channel), eq(channelAccounts.externalId, externalId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Persist the outcome of a token refresh (new expiry and/or vault ref, status). */
+export async function updateChannelAccountToken(
+  db: Database,
+  accountId: string,
+  patch: { tokenExpiresAt?: Date | null; tokenVaultRef?: string; status?: string },
+): Promise<void> {
+  await db
+    .update(channelAccounts)
+    .set({
+      ...(patch.tokenExpiresAt !== undefined ? { tokenExpiresAt: patch.tokenExpiresAt } : {}),
+      ...(patch.tokenVaultRef !== undefined ? { tokenVaultRef: patch.tokenVaultRef } : {}),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+    })
+    .where(eq(channelAccounts.id, accountId));
+}
+
+/**
+ * Accounts whose token expires at or before `before` - the token-refresh
+ * worker's work list. Accounts without a recorded expiry are excluded (the
+ * adapters decide refresh eligibility from the expiry; unknown = skip).
+ */
+export async function listChannelAccountsDueForRefresh(
+  db: Database,
+  before: Date,
+): Promise<ChannelAccountRow[]> {
+  return db
+    .select()
+    .from(channelAccounts)
+    .where(
+      and(
+        isNotNull(channelAccounts.tokenExpiresAt),
+        lte(channelAccounts.tokenExpiresAt, before),
+        eq(channelAccounts.status, "connected"),
+      ),
+    )
+    .orderBy(asc(channelAccounts.tokenExpiresAt));
+}
+
+// ------------------------------------------- template category (webhook flow)
+
+/**
+ * Apply a WhatsApp template category-change event: routing follows the
+ * LATEST category, and the owning messaging account (WABA) id from the
+ * webhook is persisted alongside. Templates are matched by provider
+ * external id first, then by name inside the account's workspace.
+ */
+export async function applyTemplateCategoryChange(
+  db: Database,
+  input: {
+    templateExternalId: string;
+    templateName?: string;
+    newCategory: string;
+    messagingAccountId?: string;
+  },
+): Promise<TemplateRow | null> {
+  let target: TemplateRow | null = null;
+  if (input.templateExternalId) {
+    const [row] = await db
+      .select()
+      .from(templates)
+      .where(eq(templates.externalId, input.templateExternalId))
+      .limit(1);
+    target = row ?? null;
+  }
+  if (!target && input.templateName) {
+    const [row] = await db
+      .select()
+      .from(templates)
+      .where(eq(templates.name, input.templateName))
+      .limit(1);
+    target = row ?? null;
+  }
+  if (!target) return null;
+  const [updated] = await db
+    .update(templates)
+    .set({
+      latestCategory: input.newCategory,
+      ...(input.messagingAccountId ? { messagingAccountId: input.messagingAccountId } : {}),
+    })
+    .where(eq(templates.id, target.id))
+    .returning();
+  return updated ?? null;
+}
+
+// ------------------------------------------------------------------ webchat
+
+export type WebchatSessionRow = typeof webchatSessions.$inferSelect;
+
+/** One webchat "account" per workspace (the widget), created on first use. */
+export async function findOrCreateWebchatAccount(db: Database, workspaceId: string): Promise<ChannelAccountRow> {
+  const existing = await findChannelAccountByExternal(db, "webchat", `webchat:${workspaceId}`);
+  if (existing && existing.workspaceId === workspaceId) return existing;
+  return createChannelAccount(db, {
+    workspaceId,
+    channel: "webchat",
+    externalId: `webchat:${workspaceId}`,
+    displayName: "Website chat",
+    apiVersion: "botara-webchat-v1",
+    status: "connected",
+  });
+}
+
+export async function createConversation(
+  db: Database,
+  input: { workspaceId: string; channelAccountId: string; contactId: string; status?: string },
+): Promise<ConversationRow> {
+  const [row] = await db
+    .insert(conversations)
+    .values({
+      workspaceId: input.workspaceId,
+      channelAccountId: input.channelAccountId,
+      contactId: input.contactId,
+      status: input.status ?? "open",
+    })
+    .returning();
+  return row!;
+}
+
+export async function getContactByExternal(
+  db: Database,
+  workspaceId: string,
+  channel: string,
+  externalId: string,
+): Promise<ContactRow | null> {
+  const [row] = await db
+    .select()
+    .from(contacts)
+    .where(
+      and(
+        eq(contacts.workspaceId, workspaceId),
+        eq(contacts.channel, channel),
+        eq(contacts.externalId, externalId),
+      ),
+    )
+    .limit(1);
+  return row ?? null;
+}
+
+export async function createWebchatSession(
+  db: Database,
+  input: { workspaceId: string; token: string; contactId: string; conversationId: string; visitorName?: string },
+): Promise<WebchatSessionRow> {
+  const [row] = await db
+    .insert(webchatSessions)
+    .values({
+      workspaceId: input.workspaceId,
+      token: input.token,
+      contactId: input.contactId,
+      conversationId: input.conversationId,
+      visitorName: input.visitorName,
+    })
+    .returning();
+  return row!;
+}
+
+export async function getWebchatSessionByToken(db: Database, token: string): Promise<WebchatSessionRow | null> {
+  const [row] = await db.select().from(webchatSessions).where(eq(webchatSessions.token, token)).limit(1);
+  return row ?? null;
+}
+
+export async function getWebchatSessionById(db: Database, id: string): Promise<WebchatSessionRow | null> {
+  const [row] = await db.select().from(webchatSessions).where(eq(webchatSessions.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function touchWebchatSession(db: Database, id: string, at: Date): Promise<void> {
+  await db.update(webchatSessions).set({ lastSeenAt: at }).where(eq(webchatSessions.id, id));
+}
+
+// ------------------------------------------------------------ scheduled posts
+
+export type ScheduledPostRow = typeof scheduledPosts.$inferSelect;
+
+export interface ScheduledPostTarget {
+  channelAccountId: string;
+  channel: string;
+}
+
+export type ScheduledPostResults = Record<
+  string,
+  { status: "sent" | "failed"; externalPostId?: string; error?: string }
+>;
+
+export async function createScheduledPost(
+  db: Database,
+  input: {
+    workspaceId: string;
+    text?: string;
+    mediaUrls?: string[];
+    mediaKeys?: string[];
+    targets: ScheduledPostTarget[];
+    scheduledAt?: Date | null;
+    status?: string;
+  },
+): Promise<ScheduledPostRow> {
+  const [row] = await db
+    .insert(scheduledPosts)
+    .values({
+      workspaceId: input.workspaceId,
+      text: input.text,
+      mediaUrls: input.mediaUrls ?? [],
+      mediaKeys: input.mediaKeys ?? [],
+      targets: input.targets,
+      scheduledAt: input.scheduledAt ?? null,
+      status: input.status ?? "scheduled",
+    })
+    .returning();
+  return row!;
+}
+
+export async function listScheduledPosts(
+  db: Database,
+  workspaceId: string,
+  filter: { status?: string } = {},
+): Promise<ScheduledPostRow[]> {
+  return db
+    .select()
+    .from(scheduledPosts)
+    .where(
+      and(
+        eq(scheduledPosts.workspaceId, workspaceId),
+        filter.status ? eq(scheduledPosts.status, filter.status) : undefined,
+      ),
+    )
+    .orderBy(desc(scheduledPosts.createdAt));
+}
+
+export async function getScheduledPost(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<ScheduledPostRow | null> {
+  const [row] = await db
+    .select()
+    .from(scheduledPosts)
+    .where(and(eq(scheduledPosts.id, id), eq(scheduledPosts.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Worker-side lookup: publish jobs carry only the post id. */
+export async function getScheduledPostById(db: Database, id: string): Promise<ScheduledPostRow | null> {
+  const [row] = await db.select().from(scheduledPosts).where(eq(scheduledPosts.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function updateScheduledPost(
+  db: Database,
+  id: string,
+  patch: {
+    text?: string;
+    mediaUrls?: string[];
+    scheduledAt?: Date | null;
+    status?: string;
+    results?: ScheduledPostResults;
+  },
+): Promise<void> {
+  await db
+    .update(scheduledPosts)
+    .set({
+      ...(patch.text !== undefined ? { text: patch.text } : {}),
+      ...(patch.mediaUrls !== undefined ? { mediaUrls: patch.mediaUrls } : {}),
+      ...(patch.scheduledAt !== undefined ? { scheduledAt: patch.scheduledAt } : {}),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.results !== undefined ? { results: patch.results } : {}),
+    })
+    .where(eq(scheduledPosts.id, id));
+}
+
+/** Posts whose scheduled time has arrived and that still await publishing. */
+export async function listDueScheduledPosts(db: Database, now: Date): Promise<ScheduledPostRow[]> {
+  return db
+    .select()
+    .from(scheduledPosts)
+    .where(
+      and(
+        eq(scheduledPosts.status, "scheduled"),
+        isNotNull(scheduledPosts.scheduledAt),
+        lte(scheduledPosts.scheduledAt, now),
+      ),
+    )
+    .orderBy(asc(scheduledPosts.scheduledAt));
+}
+
+// ---------------------------------------------------------------- sequences
+
+export type SequenceRow = typeof sequences.$inferSelect;
+export type SequenceEnrollmentRow = typeof sequenceEnrollments.$inferSelect;
+
+export interface SequenceStep {
+  delaySeconds: number;
+  text?: string;
+  template?: { name: string; language: string; latestCategory: string };
+}
+
+export async function createSequence(
+  db: Database,
+  input: { workspaceId: string; channelAccountId: string; name: string; steps: SequenceStep[]; status?: string },
+): Promise<SequenceRow> {
+  const [row] = await db
+    .insert(sequences)
+    .values({
+      workspaceId: input.workspaceId,
+      channelAccountId: input.channelAccountId,
+      name: input.name,
+      steps: input.steps,
+      status: input.status ?? "active",
+    })
+    .returning();
+  return row!;
+}
+
+export async function listSequences(db: Database, workspaceId: string): Promise<SequenceRow[]> {
+  return db
+    .select()
+    .from(sequences)
+    .where(eq(sequences.workspaceId, workspaceId))
+    .orderBy(desc(sequences.createdAt));
+}
+
+export async function getSequence(db: Database, workspaceId: string, id: string): Promise<SequenceRow | null> {
+  const [row] = await db
+    .select()
+    .from(sequences)
+    .where(and(eq(sequences.id, id), eq(sequences.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function updateSequence(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: { name?: string; steps?: SequenceStep[]; status?: string },
+): Promise<SequenceRow | null> {
+  const existing = await getSequence(db, workspaceId, id);
+  if (!existing) return null;
+  const [row] = await db
+    .update(sequences)
+    .set({
+      name: patch.name ?? existing.name,
+      steps: patch.steps ?? existing.steps,
+      status: patch.status ?? existing.status,
+    })
+    .where(eq(sequences.id, id))
+    .returning();
+  return row ?? null;
+}
+
+/** Enroll one contact; re-enrolling the same contact is a no-op (unique index). */
+export async function createEnrollment(
+  db: Database,
+  input: { workspaceId: string; sequenceId: string; contactId: string; nextStepAt: Date },
+): Promise<SequenceEnrollmentRow | null> {
+  const [row] = await db
+    .insert(sequenceEnrollments)
+    .values({
+      workspaceId: input.workspaceId,
+      sequenceId: input.sequenceId,
+      contactId: input.contactId,
+      currentStep: 0,
+      status: "active",
+      nextStepAt: input.nextStepAt,
+    })
+    .onConflictDoNothing()
+    .returning();
+  return row ?? null;
+}
+
+export interface DueEnrollmentSnapshot {
+  enrollmentId: string;
+  sequenceId: string;
+  workspaceId: string;
+  currentStep: number;
+  steps: SequenceStep[];
+  contactId: string;
+  contactExternalId: string;
+  channelAccountId: string;
+  channel: string;
+  accountExternalId: string;
+  tokenVaultRef?: string;
+}
+
+/** Enrollments due to advance, fully joined for the sequence processor. */
+export async function listDueEnrollments(db: Database, now: Date): Promise<DueEnrollmentSnapshot[]> {
+  const rows = await db
+    .select({
+      enrollment: sequenceEnrollments,
+      sequence: sequences,
+      contact: contacts,
+      account: channelAccounts,
+    })
+    .from(sequenceEnrollments)
+    .innerJoin(sequences, eq(sequenceEnrollments.sequenceId, sequences.id))
+    .innerJoin(contacts, eq(sequenceEnrollments.contactId, contacts.id))
+    .innerJoin(channelAccounts, eq(sequences.channelAccountId, channelAccounts.id))
+    .where(
+      and(
+        eq(sequenceEnrollments.status, "active"),
+        eq(sequences.status, "active"),
+        isNotNull(sequenceEnrollments.nextStepAt),
+        lte(sequenceEnrollments.nextStepAt, now),
+      ),
+    )
+    .orderBy(asc(sequenceEnrollments.nextStepAt));
+  return rows.map((r) => ({
+    enrollmentId: r.enrollment.id,
+    sequenceId: r.sequence.id,
+    workspaceId: r.enrollment.workspaceId,
+    currentStep: r.enrollment.currentStep,
+    steps: (r.sequence.steps as SequenceStep[]) ?? [],
+    contactId: r.contact.id,
+    contactExternalId: r.contact.externalId,
+    channelAccountId: r.account.id,
+    channel: r.account.channel,
+    accountExternalId: r.account.externalId,
+    tokenVaultRef: r.account.tokenVaultRef ?? undefined,
+  }));
+}
+
+export async function updateEnrollment(
+  db: Database,
+  id: string,
+  patch: { currentStep?: number; status?: string; nextStepAt?: Date | null; lastStepAt?: Date | null },
+): Promise<void> {
+  await db
+    .update(sequenceEnrollments)
+    .set({
+      ...(patch.currentStep !== undefined ? { currentStep: patch.currentStep } : {}),
+      ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.nextStepAt !== undefined ? { nextStepAt: patch.nextStepAt } : {}),
+      ...(patch.lastStepAt !== undefined ? { lastStepAt: patch.lastStepAt } : {}),
+    })
+    .where(eq(sequenceEnrollments.id, id));
 }
