@@ -1500,6 +1500,26 @@ export async function findOpenConversation(
   return row && row.status !== "resolved" ? row : null;
 }
 
+/**
+ * Idempotency guard for OUTBOUND sends: callers that persist a message row
+ * BEFORE handing the send to a channel adapter (the inbox reply route) and
+ * adapters whose store persists on delivery (webchat) meet at the
+ * idempotency key - whoever arrives second must reuse the existing row
+ * instead of inserting a duplicate.
+ */
+export async function findMessageByIdempotencyKey(
+  db: Database,
+  conversationId: string,
+  idempotencyKey: string,
+): Promise<MessageRow | null> {
+  const [row] = await db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.idempotencyKey, idempotencyKey)))
+    .limit(1);
+  return row ?? null;
+}
+
 /** Webhook redelivery guard: provider message ids are unique per conversation. */
 export async function findMessageByExternalId(
   db: Database,

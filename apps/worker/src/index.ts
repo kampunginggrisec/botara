@@ -15,11 +15,12 @@ import {
   getContactByExternal, createContact, listConversations, findOpenConversation,
   isCommentProcessed, markCommentProcessed,
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
+  findMessageByIdempotencyKey, getWebchatSessionById,
   type Database,
 } from "@botara/db";
 import {
-  getAdapter, EmailAdapter, InstagramAdapter,
-  type ChannelAccountRef, type ChannelKey,
+  getAdapter, EmailAdapter, InstagramAdapter, WebchatAdapter,
+  type ChannelAccountRef, type ChannelKey, type WebchatStore,
 } from "@botara/channels";
 import { putObject } from "@botara/media";
 import {
@@ -88,9 +89,50 @@ function getDbOrNull(): Database | null {
 
 // ------------------------------------------------------------ Fase 1 ports
 
+/**
+ * DB-backed WebchatStore for the worker - the same idempotency seam as
+ * apps/api's store (kept in step deliberately): a send whose idempotency
+ * key already has a message row in the session's conversation reuses that
+ * row instead of inserting a second one. Flow/sequence send-message jobs
+ * persist ONLY through this store (no row is pre-created for them), so a
+ * job retry can never double-deliver a webchat message either.
+ */
+function buildWorkerWebchatStore(db: Database): WebchatStore {
+  return {
+    async deliverOutbound(input) {
+      const prefix = "webchat-session:";
+      if (!input.toExternalId.startsWith(prefix)) {
+        throw new Error(`webchat recipient must be a session externalId (${prefix}...).`);
+      }
+      const session = await getWebchatSessionById(db, input.toExternalId.slice(prefix.length));
+      if (!session) throw new Error("Webchat session not found for this conversation.");
+      const existing = await findMessageByIdempotencyKey(db, session.conversationId, input.idempotencyKey);
+      if (existing) {
+        await updateMessageStatus(db, existing.id, "sent");
+        return { messageId: existing.id };
+      }
+      const message = await createMessage(db, {
+        conversationId: session.conversationId,
+        direction: "out",
+        type: "text",
+        body: input.text,
+        status: "sent",
+        idempotencyKey: input.idempotencyKey,
+      });
+      return { messageId: message.id };
+    },
+  };
+}
+
 function buildProdPorts(db: Database): WorkerPorts {
   return {
     async send(channel, input) {
+      // The registry's webchat adapter intentionally has no store; the
+      // worker wires the DB-backed one (flow/sequence sends to webchat
+      // conversations deliver through it, exactly one persisted row).
+      if (channel === "webchat") {
+        return new WebchatAdapter({ store: buildWorkerWebchatStore(db) }).send(input);
+      }
       return getAdapter(channel as ChannelKey).send(input);
     },
     async loadFlowRun(ref) {
