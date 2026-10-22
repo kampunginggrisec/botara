@@ -1592,16 +1592,16 @@ export async function getWorkspaceStats(
     .select({ direction: messages.direction, value: cnt() })
     .from(messages)
     .innerJoin(conversations, eq(messages.conversationId, conversations.id))
-    .where(and(eq(conversations.workspaceId, workspaceId), sql`${messages.createdAt} >= ${thirtyDaysAgo}`))
+    .where(and(eq(conversations.workspaceId, workspaceId), sql`${messages.createdAt} >= ${thirtyDaysAgo.toISOString()}::timestamptz`))
     .groupBy(messages.direction);
   const broadcastsRows = await db
     .select({ sent: broadcasts.sentCount, failed: broadcasts.failedCount })
     .from(broadcasts)
-    .where(and(eq(broadcasts.workspaceId, workspaceId), sql`${broadcasts.createdAt} >= ${monthStart}`));
+    .where(and(eq(broadcasts.workspaceId, workspaceId), sql`${broadcasts.createdAt} >= ${monthStart.toISOString()}::timestamptz`));
   const costRows = await db
     .select({ currency: costLedger.currency, total: sql<string>`coalesce(sum(${costLedger.amount}),0)` })
     .from(costLedger)
-    .where(and(eq(costLedger.workspaceId, workspaceId), sql`${costLedger.createdAt} >= ${monthStart}`))
+    .where(and(eq(costLedger.workspaceId, workspaceId), sql`${costLedger.createdAt} >= ${monthStart.toISOString()}::timestamptz`))
     .groupBy(costLedger.currency);
   const scheduledPostsPending = await countOf(
     db.select({ value: cnt() }).from(scheduledPosts)
