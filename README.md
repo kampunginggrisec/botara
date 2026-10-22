@@ -228,11 +228,48 @@ The placeholder screens the owner found on the trial deployment are gone —
 - **Feature parity:** `docs/feature-parity.md` maps ChatbotX's public
   feature list against Botara, item by item, honestly.
 
+## Adopted-features package status
+
+Five feature groups adopted from the public parity gap list (implemented
+independently, clean-room — concepts only, no third-party code):
+
+- **Rich message blocks:** a channel-agnostic block model (buttons /
+  list / carousel / product / catalog) as Zod schemas in
+  `packages/channels`, usable from flow `send_message` nodes and the
+  inbox reply API. Each adapter renders natively where the platform
+  supports it (WhatsApp interactive messages, Messenger templates +
+  quick replies, Instagram quick replies + generic template, Telegram
+  inline keyboards) and degrades to formatted text with a typed warning
+  otherwise. Builder rich-block editor + inbox "Add buttons" composer.
+- **Comment-to-DM + comment automation:** flow trigger `comment_keyword`
+  for Instagram/Messenger comments — public reply, auto-hide, and a
+  private reply (config text or the flow's first message node) executed
+  by a worker `comment-action` job with `processed_comments`
+  idempotency; the flow then continues inside the DM conversation.
+- **Contact import/export:** CSV (hand-written parser) / JSON import
+  with per-row validation, (channel, externalId) dedupe, skip/update
+  conflict modes and a 5000-row cap; CSV/JSON export downloads;
+  Contacts page dialog + buttons.
+- **MCP server + API tokens:** personal API tokens (`bta_...`, SHA-256
+  hashed, managed in Settings) authenticate the REST API like a session;
+  `apps/mcp` exposes 11 safe tools (reads, dry-run, estimate, enroll,
+  inbox reply) over Streamable HTTP (`PORT_MCP`, default 3003) or stdio
+  using the official MCP SDK — see `docs/mcp.md`.
+- **Growth tools:** trackable short links per channel account
+  (`/r/:slug` redirect counting clicks → wa.me / m.me / t.me / ig.me),
+  server-side QR codes, referral capture (Messenger ref, Telegram
+  `/start`, WhatsApp ctwa) that counts a conversion once per contact,
+  tags the contact `growth:<slug>`, and runs a bound flow with priority
+  over keyword matching. Growth page in the dashboard.
+
+All new web strings exist in both EN and ID dictionaries; the parity
+table in `docs/feature-parity.md` reflects the new status per item.
+
 ## Production readiness checklist
 
-Done in code (Fase 0-4 + completion package): everything above, plus the
-Fase 1-2 feature set, the production deployment package, and the trial
-deployment.
+Done in code (Fase 0-4 + completion + adopted-features packages):
+everything above, plus the Fase 1-2 feature set, the production
+deployment package, and the trial deployment.
 
 Still external — required before real go-live:
 

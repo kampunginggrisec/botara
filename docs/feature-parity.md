@@ -40,14 +40,14 @@ not started; *Not planned* = deliberately out of scope for now.
 | Feature | ChatbotX | Botara | Botara location / notes |
 |---|---|---|---|
 | Visual flow builder (drag-and-drop, 15+ node types) | All plans | **Implemented** | `apps/web` Flows page on @xyflow/react: palette, edges, condition true/false branches, per-node config, save/activate, dry-run test panel |
-| Rich messaging blocks (media, buttons, quick replies, catalogs, carousels) | All plans | **Partial** | Text/media sends + template messages implemented; catalog/carousel blocks planned |
+| Rich messaging blocks (media, buttons, quick replies, catalogs, carousels) | All plans | **Implemented** | Channel-agnostic block model (`packages/channels` rich.ts Zod schemas: buttons/list/carousel/product/catalog) consumed by flow `send_message` nodes + the inbox reply API; per-channel renderers (WhatsApp interactive buttons/list/CTA-URL/product messages, Messenger button + generic templates + quick replies, Instagram quick replies + generic template, Telegram inline keyboards/carousel-as-sequence); unsupported combos degrade to formatted text with a typed warning, never silently. Builder rich-block editor + inbox "Add buttons" composer |
 | Keyword triggers & auto-replies | All plans | **Implemented** | Flow trigger `{type:"keyword"}` matched case-insensitively (contains/equals) by the inbound webhook dispatcher |
 | Event triggers / postbacks | Claimed | **Implemented** | Postback payload matching + `message.received` events; schedule/manual trigger kinds exist in the engine |
-| Comment automation (auto-reply, like, hide) | Claimed | **Partial** | `comment.received` events are parsed + keyword moderation exists; automated comment-triggered flows and like/hide actions are planned |
-| Comment-to-DM | Claimed | **Planned** | Follows the comment-automation work |
+| Comment automation (auto-reply, like, hide) | Claimed | **Implemented** | Flow trigger `comment_keyword` (contains/equals, case-insensitive) matched by the webhook dispatcher on standardized `comment.received` events (Instagram + Messenger — Messenger feed comments parsed since this package); a `comment-action` queue job performs public reply + auto-hide via adapter moderation. "Like" is not offered: neither platform exposes a comment-like API to apps |
+| Comment-to-DM | Claimed | **Implemented** | Same pipeline: the private reply (IG private-reply API / Messenger comment_id recipient) is the trigger config's `privateText` or the flow's first message node, persisted into an inbox conversation with idempotency key `commentId+flowId` + a `processed_comments` table; the flow then continues in the DM |
 | Webhooks & external HTTP in flows | All plans | **Implemented** | `webhook` flow node (GET/POST) via the worker's HTTP port |
 | A/B testing of flows | Claimed | **Not planned** | — |
-| Growth tools: conversation-starter links, ref links, QR codes | Claimed | **Planned** | `referral.received` events are already parsed; link/QR tooling is not built |
+| Growth tools: conversation-starter links, ref links, QR codes | Claimed | **Implemented** | `growth_links` table + Growth page: public short link `/r/:slug` (click-counted 302 to wa.me / m.me?ref / t.me?start / ig.me), server-side QR SVG (`qrcode`), referral capture in the dispatcher (Messenger ref + postback referral, Telegram `/start <slug>`, WhatsApp ctwa under a documented single-link rule) → conversion counted once per contact, `growth:<slug>` tag, bound flow runs with priority over keyword matching |
 | Flow export/import (JSON) | Claimed (homepage FAQ: Cloud → self-hosted) | **Partial** | Flow graphs are JSON via the API (GET/PATCH), so export exists de facto; an import/export UI is planned |
 | Sequences / drip campaigns (+ auto-enrollment) | All plans | **Implemented** | Sequences API + worker scheduler + full UI (step editor, enroll-by-tag) |
 | Broadcasts (targeted, recurring, audience preview) | All plans | **Implemented** | WhatsApp template broadcasts with versioned rate-card estimates + cost ledger; per-delivered-message pricing per Meta's current model |
@@ -59,7 +59,7 @@ not started; *Not planned* = deliberately out of scope for now.
 | AI agents (BYOK: OpenAI, Claude, Gemini, DeepSeek, OpenRouter, local LLMs, …) | All plans (unlimited agents, BYOK) | **Implemented** | OpenAI-compatible provider behind one interface — any compatible endpoint (incl. gateways for non-compatible providers) works by base-URL + key; `ai_reply` flow node + Inbox AI suggestions |
 | Knowledge bases for agents (RAG) | Claimed (docs API overview) | **Implemented** | KB documents → chunks → embeddings; top-3 cosine retrieval grounds `ai_reply` and suggestions |
 | Agentic inbox copilot (summaries, smart replies, intent scoring) | Claimed (homepage marketing) | **Partial** | AI reply suggestions implemented; conversation summaries / intent scoring not built |
-| MCP server (tools for Claude/ChatGPT/Cursor/…) | All plans | **Planned** | Not started |
+| MCP server (tools for Claude/ChatGPT/Cursor/…) | All plans | **Implemented** | `apps/mcp` (`@botara/mcp`, official MCP SDK): Streamable HTTP (stateless, `PORT_MCP` 3003) + stdio; 11 safe tools over the REST API authenticated by a personal `bta_` token (Settings → API tokens); see `docs/mcp.md` |
 | Agent frameworks (OpenClaw, Hermes, Claude agents) | Claimed | **Not planned** | — |
 
 ## Inbox, contacts, publishing, analytics
@@ -68,7 +68,7 @@ not started; *Not planned* = deliberately out of scope for now.
 |---|---|---|---|
 | Unified omnichannel live-chat inbox (human takeover, assignment) | All plans | **Partial** | Inbox with all channels, 24h window enforcement (fail closed), Messenger handover protocol; the conversation-assignment UI is planned |
 | Contacts CRM (tags, custom fields, segmentation) | Claimed (contacts unlimited in all plans) | **Implemented** | Contacts API + page; tags + custom fields; segment counts API |
-| Contact import / export | Claimed (docs API overview) | **Planned** | Not built yet |
+| Contact import / export | Claimed (docs API overview) | **Implemented** | `POST /contacts/import` (CSV with a hand-written parser / JSON, per-row validation, (channel, externalId) dedupe, skip/update conflict modes, 5000-row cap) + `GET /contacts/export` (CSV/JSON download); Contacts page Import dialog + Export buttons |
 | Coupons (batches, redemption tracking) | Claimed (docs API overview) | **Not planned** | — |
 | Product catalogs / Meta Catalog sync | Claimed (docs API overview) | **Planned** | Not started |
 | E-commerce connectors (Shopify / WooCommerce named) | Not mentioned in fetched public material (e-commerce appears as catalogs/coupons + homepage marketing claims) | **Not planned** | Botara takes no position until catalogs land |
@@ -79,7 +79,7 @@ not started; *Not planned* = deliberately out of scope for now.
 
 | Feature | ChatbotX | Botara | Botara location / notes |
 |---|---|---|---|
-| Public REST API (390+ endpoints, workspace API keys) | All plans | **Partial** | REST API with OpenAPI document + session auth; third-party API-key management is planned |
+| Public REST API (390+ endpoints, workspace API keys) | All plans | **Implemented** | REST API with OpenAPI document + session auth, PLUS personal API tokens (`api_tokens` table, SHA-256 hashed, `bta_` prefix, create/list/revoke in Settings; Bearer tokens resolve user + workspaces identically to JWT) — the same tokens authenticate the MCP server |
 | CLI | All plans | **Not planned** | — |
 | n8n integration (custom node) | Claimed (docs) | **Planned** | Via the future API-key/MCP work; a generic webhook node exists today |
 | Make.com integration | Claimed (docs) | **Planned** | Same as n8n |
@@ -117,9 +117,14 @@ not started; *Not planned* = deliberately out of scope for now.
   linked IG business account get an honest error redirect.
 - **TikTok and Zalo** are ChatbotX channels Botara does not offer; the
   table marks them Not planned rather than pretending coverage.
-- Items marked Partial above (inbox assignment UI, rich blocks,
-  comment automation, analytics depth, API keys) are real subsets —
-  nothing in this table claims more than the code does.
+- Items marked Partial above (inbox assignment UI, analytics depth,
+  flow export/import UI, API-as-channel) are real subsets — nothing in
+  this table claims more than the code does.
+- **WhatsApp growth attribution:** wa.me links cannot carry a ref, and
+  ctwa referrals carry only the ad's `ctwa_clid` — the dispatcher
+  attributes a WhatsApp referral to a growth link only when the account
+  has exactly ONE active growth link; with several links it counts
+  nothing rather than guessing.
 
 ## Sources (public, fetched 2026-10-22)
 
