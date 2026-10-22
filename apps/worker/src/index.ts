@@ -12,17 +12,25 @@ import {
   listChannelAccountsDueForRefresh, updateChannelAccountToken,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
-  getContactByExternal, createContact, listConversations,
+  getContactByExternal, createContact, listConversations, findOpenConversation,
+  isCommentProcessed, markCommentProcessed,
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
   type Database,
 } from "@botara/db";
-import { getAdapter, EmailAdapter, InstagramAdapter, type ChannelKey } from "@botara/channels";
+import {
+  getAdapter, EmailAdapter, InstagramAdapter,
+  type ChannelAccountRef, type ChannelKey,
+} from "@botara/channels";
 import { putObject } from "@botara/media";
 import {
   processBroadcast, processFlowRun, processSendMessage,
   type BroadcastSnapshot, type FlowRunJobData, type FlowRunRef, type SendMessageJobData, type WorkerPorts,
 } from "./processors";
-import { storedGraphSchema, toRunnableFlow } from "@botara/flow-engine";
+import { firstSendMessageOf, storedGraphSchema, toRunnableFlow, type FlowState } from "@botara/flow-engine";
+import {
+  processCommentAction,
+  type CommentActionJobData, type CommentActionPorts,
+} from "./comment-action";
 import {
   processTokenRefreshAccount, processTokenRefreshScan, tokenRefreshJobId,
   type DueTokenAccount, type TokenRefreshPorts,
@@ -50,6 +58,7 @@ import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-
 
 export const QUEUE_NAMES = [
   "broadcast", "sequence", "publish", "token-refresh", "email", "send-message", "flow-run", "kb",
+  "comment-action",
 ] as const;
 export type QueueName = (typeof QUEUE_NAMES)[number];
 
@@ -102,9 +111,28 @@ function buildProdPorts(db: Database): WorkerPorts {
           variables[key] = String(value);
         }
       }
+      // Comment-to-DM runs: the first send_message was already delivered
+      // as the private reply to the comment, so the run starts AFTER that
+      // node (state pre-advanced) instead of sending it a second time.
+      let state: FlowState | undefined;
+      if (ref.skipFirstSendMessage) {
+        const first = firstSendMessageOf(parsed.data);
+        if (first) {
+          state = {
+            flowId: flowRow.id,
+            currentNodeId: first.nextNodeId,
+            variables,
+            status: first.nextNodeId ? "running" : "completed",
+          };
+        }
+      }
       return {
         flow: toRunnableFlow(flowRow.id, parsed.data),
-        event: { type: "message.received", text: ref.triggerText, variables },
+        ...(state ? { state } : {}),
+        event: {
+          type: ref.commentId ? "comment.received" : "message.received",
+          text: ref.triggerText, variables,
+        },
         context: {
           workspaceId: ref.workspaceId,
           channelAccountId: account.id,
@@ -469,6 +497,71 @@ function buildKbPorts(db: Database): KbIngestPorts {
   };
 }
 
+// -------------------------------------------------------- comment-action ports
+
+function buildCommentActionPorts(db: Database): CommentActionPorts {
+  return {
+    async isProcessed(input) {
+      return isCommentProcessed(db, input);
+    },
+    async markProcessed(input) {
+      await markCommentProcessed(db, input);
+    },
+    async loadFlowFirstMessageText(flowId) {
+      const flowRow = await getFlowById(db, flowId);
+      if (!flowRow) return null;
+      const parsed = storedGraphSchema.safeParse(flowRow.graph);
+      if (!parsed.success) return null;
+      return firstSendMessageOf(parsed.data)?.text ?? null;
+    },
+    async moderate({ channel, account, commentExternalId, action, text }) {
+      const adapter = getAdapter(channel as ChannelKey);
+      if (!adapter.moderate) throw new Error(`${channel} adapter has no comment moderation surface`);
+      await adapter.moderate({ account, targetExternalId: commentExternalId, action, text });
+    },
+    async privateReply({ channel, account, commentExternalId, text }) {
+      const adapter = getAdapter(channel as ChannelKey) as {
+        privateReplyToComment?: (
+          account: ChannelAccountRef, commentExternalId: string, text: string,
+        ) => Promise<{ externalMessageId: string }>;
+      };
+      if (!adapter.privateReplyToComment) {
+        throw new Error(`${channel} adapter has no private-reply-to-comment surface`);
+      }
+      return adapter.privateReplyToComment(account, commentExternalId, text);
+    },
+    async findOrCreateConversation({ workspaceId, channelAccountId, channel, authorExternalId }) {
+      let contact = await getContactByExternal(db, workspaceId, channel, authorExternalId);
+      if (!contact) {
+        contact = await createContact(db, { workspaceId, channel, externalId: authorExternalId });
+      }
+      const existing = await findOpenConversation(db, { workspaceId, channelAccountId, contactId: contact.id });
+      if (existing) return { conversationId: existing.id, contactId: contact.id };
+      const created = await createConversationRow(db, { workspaceId, channelAccountId, contactId: contact.id });
+      return { conversationId: created.id, contactId: contact.id };
+    },
+    async persistMessage({ conversationId, body, externalId, idempotencyKey }) {
+      await createMessage(db, {
+        conversationId,
+        direction: "out",
+        type: "text",
+        body,
+        externalId,
+        status: "sent",
+        idempotencyKey,
+      });
+    },
+    async enqueueFlowRun(ref) {
+      const queue = queueByName.get("flow-run");
+      if (!queue) throw new Error("flow-run queue is not registered");
+      const jobId = ref.commentId
+        ? jobIdFor(`commentflow:${ref.commentId}:${ref.flowId}`)
+        : jobIdFor(`flowrun:${crypto.randomUUID()}`);
+      await queue.add("flow-run", ref, { jobId });
+    },
+  };
+}
+
 // ------------------------------------------------------------------ dispatch
 
 async function dispatch(queueName: string, job: Job): Promise<unknown> {
@@ -500,6 +593,8 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
       return processEmailInbound(buildEmailPorts(db), job.data as EmailInboundJobData);
     case "kb":
       return processKbIngest(buildKbPorts(db), job.data as KbIngestJobData);
+    case "comment-action":
+      return processCommentAction(buildCommentActionPorts(db), job.data as CommentActionJobData);
     default:
       console.log(`[worker] ${queueName}: received job ${job.id} (${job.name}) - no handler`);
       return { stub: true };

@@ -1,6 +1,6 @@
 import { rateWhatsAppMessage, type WhatsAppCategory } from "@botara/billing";
 import { runFlow, type Flow, type FlowEvent, type FlowPorts, type FlowRunResult, type FlowState } from "@botara/flow-engine";
-import type { SendInput, SendResult } from "@botara/channels";
+import type { RichBlock, SendInput, SendResult } from "@botara/channels";
 
 /**
  * Fase 1 worker processors.
@@ -19,6 +19,8 @@ export interface SendMessageJobData {
   tokenVaultRef?: string;
   toExternalId: string;
   text?: string;
+  /** Rich block from a flow send_message node (rendered per channel by the adapter). */
+  rich?: RichBlock;
   template?: { name: string; language: string; latestCategory: string };
   /** Recipient country (rating); defaults to ID for WhatsApp estimates. */
   country?: string;
@@ -81,6 +83,14 @@ export interface FlowRunRef {
   channelAccountId: string;
   triggerText?: string;
   runId?: string;
+  /** Comment-automation context: the comment that triggered this run. */
+  commentId?: string;
+  /**
+   * Comment-to-DM: the flow's first send_message was already delivered as
+   * the private reply to the comment - loadFlowRun starts the run AFTER
+   * that node so it is never sent twice.
+   */
+  skipFirstSendMessage?: boolean;
 }
 
 export interface WorkerPorts {
@@ -144,9 +154,13 @@ export async function processSendMessage(
       account: { id: data.channelAccountId, externalId: data.accountExternalId, tokenVaultRef: data.tokenVaultRef },
       toExternalId: data.toExternalId,
       text: data.text,
+      rich: data.rich,
       template: data.template,
       idempotencyKey: data.idempotencyKey,
     });
+    if (result.warnings && result.warnings.length > 0) {
+      console.warn(`[worker] send-message ${data.idempotencyKey}: rich block degraded (${result.warnings.join(", ")})`);
+    }
     // Cost: WhatsApp is rated per delivered message by category + country
     // from the versioned rates table; other channels are free at Fase 1.
     // Fase 3 allowance: service messages consult the month-to-date service
@@ -240,7 +254,7 @@ export async function processFlowRun(
   const ctx = data.context;
   let sendSeq = 0;
   const flowPorts: FlowPorts = {
-    async sendMessage({ text, channel }) {
+    async sendMessage({ text, channel, rich }) {
       await ports.enqueueSendMessage({
         workspaceId: ctx.workspaceId,
         channelAccountId: ctx.channelAccountId,
@@ -249,6 +263,7 @@ export async function processFlowRun(
         tokenVaultRef: ctx.tokenVaultRef,
         toExternalId: ctx.contactExternalId,
         text,
+        rich,
         country: ctx.country,
         idempotencyKey: `flow:${data.flow.id}:${ctx.contactId}:${sendSeq++}`,
       });
