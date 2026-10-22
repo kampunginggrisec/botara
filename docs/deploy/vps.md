@@ -121,6 +121,22 @@ Tanpa variabel-variabel ini, endpoint OAuth membalas 503 CONFIGURATION
 dan kartu koneksi menampilkan status belum terkonfigurasi — tidak ada
 alur yang berpura-pura berhasil.
 
+## MCP server (opsional)
+
+Compose production menyediakan service `mcp` di balik profile `mcp`
+(lihat `docs/mcp.md`). Variabel yang relevan di `.env.production`:
+
+- `PORT_MCP=3003` — port transport HTTP MCP (bind `127.0.0.1` saja).
+- `BOTARA_API_TOKEN` — token API personal (`bta_...`) milik satu user,
+  dibuat dari dashboard Settings -> API tokens. Server MCP menolak start
+  tanpa token ini.
+- `BOTARA_API_URL` — di-override oleh compose ke `http://api:3000`
+  (koneksi internal antar-container).
+
+Aktifkan dengan `docker compose ... --profile mcp up -d mcp`. Jangan
+mengekspos port MCP ke publik tanpa TLS + auth di reverse proxy:
+token di dalamnya setara akses API penuh milik user tersebut.
+
 ## Update (rilis baru)
 
 ```bash

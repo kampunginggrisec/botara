@@ -89,6 +89,30 @@ services:
       target: web
     restart: unless-stopped
 
+  # Optional MCP server (docs/mcp.md). Start with:
+  #   docker compose ... --profile mcp up -d mcp
+  # It talks to the API over the internal network with ONE user's API
+  # token (BOTARA_API_TOKEN in .env.production) and binds localhost only -
+  # put your own TLS/auth proxy in front before exposing it further.
+  mcp:
+    profiles: ["mcp"]
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: mcp
+    restart: unless-stopped
+    env_file:
+      - ../../.env.production
+    environment:
+      PORT_MCP: "3003"
+      # Direct to the API container (the API serves its routes at root;
+      # the /api prefix exists only on the public Caddy route).
+      BOTARA_API_URL: http://api:3000
+    ports:
+      - "127.0.0.1:3003:3003"
+    depends_on:
+      - api
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped

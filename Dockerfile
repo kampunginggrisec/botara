@@ -28,6 +28,12 @@ ENV NODE_ENV=production
 EXPOSE 3002
 CMD ["bun", "run", "apps/realtime/src/index.ts"]
 
+# --- MCP server (Streamable HTTP, port 3003; optional, profile-gated in compose) ---
+FROM base AS mcp
+ENV NODE_ENV=production
+EXPOSE 3003
+CMD ["bun", "run", "apps/mcp/src/index.ts"]
+
 # --- Web: build the SPA, serve the static dist with Caddy ---
 FROM base AS web-build
 RUN bun run --cwd apps/web build
