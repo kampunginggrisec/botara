@@ -73,6 +73,28 @@ curl https://DOMAIN/api/health
 Ganti `DOMAIN` dengan domain asli dari `.env.production`. Web dashboard
 dibuka di `https://DOMAIN/`.
 
+## Realtime (inbox live)
+
+Layanan `realtime` membuat inbox dashboard memperbarui dirinya sendiri
+(pesan masuk/balasan tampil tanpa refresh manual). Ia butuh tiga env:
+
+- `SESSION_SECRET` — WAJIB sama persis dengan milik API (dari
+  `.env.production` lewat env_file): realtime memverifikasi JWT sesi
+  yang sama sebelum socket boleh berlangganan.
+- `REDIS_URL=redis://redis:6379` — kanal pub/sub `botara:realtime`
+  tempat API menerbitkan event `inbox.message` (sudah di-set sebagai
+  environment pada service `realtime` di compose produksi).
+- `BOTARA_API_URL=http://api:3000` — alamat API LANGSUNG untuk
+  `GET /auth/me` (resolusi workspace per koneksi), TANPA prefix `/api`
+  (sudah di-set di compose; layout native/trial memakai default
+  `http://localhost:3001`).
+
+Di server trial (systemd, tanpa Docker), unit `botara-realtime`
+memakai EnvironmentFile `~/botara/.env` yang sama dengan API — file
+itu sudah berisi `SESSION_SECRET` dan `REDIS_URL`, dan default
+`BOTARA_API_URL` (`localhost:3001`) cocok dengan layout trial, jadi
+tidak ada env tambahan yang perlu dibuat.
+
 ## URL webhook yang didaftarkan (setelah domain aktif)
 
 Daftarkan URL berikut persis seperti ini:

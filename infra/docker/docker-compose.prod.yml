@@ -81,6 +81,11 @@ services:
       - ../../.env.production
     environment:
       PORT_REALTIME: "3002"
+      REDIS_URL: redis://redis:6379
+      # Direct API address for /auth/me workspace resolution (no /api
+      # prefix). SESSION_SECRET arrives via the env_file above and must
+      # match the API's - realtime verifies the same session JWTs.
+      BOTARA_API_URL: http://api:3000
 
   web:
     build:
