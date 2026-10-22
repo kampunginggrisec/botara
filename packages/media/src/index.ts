@@ -56,3 +56,31 @@ export async function presignedGetUrl(key: string, expiresInSeconds = 900, env: 
   const s3 = getR2Client(env);
   return getSignedUrl(s3, new GetObjectCommand({ Bucket: env.R2_BUCKET ?? "botara-media", Key: key }), { expiresIn: expiresInSeconds });
 }
+
+/**
+ * Server-side object write (worker flows: copying inbound email attachments
+ * out of their temporary provider URLs into permanent R2 storage).
+ * Returns the key plus the public URL when a public base is configured.
+ */
+export async function putObject(
+  key: string,
+  data: Uint8Array | ArrayBuffer | string,
+  contentType: string,
+  env: R2Env = process.env as R2Env,
+): Promise<{ key: string; publicUrl?: string }> {
+  const s3 = getR2Client(env);
+  const body = typeof data === "string" ? new TextEncoder().encode(data) : data instanceof Uint8Array ? data : new Uint8Array(data);
+  await s3.send(new PutObjectCommand({
+    Bucket: env.R2_BUCKET ?? "botara-media",
+    Key: key,
+    Body: body,
+    ContentType: contentType,
+  }));
+  let url: string | undefined;
+  try {
+    url = publicUrl(key, env);
+  } catch {
+    url = undefined; // no public base configured - the key alone is the durable reference
+  }
+  return { key, publicUrl: url };
+}
