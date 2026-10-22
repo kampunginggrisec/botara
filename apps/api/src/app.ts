@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import type { Context, Next } from "hono";
+import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import { AppError, evaluateReplyWindow, MessagingWindowClosedError } from "@botara/shared";
@@ -16,6 +17,12 @@ import {
   createWebchatSession, getWebchatSessionByToken, touchWebchatSession,
   createScheduledPost, listScheduledPosts, getScheduledPost, updateScheduledPost, deleteScheduledPost,
   createSequence, listSequences, getSequence, updateSequence, createEnrollment,
+  createTokenVault, insertAuditLog, pingDb,
+  findWorkspaceDomain, findEmailAccountForWorkspace,
+  createWorkspaceDomain, listWorkspaceDomains, deleteWorkspaceDomain,
+  createDataDeletionRequest, getDataDeletionRequestByCode, completeDataDeletionRequest,
+  purgeExternalUserData,
+  createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument, listKbChunksByWorkspace,
   type Database, type ScheduledPostTarget, type SequenceStep,
 } from "@botara/db";
 import {
@@ -23,24 +30,37 @@ import {
   WebchatAdapter, CHANNEL_CAPABILITIES,
   type ChannelKey, type InboundEvent,
 } from "@botara/channels";
+import {
+  ADMIN_ROLES, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
+  DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
+  verifySessionToken,
+  type AuthContext, type AuthStore, type AuthUser,
+} from "./auth";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
   createAIProviderFromEnv, moderateText, DEFAULT_AI_MODEL, type AIProvider,
 } from "@botara/ai";
 import {
   InMemoryVault, exchangeEmbeddedSignup,
-  type EmbeddedSignupInput, type EmbeddedSignupResult,
+  type EmbeddedSignupInput, type EmbeddedSignupResult, type TokenVaultPort,
 } from "./whatsapp-onboarding";
 import { createDbWebchatStore } from "./webchat-store";
 
 /**
- * Botara API - Fase 1.
+ * Botara API - Fase 3.
  *
- * WORKSPACE CONTEXT (Fase 1 stand-in): until full auth lands in a later
- * phase, DB-backed routes read the workspace from the `X-Workspace-Id`
- * header (see workspaceMiddleware below). This is a deliberate, documented
- * placeholder - NOT an authentication mechanism. Web clients send the
- * header from a locally stored workspace id (apps/web/src/api.ts).
+ * AUTHENTICATION (Fase 3, replaces the Fase 1 stand-in): users register and
+ * log in with email + password; the session is a signed JWT (HS256,
+ * SESSION_SECRET) delivered as an httpOnly cookie and accepted as a Bearer
+ * token. The X-Workspace-Id header now only SELECTS the workspace - the
+ * auth middleware verifies the caller's membership + role on every
+ * request (see ./auth.ts). The old header-only mode survives solely as an
+ * explicit dev fallback behind BOTARA_ALLOW_HEADER_WORKSPACE=1 (default
+ * off). Public surfaces stay public by design: /webhooks/* (provider
+ * signatures), /public/webchat/* (visitor session tokens), /health*,
+ * /broadcasts/estimate and /moderation/check (pure calculators over the
+ * request body - no workspace data), /data-deletion/status/* (Meta status
+ * pages), and the /auth/* entry points themselves.
  *
  * Error contract: every error response is the shared AppError taxonomy
  * serialized as { error: { code, message, details? } }.
@@ -80,6 +100,40 @@ export interface TemplateCategoryUpdater {
   applyCategoryChange(event: Extract<InboundEvent, { type: "template.category_changed" }>): Promise<void>;
 }
 
+/** Enqueues an email-inbound job (worker "email" queue) for a routed Resend webhook. */
+export interface EmailInboundEnqueuer {
+  enqueueEmailInbound(input: { workspaceId: string; channelAccountId: string; emailId: string }): Promise<void>;
+}
+
+/** Resolves a recipient domain to its workspace + email channel account. */
+export interface EmailRouter {
+  resolveRecipientDomain(domain: string): Promise<{ workspaceId: string; channelAccountId: string } | null>;
+}
+
+/** Meta data-deletion persistence + user-data purge. */
+export interface DataDeletionStore {
+  create(input: { confirmationCode: string; providerUserId: string }): Promise<void>;
+  getByCode(code: string): Promise<{ confirmationCode: string; status: string; createdAt: string } | null>;
+  complete(code: string): Promise<void>;
+  purge(providerUserId: string): Promise<{ contacts: number }>;
+}
+
+/** Enqueues a kb-ingest job (worker "kb" queue) for a new knowledge-base document. */
+export interface KbEnqueuer {
+  enqueueKbIngest(documentId: string): Promise<void>;
+}
+
+export interface DependencyStatus {
+  ok: boolean;
+  detail?: string;
+}
+
+/** Dependency probes behind GET /health/ready. */
+export interface ReadinessChecker {
+  checkDatabase(): Promise<DependencyStatus>;
+  checkRedis(): Promise<DependencyStatus>;
+}
+
 export interface ApiDeps {
   /** Returns the DB or throws AppError CONFIGURATION (503) when unconfigured. */
   getDatabase: () => Database;
@@ -91,6 +145,19 @@ export interface ApiDeps {
   whatsappOnboarding: (workspaceId: string, input: EmbeddedSignupInput) => Promise<EmbeddedSignupResult>;
   /** The configured AI provider, or null - routes answer 503, never fake. */
   getAiProvider: () => AIProvider | null;
+  /** Fase 3: users, workspaces, memberships, audit (auth persistence). */
+  authStore: AuthStore;
+  /** Fase 3: Resend inbound routing + enqueueing. */
+  emailInboundEnqueuer: EmailInboundEnqueuer;
+  emailRouter: EmailRouter;
+  /** Fase 3: Meta data-deletion callback store. */
+  dataDeletionStore: DataDeletionStore;
+  /** Fase 3: knowledge-base ingestion enqueueing. */
+  kbEnqueuer: KbEnqueuer;
+  /** Fase 3: readiness probes for /health/ready. */
+  readiness: ReadinessChecker;
+  /** Fase 3: in-process rate-limit overrides (tests use tiny limits). */
+  rateLimits?: { authPerMinute?: number; publicPerMinute?: number };
   env: Record<string, string | undefined>;
 }
 
@@ -162,6 +229,129 @@ export function createBullMqPublishEnqueuer(redisUrl: string): PublishEnqueuer {
   };
 }
 
+/** Production email-inbound enqueuer: BullMQ "email" queue, job "inbound". */
+export function createBullMqEmailEnqueuer(redisUrl: string): EmailInboundEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "email", "inbound");
+  return {
+    enqueueEmailInbound: (input) => inner.enqueue({ ...input }, `email-inbound:${input.emailId}`),
+  };
+}
+
+/** Production kb-ingest enqueuer: BullMQ "kb" queue, job "ingest". */
+export function createBullMqKbEnqueuer(redisUrl: string): KbEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "kb", "ingest");
+  return {
+    enqueueKbIngest: (documentId) => inner.enqueue({ documentId }, `kb-ingest:${documentId}`),
+  };
+}
+
+/** DB-backed recipient-domain router for Resend inbound webhooks. */
+export function createDbEmailRouter(getDatabase: () => Database): EmailRouter {
+  return {
+    async resolveRecipientDomain(domain) {
+      const db = getDatabase();
+      const row = await findWorkspaceDomain(db, domain);
+      if (!row) return null;
+      const accountId = row.channelAccountId
+        ?? (await findEmailAccountForWorkspace(db, row.workspaceId))?.id;
+      if (!accountId) return null;
+      return { workspaceId: row.workspaceId, channelAccountId: accountId };
+    },
+  };
+}
+
+/** DB-backed Meta data-deletion store. */
+export function createDbDataDeletionStore(getDatabase: () => Database): DataDeletionStore {
+  return {
+    async create(input) {
+      await createDataDeletionRequest(getDatabase(), input);
+    },
+    async getByCode(code) {
+      const row = await getDataDeletionRequestByCode(getDatabase(), code);
+      return row
+        ? { confirmationCode: row.confirmationCode, status: row.status, createdAt: row.createdAt.toISOString() }
+        : null;
+    },
+    async complete(code) {
+      await completeDataDeletionRequest(getDatabase(), code);
+    },
+    async purge(providerUserId) {
+      return purgeExternalUserData(getDatabase(), providerUserId);
+    },
+  };
+}
+
+async function pingRedis(redisUrl: string): Promise<DependencyStatus> {
+  const connection = new IORedis(redisUrl, {
+    maxRetriesPerRequest: 1,
+    connectTimeout: 1500,
+    enableOfflineQueue: false,
+    retryStrategy: () => null,
+  });
+  connection.on("error", () => { /* surfaced via the raced ping below */ });
+  try {
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error("redis ping timed out")), 2000),
+    );
+    const res = await Promise.race([connection.ping(), timeout]);
+    return res === "PONG"
+      ? { ok: true }
+      : { ok: false, detail: `unexpected PING response: ${String(res)}` };
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+  } finally {
+    connection.disconnect();
+  }
+}
+
+/** Production readiness probes: a real SELECT 1 + a real Redis PING. */
+export function createReadinessChecker(
+  getDatabase: () => Database,
+  redisUrl: string,
+): ReadinessChecker {
+  return {
+    async checkDatabase() {
+      try {
+        await pingDb(getDatabase());
+        return { ok: true };
+      } catch (err) {
+        return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+      }
+    },
+    checkRedis: () => pingRedis(redisUrl),
+  };
+}
+
+/**
+ * Default onboarding vault (Fase 3): the REAL encrypted TokenVault when
+ * both DATABASE_URL and TOKEN_VAULT_KEY are configured - resolution is lazy
+ * so a malformed key surfaces as a CONFIGURATION error on first use, not a
+ * boot crash. The in-memory vault remains only as the no-DB dev fallback.
+ */
+export function createDefaultVault(): TokenVaultPort {
+  const memory = new InMemoryVault();
+  let real: { store: TokenVaultPort["store"] } | null | undefined;
+  const resolveReal = () => {
+    if (real !== undefined) return real;
+    if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
+      const db = defaultGetDatabase();
+      const vault = createTokenVault(db, process.env, {
+        write: async (entry) => { await insertAuditLog(db, entry); },
+      });
+      real = { store: (input) => vault.store(input) };
+    } else {
+      real = null;
+    }
+    return real;
+  };
+  return {
+    async store(input) {
+      const vault = resolveReal();
+      return vault ? vault.store(input) : memory.store(input);
+    },
+  };
+}
+
 /** Default template-category updater: the Drizzle repository behind the DB getter. */
 export function createDbTemplateCategoryUpdater(getDatabase: () => Database): TemplateCategoryUpdater {
   return {
@@ -179,13 +369,19 @@ export function createDbTemplateCategoryUpdater(getDatabase: () => Database): Te
 
 export function defaultDeps(): ApiDeps {
   const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
-  const vault = new InMemoryVault();
+  const vault = createDefaultVault();
   return {
     getDatabase: defaultGetDatabase,
     eventSink: logEventSink,
     broadcastEnqueuer: createBullMqBroadcastEnqueuer(redisUrl),
     publishEnqueuer: createBullMqPublishEnqueuer(redisUrl),
     templateCategoryUpdater: createDbTemplateCategoryUpdater(defaultGetDatabase),
+    authStore: new DbAuthStore(defaultGetDatabase),
+    emailInboundEnqueuer: createBullMqEmailEnqueuer(redisUrl),
+    emailRouter: createDbEmailRouter(defaultGetDatabase),
+    dataDeletionStore: createDbDataDeletionStore(defaultGetDatabase),
+    kbEnqueuer: createBullMqKbEnqueuer(redisUrl),
+    readiness: createReadinessChecker(defaultGetDatabase, redisUrl),
     whatsappOnboarding: (workspaceId, input) =>
       exchangeEmbeddedSignup(
         {
@@ -209,7 +405,7 @@ export function defaultDeps(): ApiDeps {
 
 // ------------------------------------------------------------------- types
 
-type AppEnv = { Variables: { workspaceId?: string } };
+type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
 type Ctx = Context<AppEnv>;
 
 
@@ -217,14 +413,39 @@ function errorBody(err: AppError) {
   return { error: { code: err.code, message: err.message, ...(err.details !== undefined ? { details: err.details } : {}) } };
 }
 
-/** Workspace id from the middleware; DB handlers must have one. */
+/**
+ * Workspace id from the auth context; DB handlers must have one. The auth
+ * middleware has already verified membership - reaching here without a
+ * selected workspace means the client sent a session token but no
+ * X-Workspace-Id selector.
+ */
 function workspaceId(c: Ctx): string {
-  const id = c.get("workspaceId");
+  const id = c.get("auth")?.workspaceId ?? c.get("workspaceId");
   if (!id) {
-    throw new AppError("VALIDATION", "Missing X-Workspace-Id header (Fase 1 workspace context).", { status: 400 });
+    throw new AppError(
+      "VALIDATION",
+      "No workspace selected: send X-Workspace-Id together with your session token.",
+      { status: 400 },
+    );
   }
   return id;
 }
+
+/** Auth context from the middleware; protected handlers must have one. */
+function authContext(c: Ctx): AuthContext {
+  const auth = c.get("auth");
+  if (!auth) {
+    throw new AppError("UNAUTHORIZED", "Authentication required.", { status: 401 });
+  }
+  return auth;
+}
+
+/** Mutating workspace routes: owner/admin/member (agents are read + reply). */
+function guardMutator(c: Ctx): void {
+  requireRole(c.get("auth"), MUTATOR_ROLES);
+}
+
+const publicUser = (user: AuthUser) => ({ id: user.id, email: user.email, name: user.name });
 
 async function readJsonBody(c: Ctx): Promise<Record<string, unknown>> {
   try {
@@ -261,13 +482,224 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json(errorBody(wrapped), 500);
   });
 
+  // ------------------------------------------------------------ auth helpers
+  // Session token: Authorization Bearer wins, the httpOnly cookie is the
+  // browser path. SESSION_SECRET missing => auth is unconfigured (503,
+  // fail closed) - tokens are never accepted unsigned.
+
+  function extractSessionToken(c: Ctx): string | undefined {
+    const header = c.req.header("authorization");
+    if (header?.startsWith("Bearer ")) {
+      const token = header.slice("Bearer ".length).trim();
+      if (token) return token;
+    }
+    return getCookie(c, SESSION_COOKIE);
+  }
+
+  function sessionSecret(): string {
+    const secret = deps.env.SESSION_SECRET;
+    if (!secret) {
+      throw new AppError(
+        "CONFIGURATION",
+        "SESSION_SECRET is not configured on this server; authentication is unavailable.",
+        { status: 503 },
+      );
+    }
+    return secret;
+  }
+
+  /** Verify the presented token and load its user. Throws 401/503. */
+  async function authenticateRequest(c: Ctx): Promise<AuthUser> {
+    const token = extractSessionToken(c);
+    if (!token) {
+      throw new AppError(
+        "UNAUTHORIZED",
+        "Authentication required: send a session token (Authorization: Bearer or the botara_session cookie).",
+        { status: 401 },
+      );
+    }
+    const claims = verifySessionToken(token, sessionSecret());
+    if (!claims) {
+      throw new AppError("UNAUTHORIZED", "Session token is invalid or expired.", { status: 401 });
+    }
+    const user = await deps.authStore.findUserById(claims.userId);
+    if (!user) {
+      throw new AppError("UNAUTHORIZED", "Session user no longer exists.", { status: 401 });
+    }
+    return user;
+  }
+
+  /**
+   * Full request context for workspace-scoped routes: the authenticated
+   * user plus - when X-Workspace-Id selects one - verified membership and
+   * role in that workspace. The dev fallback (BOTARA_ALLOW_HEADER_WORKSPACE=1)
+   * is the ONLY path that trusts the header alone.
+   */
+  async function resolveAuthContext(c: Ctx): Promise<AuthContext> {
+    const selectedWorkspace = c.req.header("x-workspace-id");
+    if (!extractSessionToken(c)) {
+      if (deps.env.BOTARA_ALLOW_HEADER_WORKSPACE === "1" && selectedWorkspace) {
+        return {
+          user: { id: "dev-header-user", email: "dev@localhost", name: "Dev (header fallback)" },
+          workspaceId: selectedWorkspace,
+          role: "owner",
+          viaHeaderFallback: true,
+        };
+      }
+      throw new AppError(
+        "UNAUTHORIZED",
+        "Authentication required: send a session token (Authorization: Bearer or the botara_session cookie).",
+        { status: 401 },
+      );
+    }
+    const user = await authenticateRequest(c);
+    const base: AuthContext = { user: { id: user.id, email: user.email, name: user.name } };
+    if (!selectedWorkspace) return base;
+    const membership = await deps.authStore.getMembership(selectedWorkspace, user.id);
+    if (!membership) {
+      throw new AppError("FORBIDDEN", "You are not a member of the selected workspace.", { status: 403 });
+    }
+    return { ...base, workspaceId: selectedWorkspace, role: membership.role };
+  }
+
+  /** Membership check against a workspace from the PATH (member admin routes). */
+  async function requirePathWorkspaceRole(
+    c: Ctx,
+    workspaceIdParam: string,
+    roles: readonly string[],
+  ): Promise<AuthContext> {
+    const auth = authContext(c);
+    if (auth.viaHeaderFallback) return { ...auth, workspaceId: workspaceIdParam, role: "owner" };
+    const membership = await deps.authStore.getMembership(workspaceIdParam, auth.user.id);
+    if (!membership || !roles.includes(membership.role)) {
+      throw new AppError(
+        "FORBIDDEN",
+        `This action requires one of these workspace roles: ${roles.join(", ")}.`,
+        { status: 403 },
+      );
+    }
+    return { ...auth, workspaceId: workspaceIdParam, role: membership.role };
+  }
+
+  function setSessionCookie(c: Ctx, token: string): void {
+    setCookie(c, SESSION_COOKIE, token, {
+      httpOnly: true,
+      path: "/",
+      sameSite: "Lax",
+      maxAge: SESSION_TTL_SECONDS,
+      secure: c.req.header("x-forwarded-proto") === "https",
+    });
+  }
+
+  async function createWorkspaceWithUniqueSlug(name: string) {
+    const base = slugify(name);
+    let slug = base;
+    for (let i = 2; await deps.authStore.workspaceSlugExists(slug); i++) {
+      slug = `${base}-${i}`;
+    }
+    return deps.authStore.createWorkspace({ name, slug });
+  }
+
   // ------------------------------------------------------------- health
   const healthRoute = createRoute({
     method: "get", path: "/health",
     responses: { 200: { description: "Service health", content: { "application/json": { schema: z.object({ status: z.literal("ok"), service: z.literal("api") }) } } } },
   });
   app.openapi(healthRoute, (c) => c.json({ status: "ok" as const, service: "api" as const }));
-  app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 2" }));
+  app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 3" }));
+
+  // ---------------------------------------------------------------- auth
+  const credentialsSchema = z.object({
+    email: z.string().email(),
+    password: z.string().min(8),
+  });
+
+  const registerRoute = createRoute({
+    method: "post", path: "/auth/register",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: credentialsSchema.extend({ name: z.string().min(1).optional() }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Registered; session issued" } },
+  });
+  app.openapi(registerRoute, async (c) => {
+    const secret = sessionSecret();
+    const body = c.req.valid("json");
+    const email = body.email.toLowerCase();
+    const passwordHash = await hashPassword(body.password);
+    let user = await deps.authStore.findUserByEmail(email);
+    if (user?.passwordHash) {
+      throw new AppError("CONFLICT", "This email is already registered. Log in instead.", { status: 409 });
+    }
+    if (user) {
+      // An invited row (created by a workspace invite) is claimed by
+      // setting its first password.
+      await deps.authStore.setPasswordHash(user.id, passwordHash);
+      user = { ...user, passwordHash, name: user.name ?? body.name ?? null };
+    } else {
+      user = await deps.authStore.createUser({ email, name: body.name, passwordHash });
+    }
+    // Every new user starts with a personal workspace they own.
+    const displayName = body.name ?? user.name ?? email.split("@")[0]!;
+    const workspace = await createWorkspaceWithUniqueSlug(`${displayName}'s Workspace`);
+    await deps.authStore.addMember({ workspaceId: workspace.id, userId: user.id, role: "owner" });
+    await deps.authStore.audit({
+      workspaceId: workspace.id, userId: user.id, action: "auth.register", details: { email },
+    });
+    const token = signSessionToken({ userId: user.id, email: user.email }, secret);
+    setSessionCookie(c, token);
+    return c.json({
+      user: publicUser(user),
+      workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, role: "owner" },
+      token,
+    }, 201);
+  });
+
+  const loginRoute = createRoute({
+    method: "post", path: "/auth/login",
+    request: { body: { content: { "application/json": { schema: credentialsSchema } } } },
+    responses: { 200: { description: "Logged in; session issued" } },
+  });
+  app.openapi(loginRoute, async (c) => {
+    const secret = sessionSecret();
+    const body = c.req.valid("json");
+    const user = await deps.authStore.findUserByEmail(body.email.toLowerCase());
+    // One generic message for every failure mode - no account enumeration.
+    if (!user?.passwordHash || !(await verifyPassword(body.password, user.passwordHash))) {
+      throw new AppError("UNAUTHORIZED", "Invalid email or password.", { status: 401 });
+    }
+    await deps.authStore.audit({ userId: user.id, action: "auth.login", details: { email: user.email } });
+    const token = signSessionToken({ userId: user.id, email: user.email }, secret);
+    setSessionCookie(c, token);
+    return c.json({
+      user: publicUser(user),
+      workspaces: await deps.authStore.listWorkspaces(user.id),
+      token,
+    });
+  });
+
+  app.post("/auth/logout", (c) => {
+    deleteCookie(c, SESSION_COOKIE, { path: "/" });
+    return c.json({ ok: true });
+  });
+
+  const meRoute = createRoute({
+    method: "get", path: "/auth/me",
+    responses: { 200: { description: "Current user + their workspaces" } },
+  });
+  app.openapi(meRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    return c.json({
+      user: publicUser(user),
+      workspaces: await deps.authStore.listWorkspaces(user.id),
+    });
+  });
+
 
   // ------------------------------------------------------------ webhooks
   // Webhooks are provider-facing: no workspace header, no DB. Auth is the
@@ -447,18 +879,122 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ ...estimate });
   });
 
-  // ------------------------------------------- workspace context middleware
-  // Fase 1 stand-in for auth: X-Workspace-Id header -> request context.
-  const workspaceMiddleware = async (c: Ctx, next: Next) => {
-    const id = c.req.header("x-workspace-id");
-    if (id) c.set("workspaceId", id);
+  // ------------------------------------------- auth context middleware
+  // Fase 3: every workspace-scoped route runs behind session auth +
+  // verified workspace membership (see resolveAuthContext). Registered
+  // BEFORE the routes it protects (Hono applies use() in order). The one
+  // documented bypass is POST /broadcasts/estimate - a pure calculator over
+  // the request body that touches no workspace data.
+  const authMiddleware = async (c: Ctx, next: Next) => {
+    if (c.req.path === "/broadcasts/estimate") return next();
+    const auth = await resolveAuthContext(c);
+    c.set("auth", auth);
+    if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences"]) {
-    app.use(prefix, workspaceMiddleware);
-    app.use(`${prefix}/*`, workspaceMiddleware);
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb"]) {
+    app.use(prefix, authMiddleware);
+    app.use(`${prefix}/*`, authMiddleware);
   }
 
+  // ------------------------------------------------------------- workspaces
+  const createWorkspaceRoute = createRoute({
+    method: "post", path: "/workspaces",
+    request: {
+      body: { content: { "application/json": { schema: z.object({ name: z.string().min(1).max(200) }) } } },
+    },
+    responses: { 201: { description: "Workspace created; caller is owner" } },
+  });
+  app.openapi(createWorkspaceRoute, async (c) => {
+    const auth = authContext(c);
+    const workspace = await createWorkspaceWithUniqueSlug(c.req.valid("json").name);
+    await deps.authStore.addMember({ workspaceId: workspace.id, userId: auth.user.id, role: "owner" });
+    return c.json({
+      workspace: { id: workspace.id, name: workspace.name, slug: workspace.slug, role: "owner" },
+    }, 201);
+  });
+
+  const listWorkspacesRoute = createRoute({
+    method: "get", path: "/workspaces",
+    responses: { 200: { description: "Workspaces of the current user" } },
+  });
+  app.openapi(listWorkspacesRoute, async (c) => {
+    const auth = authContext(c);
+    return c.json({ workspaces: await deps.authStore.listWorkspaces(auth.user.id) });
+  });
+
+  const listMembersRoute = createRoute({
+    method: "get", path: "/workspaces/{id}/members",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Workspace members" } },
+  });
+  app.openapi(listMembersRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    await requirePathWorkspaceRole(c, id, ROLES);
+    return c.json({ members: await deps.authStore.listMembers(id) });
+  });
+
+  const addMemberRoute = createRoute({
+    method: "post", path: "/workspaces/{id}/members",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              email: z.string().email(),
+              role: z.enum(ROLES).default("member"),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Member added (user invited by email when new)" } },
+  });
+  app.openapi(addMemberRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const body = c.req.valid("json");
+    const email = body.email.toLowerCase();
+    // Invite by email: an unknown email gets a passwordless user row; its
+    // owner claims it at registration (see /auth/register).
+    const invitee = await deps.authStore.findUserByEmail(email)
+      ?? await deps.authStore.createUser({ email });
+    await deps.authStore.addMember({ workspaceId: id, userId: invitee.id, role: body.role });
+    await deps.authStore.audit({
+      workspaceId: id,
+      userId: auth.user.id,
+      action: "workspace.member.add",
+      details: { memberUserId: invitee.id, email, role: body.role },
+    });
+    return c.json({
+      member: { userId: invitee.id, email: invitee.email, name: invitee.name, role: body.role },
+    }, 201);
+  });
+
+  const removeMemberRoute = createRoute({
+    method: "delete", path: "/workspaces/{id}/members/{userId}",
+    request: { params: z.object({ id: z.string(), userId: z.string() }) },
+    responses: { 200: { description: "Member removed" } },
+  });
+  app.openapi(removeMemberRoute, async (c) => {
+    const { id, userId } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const members = await deps.authStore.listMembers(id);
+    const target = members.find((m) => m.userId === userId);
+    if (!target) throw new AppError("NOT_FOUND", "Workspace member not found.", { status: 404 });
+    if (target.role === "owner" && members.filter((m) => m.role === "owner").length <= 1) {
+      throw new AppError("CONFLICT", "Cannot remove the workspace's only owner.", { status: 409 });
+    }
+    await deps.authStore.removeMember(id, userId);
+    await deps.authStore.audit({
+      workspaceId: id,
+      userId: auth.user.id,
+      action: "workspace.member.remove",
+      details: { memberUserId: userId, email: target.email, role: target.role },
+    });
+    return c.json({ removed: true });
+  });
   // --------------------------------------------------------- conversations
   const listConversationsRoute = createRoute({
     method: "get", path: "/conversations",
@@ -629,6 +1165,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Contact created" } },
   });
   app.openapi(createContactRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const body = c.req.valid("json");
@@ -655,6 +1192,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Contact updated" } },
   });
   app.openapi(patchContactRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
@@ -705,6 +1243,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Template created" } },
   });
   app.openapi(createTemplateRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const row = await createTemplate(db, { workspaceId: ws, ...c.req.valid("json") });
@@ -720,6 +1259,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Template latest category updated" } },
   });
   app.openapi(patchTemplateCategoryRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
@@ -750,6 +1290,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Broadcast created and queued" } },
   });
   app.openapi(createBroadcastRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const body = c.req.valid("json");
@@ -933,6 +1474,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "WhatsApp account(s) onboarded" } },
   });
   app.openapi(embeddedSignupRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const result = await deps.whatsappOnboarding(ws, c.req.valid("json"));
     // The result summary carries no token material by construction.
@@ -1067,6 +1609,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Scheduled post created" } },
   });
   app.openapi(createPostRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const body = c.req.valid("json");
@@ -1138,6 +1681,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Scheduled post updated" } },
   });
   app.openapi(patchPostRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
@@ -1163,6 +1707,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Scheduled post deleted" } },
   });
   app.openapi(deletePostRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const deleted = await deleteScheduledPost(db, ws, c.req.valid("param").id);
@@ -1176,6 +1721,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 202: { description: "Publish job enqueued" } },
   });
   app.openapi(publishNowRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
@@ -1219,6 +1765,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Sequence created" } },
   });
   app.openapi(createSequenceRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const body = c.req.valid("json");
@@ -1276,6 +1823,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Sequence updated" } },
   });
   app.openapi(patchSequenceRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
@@ -1304,6 +1852,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 201: { description: "Contacts enrolled by tag" } },
   });
   app.openapi(enrollRoute, async (c) => {
+    guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");

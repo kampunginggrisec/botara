@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { AppError } from "@botara/shared";
 import { createApp, type ApiDeps } from "./app";
+import { InMemoryAuthStore } from "./auth";
 
 function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
   return {
@@ -15,8 +16,57 @@ function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
       throw new AppError("CONFIGURATION", "onboarding not configured (test).", { status: 503 });
     },
     getAiProvider: () => null,
-    env: { WHATSAPP_VERIFY_TOKEN: "verify-me" },
+    authStore: new InMemoryAuthStore(),
+    emailInboundEnqueuer: { async enqueueEmailInbound() {} },
+    emailRouter: { async resolveRecipientDomain() { return null; } },
+    dataDeletionStore: {
+      async create() {},
+      async getByCode() { return null; },
+      async complete() {},
+      async purge() { return { contacts: 0 }; },
+    },
+    kbEnqueuer: { async enqueueKbIngest() {} },
+    readiness: {
+      async checkDatabase() { return { ok: false, detail: "not configured (test)" }; },
+      async checkRedis() { return { ok: false, detail: "not configured (test)" }; },
+    },
+    env: { WHATSAPP_VERIFY_TOKEN: "verify-me", SESSION_SECRET: "test-session-secret" },
     ...overrides,
+  };
+}
+
+type TestApp = ReturnType<typeof createApp>;
+
+interface Registered {
+  token: string;
+  workspaceId: string;
+  userId: string;
+  /** Bearer token + workspace selector, as the web client sends them. */
+  headers: Record<string, string>;
+}
+
+/** Register a user through the real endpoint and return session material. */
+async function registerUser(
+  app: TestApp,
+  email = "owner@example.com",
+  name = "Owner",
+): Promise<Registered> {
+  const res = await app.request("/auth/register", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password: "password-123", name }),
+  });
+  expect(res.status).toBe(201);
+  const body = (await res.json()) as {
+    token: string;
+    workspace: { id: string };
+    user: { id: string };
+  };
+  return {
+    token: body.token,
+    workspaceId: body.workspace.id,
+    userId: body.user.id,
+    headers: { authorization: `Bearer ${body.token}`, "x-workspace-id": body.workspace.id },
   };
 }
 
@@ -28,7 +78,7 @@ describe("api app (no DB configured)", () => {
     expect(await res.json()).toEqual({ status: "ok", service: "api" });
   });
 
-  test("POST /broadcasts/estimate works WITHOUT a database (pure route)", async () => {
+  test("POST /broadcasts/estimate works WITHOUT a database and WITHOUT auth (pure public calculator)", async () => {
     const app = createApp(testDeps());
     const res = await app.request("/broadcasts/estimate", {
       method: "POST",
@@ -45,20 +95,56 @@ describe("api app (no DB configured)", () => {
     expect(body.lines).toHaveLength(1);
   });
 
-  test("GET /conversations without DATABASE_URL -> 503 CONFIGURATION (not a crash)", async () => {
+  test("GET /conversations without a session token -> 401 UNAUTHORIZED", async () => {
     const app = createApp(testDeps());
     const res = await app.request("/conversations", { headers: { "x-workspace-id": "ws-1" } });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("UNAUTHORIZED");
+  });
+
+  test("GET /conversations with a token but no workspace selected -> 400 VALIDATION", async () => {
+    const app = createApp(testDeps());
+    const reg = await registerUser(app);
+    const res = await app.request("/conversations", {
+      headers: { authorization: `Bearer ${reg.token}` },
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION");
+  });
+
+  test("GET /conversations for a workspace the user does not belong to -> 403 FORBIDDEN", async () => {
+    const app = createApp(testDeps());
+    const reg = await registerUser(app);
+    const res = await app.request("/conversations", {
+      headers: { authorization: `Bearer ${reg.token}`, "x-workspace-id": "someone-elses-ws" },
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("FORBIDDEN");
+  });
+
+  test("GET /conversations authenticated + member, DB unconfigured -> 503 CONFIGURATION (not a crash)", async () => {
+    const app = createApp(testDeps());
+    const reg = await registerUser(app);
+    const res = await app.request("/conversations", { headers: reg.headers });
     expect(res.status).toBe(503);
     const body = (await res.json()) as { error: { code: string } };
     expect(body.error.code).toBe("CONFIGURATION");
   });
 
-  test("GET /conversations without workspace header -> 400 VALIDATION", async () => {
-    const app = createApp(testDeps());
-    const res = await app.request("/conversations");
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: { code: string } };
-    expect(body.error.code).toBe("VALIDATION");
+  test("dev header fallback stays OFF by default and works only when explicitly enabled", async () => {
+    const off = createApp(testDeps());
+    const resOff = await off.request("/conversations", { headers: { "x-workspace-id": "ws-1" } });
+    expect(resOff.status).toBe(401);
+
+    const on = createApp(testDeps({
+      env: { SESSION_SECRET: "test-session-secret", BOTARA_ALLOW_HEADER_WORKSPACE: "1" },
+    }));
+    const resOn = await on.request("/conversations", { headers: { "x-workspace-id": "ws-1" } });
+    // Past auth (fallback) -> the request reaches the handler -> 503 from the missing DB.
+    expect(resOn.status).toBe(503);
   });
 
   test("WhatsApp webhook GET verification returns the challenge", async () => {
@@ -89,12 +175,13 @@ describe("api app (no DB configured)", () => {
   });
 });
 
-describe("api app - Fase 2 routes (no DB configured)", () => {
+describe("api app - Fase 2 routes under Fase 3 auth", () => {
   test("POST /conversations/:id/ai-suggest without an AI provider -> 503 CONFIGURATION (never faked)", async () => {
     const app = createApp(testDeps());
+    const reg = await registerUser(app);
     const res = await app.request("/conversations/conv-1/ai-suggest", {
       method: "POST",
-      headers: { "x-workspace-id": "ws-1", "content-type": "application/json" },
+      headers: { ...reg.headers, "content-type": "application/json" },
       body: "{}",
     });
     expect(res.status).toBe(503);
@@ -174,7 +261,6 @@ describe("api app - Fase 2 routes (no DB configured)", () => {
     expect(event.templateExternalId).toBe("12345");
     expect(event.newCategory).toBe("marketing");
     expect(event.previousCategory).toBe("utility");
-    // The WABA (messaging account) id rides along for persistence.
     expect(event.accountExternalId).toBe("waba-99");
   });
 
@@ -190,13 +276,14 @@ describe("api app - Fase 2 routes (no DB configured)", () => {
         };
       },
     }));
+    const reg = await registerUser(app);
     const res = await app.request("/channels/whatsapp/embedded-signup/exchange", {
       method: "POST",
-      headers: { "x-workspace-id": "ws-1", "content-type": "application/json" },
+      headers: { ...reg.headers, "content-type": "application/json" },
       body: JSON.stringify({ code: "the-code", sessionInfo: { isCoexistence: true } }),
     });
     expect(res.status).toBe(201);
-    expect(seen).toEqual([{ workspaceId: "ws-1", code: "the-code" }]);
+    expect(seen).toEqual([{ workspaceId: reg.workspaceId, code: "the-code" }]);
     const body = (await res.json()) as { result: { wabaId: string; accounts: unknown[] } };
     expect(body.result.wabaId).toBe("waba-1");
     expect(JSON.stringify(body)).not.toContain("token");
@@ -234,15 +321,200 @@ describe("api app - Fase 2 routes (no DB configured)", () => {
     expect(res.status).toBe(401); // no svix headers -> rejected
   });
 
-  test("GET /channels/accounts without DB -> 503 CONFIGURATION", async () => {
+  test("GET /channels/accounts authenticated, DB unconfigured -> 503 CONFIGURATION", async () => {
     const app = createApp(testDeps());
-    const res = await app.request("/channels/accounts", { headers: { "x-workspace-id": "ws-1" } });
+    const reg = await registerUser(app);
+    const res = await app.request("/channels/accounts", { headers: reg.headers });
     expect(res.status).toBe(503);
   });
 
-  test("GET /posts without DB -> 503 CONFIGURATION", async () => {
+  test("GET /posts authenticated, DB unconfigured -> 503 CONFIGURATION", async () => {
     const app = createApp(testDeps());
-    const res = await app.request("/posts", { headers: { "x-workspace-id": "ws-1" } });
+    const reg = await registerUser(app);
+    const res = await app.request("/posts", { headers: reg.headers });
     expect(res.status).toBe(503);
+  });
+});
+
+describe("auth flow (Fase 3)", () => {
+  test("register -> login -> me happy path, with cookie + audit trail", async () => {
+    const authStore = new InMemoryAuthStore();
+    const app = createApp(testDeps({ authStore }));
+
+    const regRes = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "rina@example.com", password: "password-123", name: "Rina" }),
+    });
+    expect(regRes.status).toBe(201);
+    const cookie = regRes.headers.get("set-cookie") ?? "";
+    expect(cookie).toContain("botara_session=");
+    expect(cookie).toContain("HttpOnly");
+    const reg = (await regRes.json()) as {
+      token: string; user: { id: string; email: string }; workspace: { id: string; role: string };
+    };
+    expect(reg.user.email).toBe("rina@example.com");
+    expect(reg.workspace.role).toBe("owner");
+
+    const loginRes = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "rina@example.com", password: "password-123" }),
+    });
+    expect(loginRes.status).toBe(200);
+    const login = (await loginRes.json()) as { token: string; workspaces: Array<{ id: string; role: string }> };
+    expect(login.workspaces).toHaveLength(1);
+    expect(login.workspaces[0]!.id).toBe(reg.workspace.id);
+
+    // /auth/me accepts the Bearer token...
+    const meRes = await app.request("/auth/me", {
+      headers: { authorization: `Bearer ${login.token}` },
+    });
+    expect(meRes.status).toBe(200);
+    const me = (await meRes.json()) as { user: { email: string }; workspaces: unknown[] };
+    expect(me.user.email).toBe("rina@example.com");
+    expect(me.workspaces).toHaveLength(1);
+
+    // ...and the cookie.
+    const meCookie = await app.request("/auth/me", {
+      headers: { cookie: `botara_session=${login.token}` },
+    });
+    expect(meCookie.status).toBe(200);
+
+    expect(authStore.auditLog.map((a) => a.action)).toEqual(["auth.register", "auth.login"]);
+  });
+
+  test("login failures are a generic 401; duplicate registration is a 409", async () => {
+    const app = createApp(testDeps());
+    await registerUser(app, "dup@example.com");
+
+    const wrongPassword = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "dup@example.com", password: "wrong-password" }),
+    });
+    expect(wrongPassword.status).toBe(401);
+
+    const unknownEmail = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "ghost@example.com", password: "password-123" }),
+    });
+    expect(unknownEmail.status).toBe(401);
+    const wrongBody = (await wrongPassword.json()) as { error: { message: string } };
+    const unknownBody = (await unknownEmail.json()) as { error: { message: string } };
+    expect(wrongBody.error.message).toBe(unknownBody.error.message);
+
+    const duplicate = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "dup@example.com", password: "password-456" }),
+    });
+    expect(duplicate.status).toBe(409);
+  });
+
+  test("/auth/me without a token -> 401; with a tampered token -> 401", async () => {
+    const app = createApp(testDeps());
+    const noToken = await app.request("/auth/me");
+    expect(noToken.status).toBe(401);
+
+    const reg = await registerUser(app);
+    const tampered = `${reg.token.slice(0, -2)}xx`;
+    const bad = await app.request("/auth/me", { headers: { authorization: `Bearer ${tampered}` } });
+    expect(bad.status).toBe(401);
+  });
+
+  test("workspaces: create + list; members: invite by email, role guard, remove", async () => {
+    const authStore = new InMemoryAuthStore();
+    const app = createApp(testDeps({ authStore }));
+    const owner = await registerUser(app, "boss@example.com");
+
+    const created = await app.request("/workspaces", {
+      method: "POST",
+      headers: { ...owner.headers, "content-type": "application/json" },
+      body: JSON.stringify({ name: "Toko Kopi" }),
+    });
+    expect(created.status).toBe(201);
+    const shop = (await created.json()) as { workspace: { id: string; slug: string } };
+    expect(shop.workspace.slug).toBe("toko-kopi");
+
+    const list = await app.request("/workspaces", { headers: owner.headers });
+    const listBody = (await list.json()) as { workspaces: unknown[] };
+    expect(listBody.workspaces).toHaveLength(2); // personal + Toko Kopi
+
+    // Invite an agent by email (creates a passwordless user row).
+    const invite = await app.request(`/workspaces/${shop.workspace.id}/members`, {
+      method: "POST",
+      headers: { ...owner.headers, "content-type": "application/json" },
+      body: JSON.stringify({ email: "agent@example.com", role: "agent" }),
+    });
+    expect(invite.status).toBe(201);
+    const inviteBody = (await invite.json()) as { member: { userId: string; role: string } };
+    expect(inviteBody.member.role).toBe("agent");
+
+    // The invited agent claims the account by registering, then logs in.
+    const claim = await app.request("/auth/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "agent@example.com", password: "password-123", name: "Agent" }),
+    });
+    expect(claim.status).toBe(201);
+    const agentLogin = await app.request("/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ email: "agent@example.com", password: "password-123" }),
+    });
+    const agentBody = (await agentLogin.json()) as { token: string };
+    const agentHeaders = {
+      authorization: `Bearer ${agentBody.token}`,
+      "x-workspace-id": shop.workspace.id,
+    };
+
+    // Agent CAN read (reaches the handler -> 503 from the unconfigured DB)...
+    const read = await app.request("/conversations", { headers: agentHeaders });
+    expect(read.status).toBe(503);
+    // ...but CANNOT mutate: the role guard fires before any DB access.
+    const mutate = await app.request("/contacts", {
+      method: "POST",
+      headers: { ...agentHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ channel: "whatsapp", externalId: "6281" }),
+    });
+    expect(mutate.status).toBe(403);
+    const mutateBody = (await mutate.json()) as { error: { code: string } };
+    expect(mutateBody.error.code).toBe("FORBIDDEN");
+
+    // A plain member CAN mutate (guard passes; the 503 is the missing DB).
+    const inviteMember = await app.request(`/workspaces/${shop.workspace.id}/members`, {
+      method: "POST",
+      headers: { ...owner.headers, "content-type": "application/json" },
+      body: JSON.stringify({ email: "member@example.com", role: "member" }),
+    });
+    expect(inviteMember.status).toBe(201);
+
+    // The agent cannot administer members (owner/admin only).
+    const agentAdmin = await app.request(`/workspaces/${shop.workspace.id}/members`, {
+      method: "POST",
+      headers: { ...agentHeaders, "content-type": "application/json" },
+      body: JSON.stringify({ email: "sneaky@example.com", role: "member" }),
+    });
+    expect(agentAdmin.status).toBe(403);
+
+    // Owner removes the agent; audit recorded both member events.
+    const removed = await app.request(
+      `/workspaces/${shop.workspace.id}/members/${inviteBody.member.userId}`,
+      { method: "DELETE", headers: owner.headers },
+    );
+    expect(removed.status).toBe(200);
+    const memberActions = authStore.auditLog
+      .filter((a) => a.action.startsWith("workspace.member."))
+      .map((a) => a.action);
+    expect(memberActions).toEqual(["workspace.member.add", "workspace.member.add", "workspace.member.remove"]);
+
+    // The workspace's only owner cannot be removed.
+    const removeOwner = await app.request(
+      `/workspaces/${shop.workspace.id}/members/${owner.userId}`,
+      { method: "DELETE", headers: owner.headers },
+    );
+    expect(removeOwner.status).toBe(409);
   });
 });
