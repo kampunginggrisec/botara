@@ -1,3 +1,5 @@
+import type { RichBlock, RichWarning } from "./rich";
+
 /**
  * Channel capability model. The flow engine, inbox UI, and composer all read
  * capabilities from here - capabilities are NEVER assumed per channel in
@@ -13,6 +15,14 @@ export interface CapabilitySet {
   canBroadcast: boolean;
   /** Provider natively supports scheduled sends (false = Botara schedules via its own queue). */
   canScheduleNatively: boolean;
+  /** Rich blocks: native interactive reply/url/postback buttons. */
+  richButtons: boolean;
+  /** Rich blocks: native list-picker messages. */
+  richLists: boolean;
+  /** Rich blocks: native card carousel (generic template / equivalent). */
+  carousel: boolean;
+  /** Rich blocks: native product / catalog messages. */
+  catalog: boolean;
   /** WhatsApp only: where marketing-category sends must be routed. */
   marketingRoute?: "cloud-api" | "marketing-messages-api";
   /** Instagram only: supported OAuth flavours. */
@@ -34,39 +44,46 @@ export const CHANNEL_CAPABILITIES: Record<ChannelKey, CapabilitySet> = {
   whatsapp: {
     canDM: true, canPublish: false, canReplyToComments: false, canHideComments: false,
     canLike: false, canFetchInsights: true, canBroadcast: true, canScheduleNatively: false,
+    richButtons: true, richLists: true, carousel: false, catalog: true,
     marketingRoute: "marketing-messages-api",
-    notes: "Template-based outside the 24h window. Per-message pricing since 2025-07-01; service messages billed since 2026-10-01 after 1,000 free/number/month.",
+    notes: "Template-based outside the 24h window. Per-message pricing since 2025-07-01; service messages billed since 2026-10-01 after 1,000 free/number/month. Rich: interactive buttons/list/CTA-URL + product & catalog messages; no free-form carousel (carousels exist only as pre-approved templates).",
   },
   instagram: {
     canDM: true, canPublish: true, canReplyToComments: true, canHideComments: true,
     canLike: true, canFetchInsights: true, canBroadcast: false, canScheduleNatively: false,
+    richButtons: true, richLists: false, carousel: true, catalog: false,
     authModes: ["instagram-login", "facebook-login"],
-    notes: "Professional accounts only (Basic Display API retired 2024-12-04). Media is fetched by Meta from a public URL.",
+    notes: "Professional accounts only (Basic Display API retired 2024-12-04). Media is fetched by Meta from a public URL. Rich: buttons render as quick replies, carousel as a Send API generic template; no list or catalog messages.",
   },
   messenger: {
     canDM: true, canPublish: false, canReplyToComments: true, canHideComments: true,
     canLike: false, canFetchInsights: true, canBroadcast: false, canScheduleNatively: false,
-    notes: "Page-based. Customer Chat Plugin retired 2024-05-09 - webchat is Botara's own widget.",
+    richButtons: true, richLists: false, carousel: true, catalog: false,
+    notes: "Page-based. Customer Chat Plugin retired 2024-05-09 - webchat is Botara's own widget. Rich: button template + quick replies + generic-template carousel; the old list template was retired by Meta.",
   },
   threads: {
     canDM: false, canPublish: true, canReplyToComments: true, canHideComments: true,
     canLike: false, canFetchInsights: true, canBroadcast: false, canScheduleNatively: false,
+    richButtons: false, richLists: false, carousel: false, catalog: false,
     notes: "No DM API and no like API. Public reply + hide only for comment automation. Publishing quotas: 250 posts / 1,000 replies / 100 deletions per profile per 24h.",
   },
   telegram: {
     canDM: true, canPublish: true, canReplyToComments: false, canHideComments: false,
     canLike: false, canFetchInsights: false, canBroadcast: true, canScheduleNatively: false,
-    notes: "Bot API. Channel posts = publish; groups/chats = DM-style messaging.",
+    richButtons: true, richLists: false, carousel: false, catalog: false,
+    notes: "Bot API. Channel posts = publish; groups/chats = DM-style messaging. Rich: inline keyboards; lists render as keyboards and carousels as sequential card messages (with a typed warning), never silently.",
   },
   email: {
     canDM: true, canPublish: false, canReplyToComments: false, canHideComments: false,
     canLike: false, canFetchInsights: true, canBroadcast: true, canScheduleNatively: false,
-    notes: "Via Resend. Inbound webhook carries metadata only; content is fetched via the Receiving API.",
+    richButtons: false, richLists: false, carousel: false, catalog: false,
+    notes: "Via Resend. Inbound webhook carries metadata only; content is fetched via the Receiving API. Rich blocks degrade to formatted plain text (typed warning).",
   },
   webchat: {
     canDM: true, canPublish: false, canReplyToComments: false, canHideComments: false,
     canLike: false, canFetchInsights: false, canBroadcast: false, canScheduleNatively: false,
-    notes: "Botara's own website widget (Meta's Customer Chat Plugin retired 2024-05-09, no replacement). Messages persist in Botara's DB via a store port - there is no external API.",
+    richButtons: false, richLists: false, carousel: false, catalog: false,
+    notes: "Botara's own website widget (Meta's Customer Chat Plugin retired 2024-05-09, no replacement). Messages persist in Botara's DB via a store port - there is no external API. Rich blocks degrade to formatted plain text (typed warning).",
   },
 };
 
@@ -95,9 +112,19 @@ export interface MessageAttachment {
   size?: number;
 }
 
+/** Click-to-WhatsApp ad referral data attached to a first message (growth attribution input). */
+export interface MessageReferral {
+  /** Referral source label (e.g. "ADS", "SHORT_LINK") when the provider sends one. */
+  source?: string;
+  /** Click id from a click-to-WhatsApp ad (ctwa_clid), when present. */
+  ctwaClid?: string;
+  /** Provider source id (ad / post id), when present. */
+  sourceId?: string;
+}
+
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
-  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[] }
+  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral }
   | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; receivedAt: string }
   | { type: "comment.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId: string; text?: string; authorExternalId?: string; parentPostExternalId?: string; receivedAt: string }
   | { type: "mention.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId?: string; authorExternalId?: string; receivedAt: string }
@@ -142,6 +169,14 @@ export interface SendInput {
   templateName?: string;
   /** Email only: message subject (other channels ignore it). */
   subject?: string;
+  /**
+   * Rich block (buttons / list / carousel / product / catalog). When set,
+   * the adapter renders it natively where its capabilities allow and
+   * degrades to formatted plain text + a typed warning elsewhere - never
+   * silently. Takes precedence over text/media inside the rich renderer;
+   * `text` should carry the block's own text for non-rich consumers.
+   */
+  rich?: RichBlock;
   /** REQUIRED: providers are called with this key so retries never double-send. */
   idempotencyKey: string;
 }
@@ -149,6 +184,8 @@ export interface SendInput {
 export interface SendResult {
   externalMessageId: string;
   status: "sent" | "queued";
+  /** Typed rich-render warning codes (see rich.ts) when a block degraded. */
+  warnings?: RichWarning[];
 }
 
 export interface PublishInput {

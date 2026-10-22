@@ -1,3 +1,4 @@
+import type { RichBlock } from "@botara/channels";
 import type { Flow, FlowNode } from "./schemas";
 
 /**
@@ -20,7 +21,7 @@ export interface FlowEvent {
 }
 
 export type FlowAction =
-  | { type: "send_message"; text: string; channel?: string }
+  | { type: "send_message"; text: string; channel?: string; rich?: RichBlock }
   | { type: "ai_reply"; prompt: string; fallbackText: string; query: string; channel?: string }
   | { type: "schedule_delay"; seconds: number }
   | { type: "call_webhook"; url: string; method: "GET" | "POST" }
@@ -47,7 +48,10 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
       return { state: advance(node.next), actions: [] };
     case "send_message": {
       const text = node.text.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
-      return { state: advance(node.next), actions: [{ type: "send_message", text, channel: node.channel }] };
+      return {
+        state: advance(node.next),
+        actions: [{ type: "send_message", text, channel: node.channel, ...(node.rich ? { rich: node.rich } : {}) }],
+      };
     }
     case "condition": {
       const actual = variables[node.field];

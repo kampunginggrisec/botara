@@ -113,6 +113,7 @@
       "name": "@botara/flow-engine",
       "version": "0.0.0",
       "dependencies": {
+        "@botara/channels": "workspace:*",
         "@botara/shared": "workspace:*",
         "zod": "^3.24.0",
       },

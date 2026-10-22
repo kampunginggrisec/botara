@@ -6,6 +6,7 @@ import {
   type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
   type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText, type RichBlock, type RichWarning } from "./rich";
 
 /**
  * Instagram adapter (Fase 2 - real). ONE adapter, two auth modes, selected
@@ -303,6 +304,7 @@ export class InstagramAdapter implements ChannelAdapter {
   // --- messaging ---------------------------------------------------------------
 
   async send(input: SendInput): Promise<SendResult> {
+    if (input.rich) return this.sendRich(input, input.rich);
     const igUserId = input.account.externalId;
     let message: Record<string, unknown>;
     if (input.media?.link) {
@@ -321,6 +323,71 @@ export class InstagramAdapter implements ChannelAdapter {
       throw new ProviderApiError("Instagram send returned no message id", { provider: "instagram", retryable: false });
     }
     return { externalMessageId: messageId, status: "sent" };
+  }
+
+  /**
+   * Rich-block renderer (Send API on the mode-correct host). Native:
+   * carousel as a generic template, buttons as quick replies on the text.
+   * Quick replies cannot open URLs - url buttons are dropped with a typed
+   * warning, and a buttons block made ONLY of url buttons degrades to
+   * formatted text. Lists / products / catalogs have no IG message surface
+   * and degrade to text as well.
+   */
+  private async sendRich(input: SendInput, rich: RichBlock): Promise<SendResult> {
+    const igUserId = input.account.externalId;
+    const warnings: RichWarning[] = [];
+    let message: Record<string, unknown> | null = null;
+
+    if (rich.kind === "buttons") {
+      const tappable = rich.buttons.filter((b) => b.type !== "url");
+      if (tappable.length > 0) {
+        if (tappable.length < rich.buttons.length) warnings.push("RICH_URL_BUTTONS_DROPPED");
+        if (tappable.length > 13) warnings.push("RICH_BUTTONS_TRUNCATED");
+        message = {
+          text: rich.text,
+          quick_replies: tappable.slice(0, 13).map((b) => ({
+            content_type: "text",
+            title: b.title.slice(0, 20),
+            payload: b.payload,
+          })),
+        };
+      }
+    } else if (rich.kind === "carousel") {
+      message = {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "generic",
+            elements: rich.cards.map((card) => ({
+              title: card.title,
+              ...(card.subtitle ? { subtitle: card.subtitle } : {}),
+              ...(card.imageUrl ? { image_url: card.imageUrl } : {}),
+              ...(card.buttons && card.buttons.length > 0
+                ? {
+                    buttons: card.buttons.slice(0, 3).map((b) => b.type === "url"
+                      ? { type: "web_url", title: b.title, url: b.url }
+                      : { type: "postback", title: b.title, payload: b.payload }),
+                  }
+                : {}),
+            })),
+          },
+        },
+      };
+    }
+
+    if (!message) {
+      warnings.push("RICH_DEGRADED_TO_TEXT");
+      message = { text: richToPlainText(rich) };
+    }
+    const json = await this.graph(input.account, "POST", `${igUserId}/messages`, {
+      recipient: { id: input.toExternalId },
+      message,
+    });
+    const messageId = json.message_id as string | undefined;
+    if (!messageId) {
+      throw new ProviderApiError("Instagram send returned no message id", { provider: "instagram", retryable: false });
+    }
+    return { externalMessageId: messageId, status: "sent", ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
   /**

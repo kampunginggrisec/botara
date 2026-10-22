@@ -1,3 +1,4 @@
+import type { RichBlock } from "@botara/channels";
 import type { Flow } from "./schemas";
 import { initialState, step, type FlowAction, type FlowEvent, type FlowState } from "./interpreter";
 
@@ -16,7 +17,7 @@ import { initialState, step, type FlowAction, type FlowEvent, type FlowState } f
  * that state and later calls runFlow again with it to resume.
  */
 export interface FlowPorts {
-  sendMessage(input: { text: string; channel?: string }): Promise<void>;
+  sendMessage(input: { text: string; channel?: string; rich?: RichBlock }): Promise<void>;
   /** Persist/schedule a resume of `resumeState` after `seconds`. */
   scheduleDelay(input: { seconds: number; resumeState: FlowState }): Promise<void>;
   httpWebhook(input: { url: string; method: "GET" | "POST" }): Promise<void>;
@@ -95,7 +96,7 @@ export async function runFlow(
     for (const action of actions) {
       switch (action.type) {
         case "send_message":
-          await ports.sendMessage({ text: action.text, channel: action.channel });
+          await ports.sendMessage({ text: action.text, channel: action.channel, rich: action.rich });
           executed.push(action);
           break;
         case "ai_reply": {

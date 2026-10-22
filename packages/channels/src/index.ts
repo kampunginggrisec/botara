@@ -2,9 +2,15 @@ export {
   CHANNEL_CAPABILITIES, type CapabilitySet, type ChannelKey, type InboundEvent,
   type ChannelAccountRef, type SendInput, type SendTemplateInput, type SendResult,
   type PublishInput, type AdapterHealth, type ChannelAdapter, type MessageMedia,
-  type MessageAttachment, type MessageStatusError, type ChannelSecrets,
+  type MessageAttachment, type MessageStatusError, type MessageReferral, type ChannelSecrets,
   type CredentialProvider, type FetchLike, type RealAdapterOptions,
 } from "./types";
+export {
+  richBlockSchema, richButtonSchema, richButtonsBlockSchema, richListBlockSchema,
+  richCarouselBlockSchema, richProductBlockSchema, richCatalogBlockSchema,
+  richBlockText, richToPlainText,
+  type RichBlock, type RichButton, type RichWarning,
+} from "./rich";
 export {
   PlaceholderAdapter, registerAdapter, getAdapter, listAdapters, configureAdapterCredentials,
 } from "./registry";

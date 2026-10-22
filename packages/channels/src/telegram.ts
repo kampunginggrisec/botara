@@ -5,6 +5,7 @@ import {
   type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
   type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText, type RichBlock, type RichButton, type RichWarning } from "./rich";
 
 /**
  * Telegram Bot API adapter (Fase 1 - real).
@@ -130,6 +131,7 @@ export class TelegramAdapter implements ChannelAdapter {
   // --- sending ---------------------------------------------------------------
 
   async send(input: SendInput): Promise<SendResult> {
+    if (input.rich) return this.sendRich(input, input.rich);
     const chatId = input.toExternalId;
     if (input.media && (input.media.type === "image" || input.media.type === "photo")) {
       const photo = input.media.id ?? input.media.link;
@@ -149,6 +151,85 @@ export class TelegramAdapter implements ChannelAdapter {
       text: input.text,
     });
     return { externalMessageId: String(result.message_id), status: "sent" };
+  }
+
+  /** Map rich buttons onto an inline keyboard (rows of at most 3). */
+  private inlineKeyboard(buttons: RichButton[]): { inline_keyboard: Array<Array<Record<string, string>>> } {
+    const mapped: Array<Record<string, string>> = buttons.map((b): Record<string, string> => b.type === "url"
+      ? { text: b.title, url: b.url! }
+      : { text: b.title, callback_data: b.payload! });
+    const rows: Array<Array<Record<string, string>>> = [];
+    for (let i = 0; i < mapped.length; i += 3) rows.push(mapped.slice(i, i + 3));
+    return { inline_keyboard: rows };
+  }
+
+  /**
+   * Rich-block renderer (Bot API). Native: buttons and card buttons as
+   * inline keyboards. A carousel has no native Telegram form - it degrades
+   * to a SEQUENCE of card messages (photo + caption + that card's
+   * keyboard), a list degrades to text + a one-button-per-row keyboard,
+   * and product/catalog blocks degrade to formatted text - each with its
+   * typed warning, never silently.
+   */
+  private async sendRich(input: SendInput, rich: RichBlock): Promise<SendResult> {
+    const chatId = input.toExternalId;
+    const warnings: RichWarning[] = [];
+
+    if (rich.kind === "buttons") {
+      const result = await this.call<{ message_id: number }>(input.account, "sendMessage", {
+        chat_id: chatId,
+        text: rich.text,
+        reply_markup: this.inlineKeyboard(rich.buttons),
+      });
+      return { externalMessageId: String(result.message_id), status: "sent" };
+    }
+
+    if (rich.kind === "list") {
+      warnings.push("RICH_LIST_AS_KEYBOARD");
+      const lines = [rich.text];
+      const rowButtons: RichButton[] = [];
+      for (const section of rich.sections) {
+        lines.push("", section.title);
+        for (const row of section.rows) {
+          rowButtons.push({ type: "reply", title: row.title, payload: row.id });
+        }
+      }
+      const result = await this.call<{ message_id: number }>(input.account, "sendMessage", {
+        chat_id: chatId,
+        text: lines.join("\n"),
+        reply_markup: {
+          inline_keyboard: rowButtons.map((b) => [{ text: b.title, callback_data: b.payload! }]),
+        },
+      });
+      return { externalMessageId: String(result.message_id), status: "sent", warnings };
+    }
+
+    if (rich.kind === "carousel") {
+      warnings.push("RICH_CAROUSEL_SEQUENTIAL");
+      let firstMessageId = "";
+      for (const card of rich.cards) {
+        const caption = [card.title, card.subtitle].filter(Boolean).join("\n");
+        const markup = card.buttons && card.buttons.length > 0
+          ? { reply_markup: this.inlineKeyboard(card.buttons) }
+          : {};
+        const result = card.imageUrl
+          ? await this.call<{ message_id: number }>(input.account, "sendPhoto", {
+              chat_id: chatId, photo: card.imageUrl, caption, ...markup,
+            })
+          : await this.call<{ message_id: number }>(input.account, "sendMessage", {
+              chat_id: chatId, text: caption, ...markup,
+            });
+        if (!firstMessageId) firstMessageId = String(result.message_id);
+      }
+      return { externalMessageId: firstMessageId, status: "sent", warnings };
+    }
+
+    warnings.push("RICH_DEGRADED_TO_TEXT");
+    const result = await this.call<{ message_id: number }>(input.account, "sendMessage", {
+      chat_id: chatId,
+      text: richToPlainText(rich),
+    });
+    return { externalMessageId: String(result.message_id), status: "sent", warnings };
   }
 
   async publish(input: PublishInput): Promise<{ externalPostId: string }> {

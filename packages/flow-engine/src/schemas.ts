@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { richBlockSchema } from "@botara/channels";
 
 /**
  * Flow node schemas (Fase 0 set). The same Zod schemas validate flows in the
@@ -19,6 +20,13 @@ export const sendMessageNodeSchema = z.object({
   type: z.literal("send_message"),
   text: z.string(),
   channel: z.string().optional(),
+  /**
+   * Optional rich block (adopted-features package): buttons / list /
+   * carousel / product / catalog, rendered per channel by the adapters.
+   * `text` stays the plain-text companion (fallback rendering + the
+   * persisted message body derive from the block itself when present).
+   */
+  rich: richBlockSchema.optional(),
 });
 
 export const conditionNodeSchema = z.object({

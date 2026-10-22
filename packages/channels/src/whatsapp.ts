@@ -9,6 +9,7 @@ import {
   type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
   type PublishInput, type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText, type RichBlock, type RichWarning } from "./rich";
 
 /**
  * WhatsApp Cloud API adapter (Fase 1 - real).
@@ -196,6 +197,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
   }
 
   async send(input: SendInput): Promise<SendResult> {
+    if (input.rich) return this.sendRich(input, input.rich);
     const phoneNumberId = input.account.externalId;
     let route: WhatsAppRoute = "messages";
     let body: Record<string, unknown>;
@@ -244,6 +246,130 @@ export class WhatsAppAdapter implements ChannelAdapter {
       });
     }
     return { externalMessageId, status: "sent" };
+  }
+
+  /**
+   * Rich-block renderer (interactive messages). Native: reply buttons
+   * (max 3), list messages (max 10 rows total), a single CTA-URL button,
+   * single-product and multi-product catalog messages. Everything else
+   * (carousels, mixed button kinds, section-less catalogs) degrades to
+   * formatted plain text + a typed warning - never silently.
+   */
+  private async sendRich(input: SendInput, rich: RichBlock): Promise<SendResult> {
+    const phoneNumberId = input.account.externalId;
+    const warnings: RichWarning[] = [];
+    const base = { messaging_product: "whatsapp", recipient_type: "individual", to: input.toExternalId };
+    let body: Record<string, unknown> | null = null;
+
+    const truncate = (value: string, max: number): string => {
+      if (value.length <= max) return value;
+      warnings.push("RICH_TITLES_TRUNCATED");
+      return value.slice(0, max);
+    };
+
+    if (rich.kind === "buttons") {
+      const urlButtons = rich.buttons.filter((b) => b.type === "url");
+      if (urlButtons.length === 0) {
+        // Reply/postback buttons -> interactive "button" message (max 3).
+        let buttons = rich.buttons;
+        if (buttons.length > 3) {
+          buttons = buttons.slice(0, 3);
+          warnings.push("RICH_BUTTONS_TRUNCATED");
+        }
+        body = {
+          ...base, type: "interactive",
+          interactive: {
+            type: "button",
+            body: { text: rich.text },
+            action: {
+              buttons: buttons.map((b) => ({
+                type: "reply",
+                reply: { id: b.payload!, title: truncate(b.title, 20) },
+              })),
+            },
+          },
+        };
+      } else if (rich.buttons.length === 1) {
+        // Single CTA-URL button message.
+        const button = rich.buttons[0]!;
+        body = {
+          ...base, type: "interactive",
+          interactive: {
+            type: "cta_url",
+            body: { text: rich.text },
+            action: {
+              name: "cta_url",
+              parameters: { display_text: truncate(button.title, 20), url: button.url! },
+            },
+          },
+        };
+      }
+      // Mixed reply+url buttons have no single native shape -> text fallback below.
+    } else if (rich.kind === "list") {
+      let rowsLeft = 10; // WhatsApp caps a list at 10 rows across sections.
+      const sections = rich.sections.map((section) => {
+        const rows = section.rows.slice(0, Math.max(0, rowsLeft));
+        if (rows.length < section.rows.length) warnings.push("RICH_ROWS_TRUNCATED");
+        rowsLeft -= rows.length;
+        return {
+          title: truncate(section.title, 24),
+          rows: rows.map((row) => ({
+            id: row.id,
+            title: truncate(row.title, 24),
+            ...(row.description ? { description: truncate(row.description, 72) } : {}),
+          })),
+        };
+      }).filter((s) => s.rows.length > 0);
+      if (sections.length > 0) {
+        body = {
+          ...base, type: "interactive",
+          interactive: {
+            type: "list",
+            body: { text: rich.text },
+            action: { button: truncate(rich.buttonText, 20), sections },
+          },
+        };
+      }
+    } else if (rich.kind === "product") {
+      body = {
+        ...base, type: "interactive",
+        interactive: {
+          type: "product",
+          ...(rich.text ? { body: { text: rich.text } } : {}),
+          action: { catalog_id: rich.catalogId, product_retailer_id: rich.productId },
+        },
+      };
+    } else if (rich.kind === "catalog" && rich.sections && rich.sections.length > 0) {
+      body = {
+        ...base, type: "interactive",
+        interactive: {
+          type: "product_list",
+          header: { type: "text", text: truncate(rich.sections[0]!.title, 60) },
+          body: { text: rich.text ?? rich.sections[0]!.title },
+          action: {
+            catalog_id: rich.catalogId,
+            sections: rich.sections.map((section) => ({
+              title: truncate(section.title, 24),
+              product_items: section.productIds.map((id) => ({ product_retailer_id: id })),
+            })),
+          },
+        },
+      };
+    }
+
+    if (!body) {
+      warnings.push("RICH_DEGRADED_TO_TEXT");
+      body = { ...base, type: "text", text: { body: richToPlainText(rich) } };
+    }
+    const json = await this.graphPost(input.account, `${phoneNumberId}/messages`, body, "messages");
+    const messages = json.messages as Array<{ id?: string }> | undefined;
+    const externalMessageId = messages?.[0]?.id;
+    if (!externalMessageId) {
+      throw new ProviderApiError("WhatsApp send returned no message id", {
+        provider: "whatsapp", retryable: false,
+      });
+    }
+    return { externalMessageId, status: "sent", ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
   // --- media ---------------------------------------------------------------
@@ -355,8 +481,17 @@ export class WhatsAppAdapter implements ChannelAdapter {
             messageExternalId: String(msg.id ?? ""),
             receivedAt: isoFromEpochSeconds(msg.timestamp),
           };
+          // Click-to-WhatsApp ads attach a referral object to the FIRST
+          // message of the conversation - the growth-attribution signal.
+          const referral = msg.referral
+            ? {
+                source: typeof msg.referral.source_type === "string" ? msg.referral.source_type : undefined,
+                ctwaClid: typeof msg.referral.ctwa_clid === "string" ? msg.referral.ctwa_clid : undefined,
+                sourceId: msg.referral.source_id !== undefined ? String(msg.referral.source_id) : undefined,
+              }
+            : undefined;
           if (msg.type === "text") {
-            events.push({ type: "message.received", ...base, text: msg.text?.body });
+            events.push({ type: "message.received", ...base, text: msg.text?.body, ...(referral ? { referral } : {}) });
           } else if (["image", "video", "document", "audio", "sticker"].includes(msg.type)) {
             const m = (msg[msg.type] ?? {}) as Record<string, any>;
             const media: MessageMedia = {
@@ -366,9 +501,9 @@ export class WhatsAppAdapter implements ChannelAdapter {
               mimeType: m.mime_type,
               filename: m.filename,
             };
-            events.push({ type: "message.received", ...base, media, ...(m.caption ? { text: m.caption } : {}) });
+            events.push({ type: "message.received", ...base, media, ...(m.caption ? { text: m.caption } : {}), ...(referral ? { referral } : {}) });
           } else {
-            events.push({ type: "message.received", ...base });
+            events.push({ type: "message.received", ...base, ...(referral ? { referral } : {}) });
           }
         }
 

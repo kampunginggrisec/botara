@@ -6,6 +6,7 @@ import {
   type CredentialProvider, type FetchLike, type InboundEvent, type MessageAttachment,
   type PublishInput, type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText } from "./rich";
 
 /**
  * Email adapter via Resend (Fase 2 - real).
@@ -186,7 +187,10 @@ export class EmailAdapter implements ChannelAdapter {
         { status: 503 },
       );
     }
-    const text = input.text ?? "";
+    // Email has no interactive surface: rich blocks degrade to their
+    // formatted plain-text rendering with a typed warning.
+    const richWarnings = input.rich ? (["RICH_DEGRADED_TO_TEXT"] as const) : undefined;
+    const text = input.rich ? richToPlainText(input.rich) : (input.text ?? "");
     const subject = input.subject
       ?? (text.split("\n")[0]?.slice(0, 78).trim() || "Botara message");
     const json = await this.resend(
@@ -207,7 +211,7 @@ export class EmailAdapter implements ChannelAdapter {
     if (!id) {
       throw new ProviderApiError("Resend send returned no email id", { provider: "resend", retryable: false });
     }
-    return { externalMessageId: id, status: "sent" };
+    return { externalMessageId: id, status: "sent", ...(richWarnings ? { warnings: [...richWarnings] } : {}) };
   }
 
   async publish(_input: PublishInput): Promise<{ externalPostId: string }> {

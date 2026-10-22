@@ -3,6 +3,7 @@ import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type InboundEvent, type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText } from "./rich";
 
 /**
  * Webchat adapter (Fase 2 - real, self-built).
@@ -78,6 +79,16 @@ export class WebchatAdapter implements ChannelAdapter {
   }
 
   async send(input: SendInput): Promise<SendResult> {
+    // The widget renders plain text: rich blocks degrade to their
+    // formatted text rendering with a typed warning (never silently).
+    if (input.rich) {
+      const { messageId } = await this.store.deliverOutbound({
+        toExternalId: input.toExternalId,
+        text: richToPlainText(input.rich),
+        idempotencyKey: input.idempotencyKey,
+      });
+      return { externalMessageId: messageId, status: "sent", warnings: ["RICH_DEGRADED_TO_TEXT"] };
+    }
     if (input.text === undefined) {
       throw new AppError("VALIDATION", "webchat.send requires text");
     }

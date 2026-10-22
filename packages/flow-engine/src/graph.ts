@@ -52,3 +52,29 @@ export function triggerNodeOf(graph: StoredGraph): Extract<FlowNode, { type: "tr
     (n): n is Extract<FlowNode, { type: "trigger" }> => (n as FlowNode).type === "trigger",
   ) as Extract<FlowNode, { type: "trigger" }> | undefined;
 }
+
+/**
+ * The first send_message node reachable by walking `next` pointers from the
+ * start node (through the trigger and any pass-through nodes), or null.
+ * Comment-to-DM uses this: when a comment trigger has no explicit
+ * privateText, this node's text becomes the private reply and the flow run
+ * resumes at `nextNodeId` so the message is not sent twice.
+ */
+export function firstSendMessageOf(
+  graph: StoredGraph,
+): { nodeId: string; text: string; nextNodeId: string | null } | null {
+  const byId = new Map(graph.nodes.map((n) => [n.id, n as FlowNode]));
+  const visited = new Set<string>();
+  let currentId: string | null = graph.startNodeId;
+  while (currentId && !visited.has(currentId) && visited.size <= graph.nodes.length) {
+    visited.add(currentId);
+    const node = byId.get(currentId);
+    if (!node) return null;
+    if (node.type === "send_message") {
+      return { nodeId: node.id, text: node.text, nextNodeId: node.next };
+    }
+    if (node.type === "condition") return null; // branching: no linear "first" message
+    currentId = (node as { next?: string | null }).next ?? null;
+  }
+  return null;
+}

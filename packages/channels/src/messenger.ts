@@ -5,6 +5,7 @@ import {
   type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
   type SendInput, type SendResult,
 } from "./types";
+import { richToPlainText, type RichBlock, type RichButton, type RichWarning } from "./rich";
 
 /**
  * Messenger adapter (Fase 2 - real). Facebook Page messaging via the Send
@@ -186,6 +187,7 @@ export class MessengerAdapter implements ChannelAdapter {
   // --- sending ---------------------------------------------------------------------
 
   async send(input: SendInput): Promise<SendResult> {
+    if (input.rich) return this.sendRich(input, input.rich);
     let message: Record<string, unknown>;
     if (input.media?.link) {
       message = {
@@ -209,6 +211,117 @@ export class MessengerAdapter implements ChannelAdapter {
       throw new ProviderApiError("Messenger send returned no message id", { provider: "messenger", retryable: false });
     }
     return { externalMessageId: messageId, status: "sent" };
+  }
+
+  /** Map a rich button onto a Messenger template button. */
+  private templateButton(button: RichButton): Record<string, unknown> {
+    return button.type === "url"
+      ? { type: "web_url", title: button.title, url: button.url }
+      : { type: "postback", title: button.title, payload: button.payload };
+  }
+
+  /**
+   * Rich-block renderer (Send API templates). Native: button template
+   * (<= 3 buttons), quick replies on text (for larger reply/postback sets),
+   * and the generic template for carousels. Lists (Meta retired the list
+   * template), product and catalog blocks degrade to formatted text with a
+   * typed warning.
+   */
+  private async sendRich(input: SendInput, rich: RichBlock): Promise<SendResult> {
+    const warnings: RichWarning[] = [];
+    let message: Record<string, unknown> | null = null;
+
+    if (rich.kind === "buttons") {
+      if (rich.buttons.length <= 3) {
+        message = {
+          attachment: {
+            type: "template",
+            payload: {
+              template_type: "button",
+              text: rich.text,
+              buttons: rich.buttons.map((b) => this.templateButton(b)),
+            },
+          },
+        };
+      } else {
+        const tappable = rich.buttons.filter((b) => b.type !== "url");
+        if (tappable.length > 0) {
+          if (tappable.length < rich.buttons.length) warnings.push("RICH_URL_BUTTONS_DROPPED");
+          message = {
+            text: rich.text,
+            quick_replies: tappable.slice(0, 13).map((b) => ({
+              content_type: "text",
+              title: b.title.slice(0, 20),
+              payload: b.payload,
+            })),
+          };
+          if (tappable.length > 13) warnings.push("RICH_BUTTONS_TRUNCATED");
+        } else {
+          warnings.push("RICH_BUTTONS_TRUNCATED");
+          message = {
+            attachment: {
+              type: "template",
+              payload: {
+                template_type: "button",
+                text: rich.text,
+                buttons: rich.buttons.slice(0, 3).map((b) => this.templateButton(b)),
+              },
+            },
+          };
+        }
+      }
+    } else if (rich.kind === "carousel") {
+      message = {
+        attachment: {
+          type: "template",
+          payload: {
+            template_type: "generic",
+            elements: rich.cards.map((card) => ({
+              title: card.title,
+              ...(card.subtitle ? { subtitle: card.subtitle } : {}),
+              ...(card.imageUrl ? { image_url: card.imageUrl } : {}),
+              ...(card.buttons && card.buttons.length > 0
+                ? { buttons: card.buttons.slice(0, 3).map((b) => this.templateButton(b)) }
+                : {}),
+            })),
+          },
+        },
+      };
+    }
+
+    if (!message) {
+      warnings.push("RICH_DEGRADED_TO_TEXT");
+      message = { text: richToPlainText(rich) };
+    }
+    const json = await this.graph(input.account, "POST", "me/messages", {
+      recipient: { id: input.toExternalId },
+      messaging_type: "RESPONSE",
+      message,
+    });
+    const messageId = json.message_id as string | undefined;
+    if (!messageId) {
+      throw new ProviderApiError("Messenger send returned no message id", { provider: "messenger", retryable: false });
+    }
+    return { externalMessageId: messageId, status: "sent", ...(warnings.length > 0 ? { warnings } : {}) };
+  }
+
+  /**
+   * Private reply to a comment: exactly ONE DM per comment, sent through
+   * the Send API with the comment id as the recipient (the comment author
+   * receives it as a private message). Distinct from a public reply - see
+   * moderate "reply".
+   */
+  async privateReplyToComment(
+    account: ChannelAccountRef,
+    commentExternalId: string,
+    text: string,
+  ): Promise<{ externalMessageId: string }> {
+    const json = await this.graph(account, "POST", "me/messages", {
+      recipient: { comment_id: commentExternalId },
+      messaging_type: "RESPONSE",
+      message: { text },
+    });
+    return { externalMessageId: String(json.message_id ?? "") };
   }
 
   // --- handover protocol -----------------------------------------------------------------
@@ -349,6 +462,20 @@ export class MessengerAdapter implements ChannelAdapter {
             title: item.postback.title,
             receivedAt,
           });
+          // m.me links with ?ref= deliver the ref INSIDE the Get Started /
+          // CTA postback - surface it as a referral event for growth
+          // attribution alongside the postback itself.
+          if (item.postback.referral?.ref) {
+            events.push({
+              type: "referral.received",
+              channel: "messenger",
+              accountExternalId,
+              contactExternalId,
+              ref: String(item.postback.referral.ref),
+              source: item.postback.referral.source,
+              receivedAt,
+            });
+          }
         } else if (item.referral) {
           events.push({
             type: "referral.received",
@@ -360,6 +487,26 @@ export class MessengerAdapter implements ChannelAdapter {
             receivedAt,
           });
         }
+      }
+      // Page feed changes: comments on Page posts (comment automation
+      // input). Only NEW comments (verb "add", item "comment") become
+      // comment.received; edits/removals and other feed items are ignored.
+      for (const change of (entry.changes as Array<Record<string, any>> | undefined) ?? []) {
+        const value = (change.value ?? {}) as Record<string, any>;
+        if (change.field !== "feed" || value.item !== "comment" || (value.verb && value.verb !== "add")) continue;
+        if (!value.comment_id) continue;
+        events.push({
+          type: "comment.received",
+          channel: "messenger",
+          accountExternalId,
+          postExternalId: String(value.post_id ?? ""),
+          commentExternalId: String(value.comment_id),
+          text: typeof value.message === "string" ? value.message : undefined,
+          authorExternalId: value.from?.id !== undefined ? String(value.from.id) : undefined,
+          receivedAt: value.created_time
+            ? new Date(Number(value.created_time) * 1000).toISOString()
+            : new Date().toISOString(),
+        });
       }
     }
     return events;
