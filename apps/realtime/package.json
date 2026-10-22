@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
-    "@botara/shared": "workspace:*"
+    "@botara/shared": "workspace:*",
+    "ioredis": "^5.4.0"
   }
 }

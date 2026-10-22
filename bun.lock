@@ -47,6 +47,7 @@
       "version": "0.0.0",
       "dependencies": {
         "@botara/shared": "workspace:*",
+        "ioredis": "^5.4.0",
       },
     },
     "apps/web": {
