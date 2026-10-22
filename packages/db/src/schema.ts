@@ -321,6 +321,26 @@ export const dataDeletionRequests = pgTable("data_deletion_requests", {
   completedAt: timestamp("completed_at", { withTimezone: true }),
 }, (t) => [uniqueIndex("data_deletion_requests_code_idx").on(t.confirmationCode)]);
 
+/**
+ * Automation flows (Fase 4 - the visual builder's persistence). One row per
+ * flow: the flow-level `trigger` ({ type: "keyword"|"postback"|"manual",
+ * config }) is what the inbound dispatcher matches on, and `graph` is the
+ * builder document { startNodeId, nodes, edges } where nodes conform to
+ * the packages/flow-engine node schemas (each node may additionally carry
+ * a builder `position`). The runnable Flow is derived from the graph by
+ * flow-engine's toRunnableFlow - the graph is the single source of truth.
+ */
+export const flows = pgTable("flows", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  name: varchar("name", { length: 200 }).notNull(),
+  trigger: jsonb("trigger").notNull().default({ type: "manual", config: {} }),
+  graph: jsonb("graph").notNull().default({ startNodeId: "", nodes: [], edges: [] }),
+  status: varchar("status", { length: 40 }).notNull().default("draft"), // draft|active
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("flows_ws_status_idx").on(t.workspaceId, t.status)]);
+
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),

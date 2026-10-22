@@ -2,7 +2,7 @@ import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
   auditLog, broadcasts, channelAccounts, contacts, conversations, costLedger,
-  dataDeletionRequests, kbChunks, kbDocuments, messages,
+  dataDeletionRequests, flows, kbChunks, kbDocuments, messages,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
   users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
 } from "./schema";
@@ -519,6 +519,17 @@ export async function listChannelAccountsDueForRefresh(
       ),
     )
     .orderBy(asc(channelAccounts.tokenExpiresAt));
+}
+
+/** All connected accounts of one channel (webhook account resolution). */
+export async function listConnectedAccountsByChannel(
+  db: Database,
+  channel: string,
+): Promise<ChannelAccountRow[]> {
+  return db
+    .select()
+    .from(channelAccounts)
+    .where(and(eq(channelAccounts.channel, channel), eq(channelAccounts.status, "connected")));
 }
 
 // ------------------------------------------- template category (webhook flow)
@@ -1371,6 +1382,252 @@ export async function completeDataDeletionRequest(db: Database, confirmationCode
     .update(dataDeletionRequests)
     .set({ status: "completed", completedAt: new Date() })
     .where(eq(dataDeletionRequests.confirmationCode, confirmationCode));
+}
+
+// ------------------------------------------------------------------- flows
+
+export type FlowRow = typeof flows.$inferSelect;
+
+export interface FlowTrigger {
+  type: "keyword" | "postback" | "manual";
+  config: Record<string, unknown>;
+}
+
+export interface FlowGraph {
+  startNodeId: string;
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<Record<string, unknown>>;
+}
+
+export async function createFlow(
+  db: Database,
+  input: { workspaceId: string; name: string; trigger: FlowTrigger; graph: FlowGraph; status?: string },
+): Promise<FlowRow> {
+  const [row] = await db
+    .insert(flows)
+    .values({
+      workspaceId: input.workspaceId,
+      name: input.name,
+      trigger: input.trigger,
+      graph: input.graph,
+      status: input.status ?? "draft",
+    })
+    .returning();
+  return row!;
+}
+
+export async function listFlows(db: Database, workspaceId: string): Promise<FlowRow[]> {
+  return db
+    .select()
+    .from(flows)
+    .where(eq(flows.workspaceId, workspaceId))
+    .orderBy(desc(flows.updatedAt));
+}
+
+/** Active flows only - the inbound dispatcher's matching set. */
+export async function listActiveFlows(db: Database, workspaceId: string): Promise<FlowRow[]> {
+  return db
+    .select()
+    .from(flows)
+    .where(and(eq(flows.workspaceId, workspaceId), eq(flows.status, "active")))
+    .orderBy(asc(flows.createdAt));
+}
+
+export async function getFlow(db: Database, workspaceId: string, id: string): Promise<FlowRow | null> {
+  const [row] = await db
+    .select()
+    .from(flows)
+    .where(and(eq(flows.id, id), eq(flows.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Worker-side lookup: flow-run jobs carry the flow id + workspace. */
+export async function getFlowById(db: Database, id: string): Promise<FlowRow | null> {
+  const [row] = await db.select().from(flows).where(eq(flows.id, id)).limit(1);
+  return row ?? null;
+}
+
+export async function updateFlow(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: { name?: string; trigger?: FlowTrigger; graph?: FlowGraph; status?: string },
+): Promise<FlowRow | null> {
+  const existing = await getFlow(db, workspaceId, id);
+  if (!existing) return null;
+  const [row] = await db
+    .update(flows)
+    .set({
+      name: patch.name ?? existing.name,
+      trigger: patch.trigger ?? (existing.trigger as FlowTrigger),
+      graph: patch.graph ?? (existing.graph as FlowGraph),
+      status: patch.status ?? existing.status,
+      updatedAt: new Date(),
+    })
+    .where(eq(flows.id, id))
+    .returning();
+  return row ?? null;
+}
+
+export async function deleteFlow(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getFlow(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(flows).where(eq(flows.id, id));
+  return true;
+}
+
+// ------------------------------------------- inbound persistence (Fase 4)
+
+/** The contact's most recent not-resolved conversation on one account. */
+export async function findOpenConversation(
+  db: Database,
+  input: { workspaceId: string; channelAccountId: string; contactId: string },
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .select()
+    .from(conversations)
+    .where(
+      and(
+        eq(conversations.workspaceId, input.workspaceId),
+        eq(conversations.channelAccountId, input.channelAccountId),
+        eq(conversations.contactId, input.contactId),
+      ),
+    )
+    .orderBy(desc(conversations.createdAt))
+    .limit(1);
+  return row && row.status !== "resolved" ? row : null;
+}
+
+/** Webhook redelivery guard: provider message ids are unique per conversation. */
+export async function findMessageByExternalId(
+  db: Database,
+  conversationId: string,
+  externalId: string,
+): Promise<MessageRow | null> {
+  const [row] = await db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.externalId, externalId)))
+    .limit(1);
+  return row ?? null;
+}
+
+// ------------------------------------------------------- sequences (extra)
+
+export async function deleteSequence(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getSequence(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(sequenceEnrollments).where(eq(sequenceEnrollments.sequenceId, id));
+  await db.delete(sequences).where(eq(sequences.id, id));
+  return true;
+}
+
+/** Enrollment counts per sequence (all statuses) for the Sequences page. */
+export async function countEnrollmentsBySequence(
+  db: Database,
+  workspaceId: string,
+): Promise<Map<string, number>> {
+  const rows = await db
+    .select({ sequenceId: sequenceEnrollments.sequenceId })
+    .from(sequenceEnrollments)
+    .where(eq(sequenceEnrollments.workspaceId, workspaceId));
+  const counts = new Map<string, number>();
+  for (const r of rows) counts.set(r.sequenceId, (counts.get(r.sequenceId) ?? 0) + 1);
+  return counts;
+}
+
+// ------------------------------------------------------------ user/profile
+
+export async function updateUserName(db: Database, userId: string, name: string): Promise<void> {
+  await db.update(users).set({ name }).where(eq(users.id, userId));
+}
+
+export async function updateWorkspaceName(db: Database, workspaceId: string, name: string): Promise<void> {
+  await db.update(workspaces).set({ name }).where(eq(workspaces.id, workspaceId));
+}
+
+// ------------------------------------------------------- dashboard stats
+
+export interface WorkspaceStats {
+  contactsTotal: number;
+  conversationsOpen: number;
+  conversationsTotal: number;
+  messagesLast30d: { in: number; out: number };
+  broadcastsThisMonth: { sent: number; failed: number };
+  /** Messaging cost for the current month, summed per currency. */
+  costThisMonth: Array<{ currency: string; amount: number }>;
+  scheduledPostsPending: number;
+  activeFlows: number;
+}
+
+/**
+ * Dashboard aggregations (Fase 4). Plain counts/sums over the workspace's
+ * own rows; messages join through conversations because the messages table
+ * carries no workspace column by design.
+ */
+export async function getWorkspaceStats(
+  db: Database,
+  workspaceId: string,
+  monthStart: Date,
+  thirtyDaysAgo: Date,
+): Promise<WorkspaceStats> {
+  const countOf = async (p: Promise<Array<{ value: number | string }>>): Promise<number> => {
+    const rows = await p;
+    return Number(rows[0]?.value ?? 0);
+  };
+  const cnt = () => sql<number>`count(*)::int`;
+
+  const contactsTotal = await countOf(
+    db.select({ value: cnt() }).from(contacts).where(eq(contacts.workspaceId, workspaceId)),
+  );
+  const conversationsTotal = await countOf(
+    db.select({ value: cnt() }).from(conversations).where(eq(conversations.workspaceId, workspaceId)),
+  );
+  const conversationsOpen = await countOf(
+    db.select({ value: cnt() }).from(conversations)
+      .where(and(eq(conversations.workspaceId, workspaceId), eq(conversations.status, "open"))),
+  );
+  const messageRows = await db
+    .select({ direction: messages.direction, value: cnt() })
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .where(and(eq(conversations.workspaceId, workspaceId), sql`${messages.createdAt} >= ${thirtyDaysAgo}`))
+    .groupBy(messages.direction);
+  const broadcastsRows = await db
+    .select({ sent: broadcasts.sentCount, failed: broadcasts.failedCount })
+    .from(broadcasts)
+    .where(and(eq(broadcasts.workspaceId, workspaceId), sql`${broadcasts.createdAt} >= ${monthStart}`));
+  const costRows = await db
+    .select({ currency: costLedger.currency, total: sql<string>`coalesce(sum(${costLedger.amount}),0)` })
+    .from(costLedger)
+    .where(and(eq(costLedger.workspaceId, workspaceId), sql`${costLedger.createdAt} >= ${monthStart}`))
+    .groupBy(costLedger.currency);
+  const scheduledPostsPending = await countOf(
+    db.select({ value: cnt() }).from(scheduledPosts)
+      .where(and(
+        eq(scheduledPosts.workspaceId, workspaceId),
+        sql`${scheduledPosts.status} in ('draft','scheduled','publishing')`,
+      )),
+  );
+  const activeFlows = await countOf(
+    db.select({ value: cnt() }).from(flows)
+      .where(and(eq(flows.workspaceId, workspaceId), eq(flows.status, "active"))),
+  );
+  const byDirection = new Map(messageRows.map((r) => [r.direction, Number(r.value)]));
+  return {
+    contactsTotal,
+    conversationsOpen,
+    conversationsTotal,
+    messagesLast30d: { in: byDirection.get("in") ?? 0, out: byDirection.get("out") ?? 0 },
+    broadcastsThisMonth: {
+      sent: broadcastsRows.reduce((s, r) => s + r.sent, 0),
+      failed: broadcastsRows.reduce((s, r) => s + r.failed, 0),
+    },
+    costThisMonth: costRows.map((r) => ({ currency: r.currency, amount: Number(r.total) })),
+    scheduledPostsPending,
+    activeFlows,
+  };
 }
 
 /**
