@@ -5,7 +5,7 @@ import {
 } from "./token-refresh";
 import {
   processPublish, processPublishScan,
-  type PublishPorts, type ScheduledPostSnapshot,
+  type PublishPorts, type PublishTargetResult, type ScheduledPostSnapshot,
 } from "./publish";
 import {
   processSequenceAdvance, type DueEnrollment, type SequencePorts,
@@ -89,7 +89,7 @@ function fakePublishPorts(overrides: Partial<PublishPorts> = {}) {
     status: "publishing",
     results: {},
   };
-  const recorded: Array<{ id: string; results: Record<string, { status: string }> }> = [];
+  const recorded: Array<{ id: string; results: Record<string, PublishTargetResult> }> = [];
   const statuses: Array<{ id: string; status: string }> = [];
   const enqueuedPosts: string[] = [];
   const ports: PublishPorts = {
