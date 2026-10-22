@@ -62,6 +62,9 @@ import {
 } from "./whatsapp-onboarding";
 import { createDbWebchatStore } from "./webchat-store";
 import {
+  createRedisRealtimePublisher, type RealtimePublisher,
+} from "./realtime-publish";
+import {
   contactsToCsv, contactsToJson, dedupeImportRows, parseImport,
 } from "./contacts-io";
 import { buildGrowthTarget, generateGrowthSlug, growthShortUrl } from "./growth";
@@ -183,6 +186,8 @@ export interface ApiDeps {
   flowDispatcher: InboundFlowDispatcher;
   /** Fase 4: token vault for channel connect flows (telegram/OAuth). Store-only. */
   vault: TokenVaultPort;
+  /** Inbox live updates: fire-and-forget publisher onto the realtime bus. */
+  realtimePublisher: RealtimePublisher;
   /** Fase 4: fetch used for provider OAuth/token calls (fakeable in tests). */
   providerFetch: FetchLike;
   env: Record<string, string | undefined>;
@@ -429,6 +434,7 @@ export function createDbTemplateCategoryUpdater(getDatabase: () => Database): Te
 export function defaultDeps(): ApiDeps {
   const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
   const vault = createDefaultVault();
+  const realtimePublisher = createRedisRealtimePublisher(redisUrl);
   return {
     getDatabase: defaultGetDatabase,
     eventSink: logEventSink,
@@ -445,8 +451,10 @@ export function defaultDeps(): ApiDeps {
       getDatabase: defaultGetDatabase,
       flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
       commentEnqueuer: createBullMqCommentActionEnqueuer(redisUrl),
+      publisher: realtimePublisher,
     }),
     vault,
+    realtimePublisher,
     providerFetch: (url, init) => fetch(url, init as RequestInit),
     readiness: createReadinessChecker(defaultGetDatabase, redisUrl),
     whatsappOnboarding: (workspaceId, input) =>
@@ -2116,6 +2124,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         idempotencyKey,
       });
       await updateMessageStatus(db, message.id, "sent", result.externalMessageId);
+      // Live inbox: dashboards on this workspace refetch the thread.
+      await deps.realtimePublisher.publishInboxMessage({
+        workspaceId: ws, conversationId: id, direction: "out", messageId: message.id,
+      }).catch(() => undefined);
       return c.json({
         message: { ...message, status: "sent", externalId: result.externalMessageId, createdAt: iso(message.createdAt) },
         window: decision,
@@ -3159,6 +3171,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     });
     await touchConversationLastUserMessage(db, session.conversationId, now);
     await touchWebchatSession(db, session.id, now);
+    // Visitor messages bypass the webhook dispatcher (the widget posts
+    // here directly), so this route is their one publish point.
+    await deps.realtimePublisher.publishInboxMessage({
+      workspaceId: session.workspaceId, conversationId: session.conversationId,
+      direction: "in", messageId: message.id,
+    }).catch(() => undefined);
     return c.json({ message: { ...message, createdAt: iso(message.createdAt) } }, 201);
   });
 

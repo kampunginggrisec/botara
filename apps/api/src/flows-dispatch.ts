@@ -9,6 +9,7 @@ import {
   commentTriggerConfig, flowTriggerMatches, type FlowTrigger,
 } from "@botara/flow-engine";
 import type { InboundEvent } from "@botara/channels";
+import type { RealtimePublisher } from "./realtime-publish";
 
 /**
  * Inbound flow dispatcher (Fase 4, extended by the adopted-features
@@ -112,7 +113,7 @@ export interface DispatchStore {
   findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string } | null>;
   createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string }>;
   findMessageByExternalId(conversationId: string, externalId: string): Promise<{ id: string } | null>;
-  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string }): Promise<void>;
+  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string }): Promise<{ id: string }>;
   touchConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
   listActiveFlows(workspaceId: string): Promise<Array<{ id: string; trigger: FlowTrigger }>>;
   findGrowthLinkBySlug(slug: string): Promise<DispatchGrowthLink | null>;
@@ -159,7 +160,8 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
       return row ? { id: row.id } : null;
     },
     async createMessage(input) {
-      await createMessage(getDatabase(), input);
+      const row = await createMessage(getDatabase(), input);
+      return { id: row.id };
     },
     async touchConversationLastUserMessage(conversationId, at) {
       await touchConversationLastUserMessage(getDatabase(), conversationId, at);
@@ -198,7 +200,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   readonly accounts: DispatchAccount[] = [];
   readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string }>();
   readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string }>();
-  readonly messages: Array<{ conversationId: string; externalId?: string; body?: string; direction: string; type: string }> = [];
+  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
   readonly conversions = new Map<string, number>();
@@ -244,7 +246,9 @@ export class InMemoryDispatchStore implements DispatchStore {
   }
 
   async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string }) {
-    this.messages.push(input);
+    const id = crypto.randomUUID();
+    this.messages.push({ id, ...input });
+    return { id };
   }
 
   async touchConversationLastUserMessage() {}
@@ -288,6 +292,8 @@ export interface FlowDispatcherDeps {
   store: DispatchStore;
   flowEnqueuer: FlowRunEnqueuer;
   commentEnqueuer?: CommentActionEnqueuer;
+  /** Inbox live updates: notified once per newly persisted inbound message. */
+  publisher?: RealtimePublisher;
 }
 
 export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispatcher {
@@ -385,7 +391,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     if (event.type === "message.received") {
       const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
       if (!existing) {
-        await deps.store.createMessage({
+        const created = await deps.store.createMessage({
           conversationId: conversation.id,
           direction: "in",
           type: event.media ? "media" : "text",
@@ -394,6 +400,16 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           status: "delivered",
         });
         await deps.store.touchConversationLastUserMessage(conversation.id, new Date(event.receivedAt));
+        // Live inbox: exactly one event per NEWLY persisted message -
+        // webhook redeliveries (the `existing` branch) publish nothing.
+        if (deps.publisher) {
+          await deps.publisher.publishInboxMessage({
+            workspaceId,
+            conversationId: conversation.id,
+            direction: "in",
+            messageId: created.id,
+          }).catch(() => undefined);
+        }
       }
     }
 
@@ -512,6 +528,7 @@ export interface DbFlowDispatcherDeps {
   getDatabase: () => Database;
   flowEnqueuer: FlowRunEnqueuer;
   commentEnqueuer?: CommentActionEnqueuer;
+  publisher?: RealtimePublisher;
 }
 
 export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowDispatcher {
@@ -519,6 +536,7 @@ export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowD
     store: createDbDispatchStore(deps.getDatabase),
     flowEnqueuer: deps.flowEnqueuer,
     commentEnqueuer: deps.commentEnqueuer,
+    publisher: deps.publisher,
   });
 }
 

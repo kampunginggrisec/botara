@@ -34,6 +34,7 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
     kbEnqueuer: { async enqueueKbIngest() {} },
     flowEnqueuer: { async enqueueFlowRun() {} },
     flowDispatcher: { async dispatch() {} },
+    realtimePublisher: { async publishInboxMessage() {} },
     vault: new InMemoryVault(),
     providerFetch: async () => new Response(JSON.stringify({}), { status: 200 }),
     readiness: {
