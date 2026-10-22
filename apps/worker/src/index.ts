@@ -1,15 +1,32 @@
 import { Queue, Worker, type Job } from "bullmq";
 import IORedis from "ioredis";
+import {
+  getDb, getBroadcastById, getChannelAccount, getTemplate, listContacts,
+  insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
+} from "@botara/db";
+import { getAdapter, type ChannelKey } from "@botara/channels";
+import {
+  processBroadcast, processFlowRun, processSendMessage,
+  type BroadcastSnapshot, type FlowRunJobData, type SendMessageJobData, type WorkerPorts,
+} from "./processors";
 
 /**
- * Botara worker - Fase 0 entrypoint.
- * Registers the platform queues and starts placeholder processors.
- * Redis connection failures are LOGGED (never silently swallowed); BullMQ /
- * ioredis keep retrying in the background, and SIGTERM shuts down gracefully.
+ * Botara worker - Fase 1 entrypoint.
+ * Queues: the Fase 0 set plus "send-message" and "flow-run", which (like
+ * "broadcast") have REAL processors in ./processors.ts. Processors are pure
+ * orchestration over ports; this file builds the production ports from
+ * Drizzle repositories + the channel registry + the BullMQ queues.
+ * When DATABASE_URL is not configured, the real processors log a clear
+ * configuration error and skip - they never fake success.
+ * Redis connection failures are LOGGED; SIGTERM shuts down gracefully.
  */
 
-export const QUEUE_NAMES = ["broadcast", "sequence", "publish", "token-refresh", "email"] as const;
+export const QUEUE_NAMES = [
+  "broadcast", "sequence", "publish", "token-refresh", "email", "send-message", "flow-run",
+] as const;
 export type QueueName = (typeof QUEUE_NAMES)[number];
+
+const REAL_QUEUES = new Set<string>(["broadcast", "send-message", "flow-run"]);
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
 
@@ -26,15 +43,98 @@ connection.on("error", (err) => {
 });
 connection.on("connect", () => console.log(`[worker] connected to redis at ${redisUrl}`));
 
+const queueByName = new Map<string, Queue>();
+
+/** BullMQ job ids cannot contain ":", so the canonical key is sanitized for jobId use only. */
+const jobIdFor = (idempotencyKey: string) => idempotencyKey.replace(/:/g, "_");
+
+function buildProdPorts(): WorkerPorts | null {
+  const databaseUrl = process.env.DATABASE_URL;
+  if (!databaseUrl) return null;
+  const db = getDb(databaseUrl);
+  return {
+    async send(channel, input) {
+      return getAdapter(channel as ChannelKey).send(input);
+    },
+    async writeCost(entry) {
+      await insertCostLedger(db, entry);
+    },
+    async updateMessageStatus(messageId, status, externalId) {
+      await updateMessageStatus(db, messageId, status, externalId);
+    },
+    async incrementBroadcastCounts(broadcastId, delta) {
+      await incrementBroadcastCounts(db, broadcastId, delta);
+    },
+    async loadBroadcast(broadcastId): Promise<BroadcastSnapshot | null> {
+      const row = await getBroadcastById(db, broadcastId);
+      if (!row) return null;
+      const account = await getChannelAccount(db, row.workspaceId, row.channelAccountId);
+      if (!account) return null;
+      const template = row.templateId ? await getTemplate(db, row.workspaceId, row.templateId) : null;
+      return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        channelAccountId: row.channelAccountId,
+        channel: account.channel,
+        accountExternalId: account.externalId,
+        tokenVaultRef: account.tokenVaultRef ?? undefined,
+        template: template
+          ? { name: template.name, language: template.language, latestCategory: template.latestCategory ?? template.category ?? "utility" }
+          : undefined,
+        tag: row.tag ?? undefined,
+        country: row.country ?? undefined,
+      };
+    },
+    async listBroadcastTargets(broadcast) {
+      // Tag-targeted broadcasts fan out to the segment's contacts. A
+      // recipientCount-only broadcast has no contact list to fan out to.
+      if (!broadcast.tag) return [];
+      const rows = await listContacts(db, broadcast.workspaceId, { tag: broadcast.tag });
+      return rows.map((r) => ({ contactId: r.id, externalId: r.externalId }));
+    },
+    async enqueueSendMessage(data: SendMessageJobData) {
+      const queue = queueByName.get("send-message");
+      if (!queue) throw new Error("send-message queue is not registered");
+      await queue.add("send-message", data, { jobId: jobIdFor(data.idempotencyKey) });
+    },
+    async setContactField(workspaceId, contactId, field, value) {
+      await updateContact(db, workspaceId, contactId, { customFields: { [field]: value } });
+    },
+    async httpFetch(url, method) {
+      const res = await fetch(url, { method });
+      if (!res.ok) throw new Error(`flow webhook ${method} ${url} -> HTTP ${res.status}`);
+    },
+    async scheduleFlowResume(job: FlowRunJobData, delaySeconds) {
+      const queue = queueByName.get("flow-run");
+      if (!queue) throw new Error("flow-run queue is not registered");
+      await queue.add("flow-run", job, { delay: delaySeconds * 1000 });
+    },
+  };
+}
+
 const queues: Queue[] = [];
 const workers: Worker[] = [];
 
 for (const name of QUEUE_NAMES) {
-  queues.push(new Queue(name, { connection }));
+  const queue = new Queue(name, { connection });
+  queueByName.set(name, queue);
+  queues.push(queue);
   const worker = new Worker(
     name,
     async (job: Job) => {
-      // Fase 0 placeholder processor: real handlers land per-queue in Fase 1+.
+      if (REAL_QUEUES.has(name)) {
+        const ports = buildProdPorts();
+        if (!ports) {
+          console.error(
+            `[worker] ${name}: DATABASE_URL is not configured - cannot run real processors (job ${job.id} skipped, not faked)`,
+          );
+          return { configured: false };
+        }
+        if (name === "send-message") return processSendMessage(ports, job.data as SendMessageJobData);
+        if (name === "broadcast") return processBroadcast(ports, job.data as { broadcastId: string });
+        return processFlowRun(ports, job.data as FlowRunJobData);
+      }
+      // Remaining queues keep the Fase 0 placeholder behaviour until their phase.
       console.log(`[worker] ${name}: received job ${job.id} (${job.name}) - no handler yet (Fase 0)`);
       return { stub: true };
     },

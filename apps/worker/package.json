@@ -13,6 +13,10 @@
     "bullmq": "^5.34.0",
     "ioredis": "^5.4.0",
     "@botara/config": "workspace:*",
-    "@botara/shared": "workspace:*"
+    "@botara/shared": "workspace:*",
+    "@botara/db": "workspace:*",
+    "@botara/channels": "workspace:*",
+    "@botara/billing": "workspace:*",
+    "@botara/flow-engine": "workspace:*"
   }
 }
