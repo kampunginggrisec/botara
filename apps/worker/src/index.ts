@@ -11,7 +11,7 @@ import {
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
   type Database,
 } from "@botara/db";
-import { getAdapter, EmailAdapter, type ChannelKey } from "@botara/channels";
+import { getAdapter, EmailAdapter, InstagramAdapter, type ChannelKey } from "@botara/channels";
 import { putObject } from "@botara/media";
 import {
   processBroadcast, processFlowRun, processSendMessage,
@@ -225,6 +225,35 @@ function buildPublishPorts(db: Database): PublishPorts {
       const adapter = getAdapter(channel as ChannelKey);
       if (!adapter.publish) throw new Error(`${channel} adapter has no publish surface`);
       return adapter.publish(input);
+    },
+    // Fase 3: granular Instagram container steps so VIDEO publishes poll
+    // container status here (bounded) before media_publish.
+    instagramContainers: {
+      async createContainer(channel, input) {
+        const adapter = getAdapter(channel as ChannelKey);
+        if (!(adapter instanceof InstagramAdapter)) {
+          throw new Error(`${channel} adapter has no media-container surface`);
+        }
+        return adapter.createMediaContainer(input);
+      },
+      async containerStatus(channel, account, containerId) {
+        const adapter = getAdapter(channel as ChannelKey);
+        if (!(adapter instanceof InstagramAdapter)) {
+          throw new Error(`${channel} adapter has no media-container surface`);
+        }
+        return adapter.getMediaContainerStatus(account, containerId);
+      },
+      async publishContainer(channel, account, containerId) {
+        const adapter = getAdapter(channel as ChannelKey);
+        if (!(adapter instanceof InstagramAdapter)) {
+          throw new Error(`${channel} adapter has no media-container surface`);
+        }
+        return adapter.publishMediaContainer(account, containerId);
+      },
+      async delay(ms) {
+        await new Promise((resolve) => setTimeout(resolve, ms));
+      },
+      poll: { attempts: 10, delayMs: 3000 },
     },
     async recordResults(postId, results) {
       await updateScheduledPost(db, postId, { results });

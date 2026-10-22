@@ -32,6 +32,24 @@ export interface ScheduledPostSnapshot {
   results: Record<string, PublishTargetResult>;
 }
 
+/**
+ * Granular Instagram container steps (Fase 3). Instagram video/reels are a
+ * two-phase publish: create a media container, WAIT until Meta finishes
+ * processing it (status FINISHED), only then media_publish. The adapter
+ * also performs this wait inside publish() with fixed defaults; the worker
+ * uses these ports when wired so the poll is bounded and observable here,
+ * with an injectable delay (tests never sleep).
+ */
+export interface InstagramContainerPorts {
+  createContainer(channel: string, input: PublishInput): Promise<{ containerId: string }>;
+  containerStatus(channel: string, account: PublishInput["account"], containerId: string): Promise<string>;
+  publishContainer(channel: string, account: PublishInput["account"], containerId: string): Promise<{ externalPostId: string }>;
+  /** Injectable wait between polls; production = setTimeout. */
+  delay(ms: number): Promise<void>;
+  /** Bounded polling budget. */
+  poll: { attempts: number; delayMs: number };
+}
+
 export interface PublishPorts {
   loadPost(postId: string): Promise<ScheduledPostSnapshot | null>;
   publish(channel: string, input: PublishInput): Promise<{ externalPostId: string }>;
@@ -39,6 +57,42 @@ export interface PublishPorts {
   updatePostStatus(postId: string, status: string): Promise<void>;
   listDuePosts(now: Date): Promise<Array<{ id: string }>>;
   enqueuePublish(postId: string): Promise<void>;
+  /** Optional Fase 3 container path for Instagram video targets. */
+  instagramContainers?: InstagramContainerPorts;
+}
+
+const VIDEO_URL = /\.(mp4|mov|m4v|webm)(\?|#|$)/i;
+
+/** True when any attached media looks like a video file. */
+export function postHasVideo(post: ScheduledPostSnapshot): boolean {
+  return post.mediaUrls.some((u) => VIDEO_URL.test(u));
+}
+
+/**
+ * Instagram video flow: create container -> poll status (bounded) ->
+ * publish. Images never take this path (single-step publish is correct
+ * for them and stays on ports.publish).
+ */
+export async function publishInstagramVideo(
+  containers: InstagramContainerPorts,
+  channel: string,
+  input: PublishInput,
+): Promise<{ externalPostId: string }> {
+  const { containerId } = await containers.createContainer(channel, input);
+  const { attempts, delayMs } = containers.poll;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    const status = await containers.containerStatus(channel, input.account, containerId);
+    if (status === "FINISHED") {
+      return containers.publishContainer(channel, input.account, containerId);
+    }
+    if (status === "ERROR" || status === "EXPIRED") {
+      throw new Error(`Instagram media container ${containerId} ended in status ${status}`);
+    }
+    if (attempt < attempts) await containers.delay(delayMs);
+  }
+  throw new Error(
+    `Instagram media container ${containerId} not FINISHED after ${attempts} polls`,
+  );
 }
 
 export async function processPublishScan(
@@ -73,7 +127,7 @@ export async function processPublish(
   for (const target of post.targets) {
     if (results[target.channelAccountId]?.status === "sent") continue; // idempotent re-run
     try {
-      const result = await ports.publish(target.channel, {
+      const publishInput: PublishInput = {
         account: {
           id: target.channelAccountId,
           externalId: target.accountExternalId,
@@ -83,7 +137,15 @@ export async function processPublish(
         text: post.text,
         mediaUrls: post.mediaUrls,
         idempotencyKey: `post:${post.id}:${target.channelAccountId}`,
-      });
+      };
+      // Instagram VIDEO goes through the container flow (create -> poll
+      // FINISHED -> publish) when the granular ports are wired; everything
+      // else - including Instagram images - uses the one-shot publish.
+      const result = ports.instagramContainers
+        && target.channel === "instagram"
+        && postHasVideo(post)
+        ? await publishInstagramVideo(ports.instagramContainers, target.channel, publishInput)
+        : await ports.publish(target.channel, publishInput);
       results[target.channelAccountId] = { status: "sent", externalPostId: result.externalPostId };
     } catch (err) {
       results[target.channelAccountId] = {
