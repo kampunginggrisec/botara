@@ -1,8 +1,9 @@
 import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
-  auditLog, broadcasts, channelAccounts, contacts, conversations, costLedger,
-  dataDeletionRequests, flows, kbChunks, kbDocuments, messages,
+  apiTokens, auditLog, broadcasts, channelAccounts, contacts, conversations, costLedger,
+  dataDeletionRequests, flows, growthLinks, kbChunks, kbDocuments, messages,
+  processedComments,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
   users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
 } from "./schema";
@@ -1389,7 +1390,7 @@ export async function completeDataDeletionRequest(db: Database, confirmationCode
 export type FlowRow = typeof flows.$inferSelect;
 
 export interface FlowTrigger {
-  type: "keyword" | "postback" | "manual";
+  type: "keyword" | "postback" | "manual" | "comment_keyword";
   config: Record<string, unknown>;
 }
 
@@ -1628,6 +1629,224 @@ export async function getWorkspaceStats(
     scheduledPostsPending,
     activeFlows,
   };
+}
+
+// ------------------------------------------------- API tokens (adopted features)
+
+export type ApiTokenRow = typeof apiTokens.$inferSelect;
+
+export async function createApiToken(
+  db: Database,
+  input: { userId: string; name: string; tokenHash: string; prefix: string },
+): Promise<ApiTokenRow> {
+  const [row] = await db
+    .insert(apiTokens)
+    .values({ userId: input.userId, name: input.name, tokenHash: input.tokenHash, prefix: input.prefix })
+    .returning();
+  return row!;
+}
+
+export async function listApiTokensByUser(db: Database, userId: string): Promise<ApiTokenRow[]> {
+  return db
+    .select()
+    .from(apiTokens)
+    .where(eq(apiTokens.userId, userId))
+    .orderBy(desc(apiTokens.createdAt));
+}
+
+/** Auth lookup: the caller hashes the presented token; revoked rows never match. */
+export async function findApiTokenByHash(db: Database, tokenHash: string): Promise<ApiTokenRow | null> {
+  const [row] = await db
+    .select()
+    .from(apiTokens)
+    .where(and(eq(apiTokens.tokenHash, tokenHash), sql`${apiTokens.revokedAt} is null`))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function touchApiToken(db: Database, id: string, at: Date): Promise<void> {
+  await db.update(apiTokens).set({ lastUsedAt: at }).where(eq(apiTokens.id, id));
+}
+
+/** Revoke (soft delete): the row stays for audit, the hash stops authenticating. */
+export async function revokeApiToken(db: Database, userId: string, id: string): Promise<boolean> {
+  const rows = await db
+    .update(apiTokens)
+    .set({ revokedAt: new Date() })
+    .where(and(eq(apiTokens.id, id), eq(apiTokens.userId, userId), sql`${apiTokens.revokedAt} is null`))
+    .returning();
+  return rows.length > 0;
+}
+
+// ------------------------------------------- processed comments (adopted features)
+
+/** True when a comment-action for (account, comment, flow) was already claimed. */
+export async function isCommentProcessed(
+  db: Database,
+  input: { channelAccountId: string; commentExternalId: string; flowId: string },
+): Promise<boolean> {
+  const [row] = await db
+    .select({ id: processedComments.id })
+    .from(processedComments)
+    .where(
+      and(
+        eq(processedComments.channelAccountId, input.channelAccountId),
+        eq(processedComments.commentExternalId, input.commentExternalId),
+        eq(processedComments.flowId, input.flowId),
+      ),
+    )
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * Claim a comment for a flow. Returns false when the unique index says it
+ * was already claimed (webhook redelivery / queue retry) - the caller must
+ * then skip the whole action set.
+ */
+export async function markCommentProcessed(
+  db: Database,
+  input: { workspaceId: string; channelAccountId: string; commentExternalId: string; flowId: string },
+): Promise<boolean> {
+  const inserted = await db
+    .insert(processedComments)
+    .values(input)
+    .onConflictDoNothing()
+    .returning();
+  return inserted.length > 0;
+}
+
+// ------------------------------------------------ growth links (adopted features)
+
+export type GrowthLinkRow = typeof growthLinks.$inferSelect;
+
+export async function createGrowthLink(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channelAccountId: string;
+    kind: string;
+    slug: string;
+    label: string;
+    prefilledText?: string;
+    boundFlowId?: string;
+    targetRef?: string;
+    targetUrl?: string;
+  },
+): Promise<GrowthLinkRow> {
+  const [row] = await db
+    .insert(growthLinks)
+    .values({
+      workspaceId: input.workspaceId,
+      channelAccountId: input.channelAccountId,
+      kind: input.kind,
+      slug: input.slug,
+      label: input.label,
+      prefilledText: input.prefilledText,
+      boundFlowId: input.boundFlowId,
+      targetRef: input.targetRef,
+      targetUrl: input.targetUrl,
+    })
+    .returning();
+  return row!;
+}
+
+export async function listGrowthLinks(db: Database, workspaceId: string): Promise<GrowthLinkRow[]> {
+  return db
+    .select()
+    .from(growthLinks)
+    .where(eq(growthLinks.workspaceId, workspaceId))
+    .orderBy(desc(growthLinks.createdAt));
+}
+
+export async function getGrowthLink(db: Database, workspaceId: string, id: string): Promise<GrowthLinkRow | null> {
+  const [row] = await db
+    .select()
+    .from(growthLinks)
+    .where(and(eq(growthLinks.id, id), eq(growthLinks.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Slugs are globally unique - the public redirect resolves by slug alone. */
+export async function getGrowthLinkBySlug(db: Database, slug: string): Promise<GrowthLinkRow | null> {
+  const [row] = await db
+    .select()
+    .from(growthLinks)
+    .where(eq(growthLinks.slug, slug))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function deleteGrowthLink(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getGrowthLink(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(growthLinks).where(eq(growthLinks.id, id));
+  return true;
+}
+
+export async function incrementGrowthLinkClicks(db: Database, id: string): Promise<void> {
+  await db
+    .update(growthLinks)
+    .set({ clicks: sql`${growthLinks.clicks} + 1`, updatedAt: new Date() })
+    .where(eq(growthLinks.id, id));
+}
+
+export async function incrementGrowthLinkConversions(db: Database, id: string): Promise<void> {
+  await db
+    .update(growthLinks)
+    .set({ conversions: sql`${growthLinks.conversions} + 1`, updatedAt: new Date() })
+    .where(eq(growthLinks.id, id));
+}
+
+// --------------------------------------------- contact import + tagging helpers
+
+/**
+ * Insert-or-update one contact by its (workspace, channel, externalId)
+ * identity - the bulk-import workhorse. "skip" leaves an existing row
+ * untouched; "update" overwrites the display name when provided, UNIONS
+ * the tags, and merges custom fields.
+ */
+export async function upsertContactByExternal(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channel: string;
+    externalId: string;
+    displayName?: string;
+    tags?: string[];
+    customFields?: Record<string, unknown>;
+  },
+  conflict: "skip" | "update",
+): Promise<{ row: ContactRow; created: boolean }> {
+  const existing = await getContactByExternal(db, input.workspaceId, input.channel, input.externalId);
+  if (!existing) {
+    const row = await createContact(db, input);
+    return { row, created: true };
+  }
+  if (conflict === "skip") return { row: existing, created: false };
+  const mergedTags = [...new Set([...((existing.tags as string[]) ?? []), ...(input.tags ?? [])])];
+  const updated = await updateContact(db, input.workspaceId, existing.id, {
+    displayName: input.displayName ?? undefined,
+    tags: mergedTags,
+    customFields: input.customFields,
+  });
+  return { row: updated ?? existing, created: false };
+}
+
+/** Add one tag to a contact if absent (growth attribution writes `growth:<slug>`). */
+export async function addContactTag(
+  db: Database,
+  workspaceId: string,
+  contactId: string,
+  tag: string,
+): Promise<boolean> {
+  const contact = await getContact(db, workspaceId, contactId);
+  if (!contact) return false;
+  const tags = (contact.tags as string[]) ?? [];
+  if (tags.includes(tag)) return false;
+  await updateContact(db, workspaceId, contactId, { tags: [...tags, tag] });
+  return true;
 }
 
 /**

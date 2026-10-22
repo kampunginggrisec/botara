@@ -341,6 +341,74 @@ export const flows = pgTable("flows", {
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("flows_ws_status_idx").on(t.workspaceId, t.status)]);
 
+/**
+ * Personal API tokens (adopted-features package). A token is shown ONCE at
+ * creation; only its SHA-256 hash is stored. `prefix` is the non-secret
+ * display fragment (e.g. "bta_AbCd1234") shown in Settings so users can
+ * tell tokens apart. Tokens authenticate as their user (Bearer bta_...)
+ * and power the MCP server + third-party API access.
+ */
+export const apiTokens = pgTable("api_tokens", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  userId: uuid("user_id").notNull().references(() => users.id),
+  name: varchar("name", { length: 120 }).notNull(),
+  tokenHash: varchar("token_hash", { length: 64 }).notNull(),
+  prefix: varchar("prefix", { length: 20 }).notNull(),
+  lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("api_tokens_hash_idx").on(t.tokenHash),
+  index("api_tokens_user_idx").on(t.userId),
+]);
+
+/**
+ * Comment-automation idempotency (adopted-features package). One row per
+ * (channel account, comment, flow) that a comment-action job has claimed -
+ * webhook redeliveries and queue retries can never double-reply, double-
+ * hide, or burn the one private reply a comment is allowed.
+ */
+export const processedComments = pgTable("processed_comments", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  commentExternalId: varchar("comment_external_id", { length: 200 }).notNull(),
+  flowId: uuid("flow_id").notNull().references(() => flows.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("processed_comments_account_comment_flow_idx").on(t.channelAccountId, t.commentExternalId, t.flowId),
+]);
+
+/**
+ * Growth links (adopted-features package). A short tracked link per
+ * channel account: /r/:slug counts the click, then 302s to the channel
+ * target (wa.me / m.me / t.me / ig.me / webchat page). Referral capture on
+ * inbound events increments conversions once per contact and can run a
+ * bound flow instead of keyword matching. `kind` mirrors the account's
+ * channel at creation time. targetRef carries the channel-specific target
+ * the account row cannot supply (WhatsApp phone number, Telegram/IG
+ * username override); targetUrl is the full destination for webchat.
+ */
+export const growthLinks = pgTable("growth_links", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  kind: varchar("kind", { length: 40 }).notNull(), // whatsapp|instagram|messenger|telegram|webchat|...
+  slug: varchar("slug", { length: 32 }).notNull(),
+  label: varchar("label", { length: 200 }).notNull(),
+  prefilledText: text("prefilled_text"),
+  boundFlowId: uuid("bound_flow_id").references(() => flows.id),
+  targetRef: varchar("target_ref", { length: 200 }),
+  targetUrl: text("target_url"),
+  clicks: integer("clicks").notNull().default(0),
+  conversions: integer("conversions").notNull().default(0),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("growth_links_slug_idx").on(t.slug),
+  index("growth_links_ws_idx").on(t.workspaceId),
+]);
+
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
