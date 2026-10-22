@@ -11,7 +11,7 @@ import {
   touchConversationLastUserMessage,
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
-  getChannelAccount, getTemplate, listChannelAccounts, createChannelAccount,
+  getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
   applyTemplateCategoryChange,
   findOrCreateWebchatAccount, createConversation as createConversationRow,
   createWebchatSession, getWebchatSessionByToken, touchWebchatSession,
@@ -27,23 +27,26 @@ import {
   createFlow, listFlows, getFlow, updateFlow, deleteFlow,
   deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
   updateChannelAccountToken,
+  createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
+  getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
+  type GrowthLinkRow,
 } from "@botara/db";
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
   WebchatAdapter, CHANNEL_CAPABILITIES,
   TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter,
   StaticCredentialProvider, buildInstagramAuthorizeUrl, buildThreadsAuthorizeUrl,
-  buildMessengerAuthorizeUrl,
+  buildMessengerAuthorizeUrl, richBlockSchema, richBlockText, richToPlainText,
   type ChannelKey, type InboundEvent, type FetchLike, type InstagramAuthMode,
 } from "@botara/channels";
 import { runFlow, storedGraphSchema, toRunnableFlow, type FlowAction } from "@botara/flow-engine";
 import {
   createDbFlowDispatcher, noopFlowDispatcher,
-  type FlowRunEnqueuer, type InboundFlowDispatcher,
+  type CommentActionEnqueuer, type FlowRunEnqueuer, type InboundFlowDispatcher,
 } from "./flows-dispatch";
 import {
-  ADMIN_ROLES, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
+  ADMIN_ROLES, API_TOKEN_PREFIX, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
   DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
   verifySessionToken,
   type AuthContext, type AuthStore, type AuthUser,
@@ -58,6 +61,10 @@ import {
   type EmbeddedSignupInput, type EmbeddedSignupResult, type TokenVaultPort,
 } from "./whatsapp-onboarding";
 import { createDbWebchatStore } from "./webchat-store";
+import {
+  contactsToCsv, contactsToJson, dedupeImportRows, parseImport,
+} from "./contacts-io";
+import { buildGrowthTarget, generateGrowthSlug, growthShortUrl } from "./growth";
 
 /**
  * Botara API - Fase 3.
@@ -268,6 +275,19 @@ export function createBullMqFlowEnqueuer(redisUrl: string): FlowRunEnqueuer {
   };
 }
 
+/**
+ * Production comment-action enqueuer: BullMQ "comment-action" queue. The
+ * job id is the (comment, flow) pair, so a redelivered webhook cannot
+ * enqueue the same automation twice while the first job is pending.
+ */
+export function createBullMqCommentActionEnqueuer(redisUrl: string): CommentActionEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "comment-action", "comment-action");
+  return {
+    enqueueCommentAction: (job) =>
+      inner.enqueue({ ...job }, `comment:${job.commentExternalId}:${job.flowId}`),
+  };
+}
+
 /** Production kb-ingest enqueuer: BullMQ "kb" queue, job "ingest". */
 export function createBullMqKbEnqueuer(redisUrl: string): KbEnqueuer {
   const inner = createBullMqEnqueuer(redisUrl, "kb", "ingest");
@@ -421,7 +441,11 @@ export function defaultDeps(): ApiDeps {
     dataDeletionStore: createDbDataDeletionStore(defaultGetDatabase),
     kbEnqueuer: createBullMqKbEnqueuer(redisUrl),
     flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
-    flowDispatcher: createDbFlowDispatcher({ getDatabase: defaultGetDatabase, flowEnqueuer: createBullMqFlowEnqueuer(redisUrl) }),
+    flowDispatcher: createDbFlowDispatcher({
+      getDatabase: defaultGetDatabase,
+      flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
+      commentEnqueuer: createBullMqCommentActionEnqueuer(redisUrl),
+    }),
     vault,
     providerFetch: (url, init) => fetch(url, init as RequestInit),
     readiness: createReadinessChecker(defaultGetDatabase, redisUrl),
@@ -613,7 +637,7 @@ function oauthSecret(deps: ApiDeps): string {
 }
 
 const flowTriggerInputSchema = z.object({
-  type: z.enum(["keyword", "postback", "manual"]),
+  type: z.enum(["keyword", "postback", "manual", "comment_keyword"]),
   config: z.record(z.unknown()).default({}),
 }).openapi("FlowTriggerInput");
 
@@ -839,6 +863,17 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         "Authentication required: send a session token (Authorization: Bearer or the botara_session cookie).",
         { status: 401 },
       );
+    }
+    // Personal API tokens (adopted features): a Bearer `bta_...` token
+    // resolves through the token store (SHA-256 hash lookup, revocation
+    // honored) and authenticates as its user - workspace membership checks
+    // then apply identically to the JWT path. No SESSION_SECRET involved.
+    if (token.startsWith(API_TOKEN_PREFIX)) {
+      const user = await deps.authStore.findUserByApiToken(token);
+      if (!user) {
+        throw new AppError("UNAUTHORIZED", "API token is invalid or revoked.", { status: 401 });
+      }
+      return user;
     }
     const claims = verifySessionToken(token, sessionSecret());
     if (!claims) {
@@ -1073,6 +1108,56 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     await deps.authStore.setPasswordHash(user.id, passwordHash);
     await deps.authStore.audit({ userId: user.id, action: "auth.change_password", details: {} });
     return c.json({ ok: true as const });
+  });
+
+  // ------------------------------------------- API tokens (adopted features)
+  // Personal API tokens power the MCP server and third-party API access.
+  // The raw token (bta_...) is returned ONCE at creation; only its SHA-256
+  // hash is stored. Bearer bta_ tokens authenticate anywhere a session JWT
+  // does (see authenticateRequest), with identical workspace membership
+  // checks - a token is exactly as powerful as its user, so Settings is
+  // where they are created and revoked.
+
+  const createApiTokenRoute = createRoute({
+    method: "post", path: "/auth/tokens",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({ name: z.string().min(1).max(120) }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "API token created; raw token returned ONCE" } },
+  });
+  app.openapi(createApiTokenRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    const { raw, token } = await deps.authStore.createApiToken(user.id, c.req.valid("json").name.trim());
+    await deps.authStore.audit({ userId: user.id, action: "auth.token.create", details: { tokenId: token.id, name: token.name } });
+    return c.json({ token: raw, tokenInfo: token }, 201);
+  });
+
+  const listApiTokensRoute = createRoute({
+    method: "get", path: "/auth/tokens",
+    responses: { 200: { description: "API token metadata (never raw tokens)" } },
+  });
+  app.openapi(listApiTokensRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    return c.json({ tokens: await deps.authStore.listApiTokens(user.id) });
+  });
+
+  const revokeApiTokenRoute = createRoute({
+    method: "delete", path: "/auth/tokens/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "API token revoked" } },
+  });
+  app.openapi(revokeApiTokenRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    const revoked = await deps.authStore.revokeApiToken(user.id, c.req.valid("param").id);
+    if (!revoked) throw new AppError("NOT_FOUND", "API token not found (or already revoked).", { status: 404 });
+    await deps.authStore.audit({ userId: user.id, action: "auth.token.revoke", details: { tokenId: c.req.valid("param").id } });
+    return c.json({ revoked: true });
   });
 
   // --------------------------------------------------- public config (Fase 4)
@@ -1572,7 +1657,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links"]) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
@@ -1951,6 +2036,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
               kind: z.enum(["free_form", "template"]).default("free_form"),
               text: z.string().min(1).optional(),
               templateId: z.string().optional(),
+              /** Rich block (buttons/list/carousel/product/catalog) for free-form replies. */
+              rich: richBlockSchema.optional(),
             }),
           },
         },
@@ -1991,16 +2078,20 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         language: template.language,
         latestCategory: template.latestCategory ?? template.category ?? "utility",
       };
-    } else if (!body.text) {
-      throw new AppError("VALIDATION", "text is required for free-form replies.", { status: 400 });
+    } else if (!body.text && !body.rich) {
+      throw new AppError("VALIDATION", "text (or a rich block) is required for free-form replies.", { status: 400 });
     }
 
     const idempotencyKey = `reply:${id}:${crypto.randomUUID()}`;
     const message = await createMessage(db, {
       conversationId: id,
       direction: "out",
-      type: body.kind === "template" ? "template" : "text",
-      body: body.kind === "template" ? templateInput!.name : body.text,
+      type: body.kind === "template" ? "template" : body.rich ? "rich" : "text",
+      // Rich messages persist as their formatted plain-text rendering so
+      // the thread stays readable on every surface.
+      body: body.kind === "template"
+        ? templateInput!.name
+        : body.rich ? richToPlainText(body.rich) : body.text,
       status: "queued",
       idempotencyKey,
     });
@@ -2019,7 +2110,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           tokenVaultRef: account.tokenVaultRef ?? undefined,
         },
         toExternalId: conversation.contactExternalId,
-        text: body.kind === "free_form" ? body.text : undefined,
+        text: body.kind === "free_form" ? (body.text ?? (body.rich ? richBlockText(body.rich) : undefined)) : undefined,
+        rich: body.kind === "free_form" ? body.rich : undefined,
         template: templateInput,
         idempotencyKey,
       });
@@ -2027,6 +2119,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       return c.json({
         message: { ...message, status: "sent", externalId: result.externalMessageId, createdAt: iso(message.createdAt) },
         window: decision,
+        ...(result.warnings ? { warnings: result.warnings } : {}),
       });
     } catch (err) {
       await updateMessageStatus(db, message.id, "failed").catch(() => undefined);
@@ -2105,6 +2198,91 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ contact: { ...row, createdAt: iso(row.createdAt) } });
   });
 
+  // ------------------------------------- contact import / export (adopted)
+  // Import: CSV (header-mapped) or JSON array, deduped within the file and
+  // against the DB by (channel, externalId); per-row errors are reported,
+  // never fatal to the batch. Export: the full workspace set in the same
+  // column shape, as a download.
+
+  const importContactsRoute = createRoute({
+    method: "post", path: "/contacts/import",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              format: z.enum(["csv", "json"]),
+              content: z.string().min(1).max(10_000_000),
+              conflict: z.enum(["skip", "update"]).default("skip"),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Import summary: inserted / updated / skipped / per-row errors" } },
+  });
+  app.openapi(importContactsRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const body = c.req.valid("json");
+    const parsed = parseImport(body.format, body.content); // throws past the 5000-row cap
+    const db = deps.getDatabase();
+    const deduped = dedupeImportRows(parsed.rows, body.conflict);
+    let inserted = 0;
+    let updated = 0;
+    for (const row of deduped.rows) {
+      const { created } = await upsertContactByExternal(db, {
+        workspaceId: ws,
+        channel: row.channel,
+        externalId: row.externalId,
+        displayName: row.displayName,
+        tags: row.tags,
+        customFields: row.customFields,
+      }, body.conflict);
+      if (created) inserted++;
+      else if (body.conflict === "update") updated++;
+    }
+    // Skipped = in-file duplicates + rows that already existed in "skip"
+    // mode (in "update" mode those same rows count as updated instead).
+    const skipped = deduped.duplicates
+      + (body.conflict === "skip" ? deduped.rows.length - inserted : 0);
+    return c.json({
+      inserted,
+      updated,
+      skipped,
+      errors: parsed.errors,
+    });
+  });
+
+  const exportContactsRoute = createRoute({
+    method: "get", path: "/contacts/export",
+    request: { query: z.object({ format: z.enum(["csv", "json"]).default("csv") }) },
+    responses: { 200: { description: "Workspace contacts as a downloadable file" } },
+  });
+  app.openapi(exportContactsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const format = c.req.valid("query").format;
+    const rows = await listContacts(db, ws);
+    const contacts = rows.map((r) => ({
+      channel: r.channel,
+      externalId: r.externalId,
+      displayName: r.displayName,
+      tags: (r.tags as string[]) ?? [],
+      customFields: (r.customFields as Record<string, unknown>) ?? {},
+    }));
+    if (format === "json") {
+      return c.body(contactsToJson(contacts), 200, {
+        "content-type": "application/json; charset=utf-8",
+        "content-disposition": 'attachment; filename="contacts.json"',
+      });
+    }
+    return c.body(contactsToCsv(contacts), 200, {
+      "content-type": "text/csv; charset=utf-8",
+      "content-disposition": 'attachment; filename="contacts.csv"',
+    });
+  });
+
   const segmentsRoute = createRoute({
     method: "get", path: "/segments",
     responses: { 200: { description: "Per-tag segment counts" } },
@@ -2113,6 +2291,167 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     return c.json({ segments: await segmentCounts(db, ws) });
+  });
+
+  // ------------------------------------------------ growth links (adopted)
+  // Short tracked links per channel account: /r/:slug counts the click and
+  // 302s to the channel target; referral capture in the dispatcher counts
+  // conversions and can run a bound flow. QR codes render server-side as
+  // SVG (qrcode package, no native deps).
+
+  const serializeGrowthLink = (row: GrowthLinkRow, c: Ctx) => ({
+    id: row.id,
+    workspaceId: row.workspaceId,
+    channelAccountId: row.channelAccountId,
+    kind: row.kind,
+    slug: row.slug,
+    label: row.label,
+    prefilledText: row.prefilledText,
+    boundFlowId: row.boundFlowId,
+    targetRef: row.targetRef,
+    targetUrl: row.targetUrl,
+    clicks: row.clicks,
+    conversions: row.conversions,
+    shortUrl: growthShortUrl(publicApiBase(deps, c), row.slug),
+    createdAt: iso(row.createdAt),
+    updatedAt: iso(row.updatedAt),
+  });
+
+  const createGrowthLinkRoute = createRoute({
+    method: "post", path: "/growth-links",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              channelAccountId: z.string().min(1),
+              label: z.string().min(1).max(200),
+              prefilledText: z.string().max(1000).optional(),
+              boundFlowId: z.string().optional(),
+              targetRef: z.string().max(200).optional(),
+              targetUrl: z.string().url().max(2000).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Growth link created" } },
+  });
+  app.openapi(createGrowthLinkRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const account = await getChannelAccount(db, ws, body.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    if (body.boundFlowId) {
+      const flow = await getFlow(db, ws, body.boundFlowId);
+      if (!flow) throw new AppError("NOT_FOUND", "Bound flow not found in this workspace.", { status: 404 });
+    }
+    const slug = generateGrowthSlug();
+    // Validate the destination NOW (throws a typed VALIDATION error when
+    // e.g. a WhatsApp number or webchat URL is missing) - a link that
+    // redirects nowhere must fail at creation, not at click time.
+    buildGrowthTarget({
+      kind: account.channel, slug,
+      prefilledText: body.prefilledText, targetRef: body.targetRef, targetUrl: body.targetUrl,
+      account: { externalId: account.externalId, displayName: account.displayName },
+    });
+    const row = await createGrowthLink(db, {
+      workspaceId: ws,
+      channelAccountId: account.id,
+      kind: account.channel,
+      slug,
+      label: body.label,
+      prefilledText: body.prefilledText,
+      boundFlowId: body.boundFlowId,
+      targetRef: body.targetRef,
+      targetUrl: body.targetUrl,
+    });
+    return c.json({ link: serializeGrowthLink(row, c) }, 201);
+  });
+
+  const listGrowthLinksRoute = createRoute({
+    method: "get", path: "/growth-links",
+    responses: { 200: { description: "Growth links of the workspace" } },
+  });
+  app.openapi(listGrowthLinksRoute, async (c) => {
+    const ws = workspaceId(c);
+    const rows = await listGrowthLinks(deps.getDatabase(), ws);
+    return c.json({ links: rows.map((row) => serializeGrowthLink(row, c)) });
+  });
+
+  const getGrowthLinkRoute = createRoute({
+    method: "get", path: "/growth-links/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One growth link" } },
+  });
+  app.openapi(getGrowthLinkRoute, async (c) => {
+    const ws = workspaceId(c);
+    const row = await getGrowthLink(deps.getDatabase(), ws, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Growth link not found.", { status: 404 });
+    return c.json({ link: serializeGrowthLink(row, c) });
+  });
+
+  const deleteGrowthLinkRoute = createRoute({
+    method: "delete", path: "/growth-links/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Growth link deleted" } },
+  });
+  app.openapi(deleteGrowthLinkRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const removed = await deleteGrowthLink(deps.getDatabase(), ws, c.req.valid("param").id);
+    if (!removed) throw new AppError("NOT_FOUND", "Growth link not found.", { status: 404 });
+    return c.json({ deleted: true });
+  });
+
+  const growthQrRoute = createRoute({
+    method: "get", path: "/growth-links/{id}/qr.svg",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "QR code (SVG) of the link's short URL" } },
+  });
+  app.openapi(growthQrRoute, async (c) => {
+    const ws = workspaceId(c);
+    const row = await getGrowthLink(deps.getDatabase(), ws, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Growth link not found.", { status: 404 });
+    const { toString: qrToString } = await import("qrcode");
+    const svg = await qrToString(growthShortUrl(publicApiBase(deps, c), row.slug), {
+      type: "svg",
+      errorCorrectionLevel: "M",
+      margin: 1,
+    });
+    return c.body(svg, 200, { "content-type": "image/svg+xml; charset=utf-8" });
+  });
+
+  /**
+   * Public growth redirect: counts the click, then 302s to the channel
+   * target. No auth (it is the shareable link). An unknown slug is a typed
+   * 404 - including on a deployment without a database, where no growth
+   * link can exist by definition.
+   */
+  app.get("/r/:slug", async (c) => {
+    const slug = c.req.param("slug");
+    let link: GrowthLinkRow | null = null;
+    try {
+      link = await getGrowthLinkBySlug(deps.getDatabase(), slug);
+    } catch (err) {
+      if (err instanceof AppError && err.code === "CONFIGURATION") {
+        throw new AppError("NOT_FOUND", "Growth link not found.", { status: 404 });
+      }
+      throw err;
+    }
+    if (!link) throw new AppError("NOT_FOUND", "Growth link not found.", { status: 404 });
+    const db = deps.getDatabase();
+    const account = await getChannelAccountById(db, link.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Growth link target account no longer exists.", { status: 404 });
+    const target = buildGrowthTarget({
+      kind: link.kind, slug: link.slug,
+      prefilledText: link.prefilledText, targetRef: link.targetRef, targetUrl: link.targetUrl,
+      account: { externalId: account.externalId, displayName: account.displayName },
+    });
+    await incrementGrowthLinkClicks(db, link.id).catch(() => undefined);
+    return c.redirect(target, 302);
   });
 
   // ------------------------------------------------------------- templates

@@ -1768,6 +1768,15 @@ export async function getGrowthLink(db: Database, workspaceId: string, id: strin
   return row ?? null;
 }
 
+/** All growth links bound to one channel account (WhatsApp single-link attribution). */
+export async function listGrowthLinksByAccount(db: Database, channelAccountId: string): Promise<GrowthLinkRow[]> {
+  return db
+    .select()
+    .from(growthLinks)
+    .where(eq(growthLinks.channelAccountId, channelAccountId))
+    .orderBy(desc(growthLinks.createdAt));
+}
+
 /** Slugs are globally unique - the public redirect resolves by slug alone. */
 export async function getGrowthLinkBySlug(db: Database, slug: string): Promise<GrowthLinkRow | null> {
   const [row] = await db

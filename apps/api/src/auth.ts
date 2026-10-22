@@ -1,9 +1,11 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AppError } from "@botara/shared";
 import {
-  createUser, createWorkspace, getUserByEmail, getUserById, getWorkspaceBySlug,
-  getWorkspaceMember, insertAuditLog, listWorkspaceMembers, listWorkspacesForUser,
-  removeWorkspaceMember, setUserPasswordHash, updateUserName, updateWorkspaceName,
+  createApiToken as createApiTokenRow, createUser, createWorkspace,
+  findApiTokenByHash, getUserByEmail, getUserById, getWorkspaceBySlug,
+  getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceMembers,
+  listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow,
+  setUserPasswordHash, touchApiToken, updateUserName, updateWorkspaceName,
   upsertWorkspaceMember,
   type Database,
 } from "@botara/db";
@@ -54,6 +56,34 @@ export interface AuthMemberView {
   role: string;
 }
 
+/** Metadata view of a personal API token - never carries the raw token. */
+export interface ApiTokenView {
+  id: string;
+  name: string;
+  /** Non-secret display fragment, e.g. "bta_AbCd1234". */
+  prefix: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export const API_TOKEN_PREFIX = "bta_";
+
+/** Mint a raw API token: `bta_` + 256 bits of base64url randomness. */
+export function generateApiToken(): string {
+  return API_TOKEN_PREFIX + randomBytes(32).toString("base64url");
+}
+
+/** The only persisted form of a token: its SHA-256 hex digest. */
+export function hashApiToken(raw: string): string {
+  return createHash("sha256").update(raw).digest("hex");
+}
+
+/** Display fragment stored alongside the hash (not a secret). */
+export function apiTokenDisplayPrefix(raw: string): string {
+  return raw.slice(0, API_TOKEN_PREFIX.length + 8);
+}
+
 /** Everything the auth + workspace handlers need from persistence. */
 export interface AuthStore {
   findUserByEmail(email: string): Promise<AuthUser | null>;
@@ -70,6 +100,12 @@ export interface AuthStore {
   /** Settings (Fase 4): profile display name + workspace rename. */
   updateUserName(userId: string, name: string): Promise<void>;
   renameWorkspace(workspaceId: string, name: string): Promise<void>;
+  /** API tokens (adopted features): create returns the raw token ONCE. */
+  createApiToken(userId: string, name: string): Promise<{ raw: string; token: ApiTokenView }>;
+  listApiTokens(userId: string): Promise<ApiTokenView[]>;
+  revokeApiToken(userId: string, id: string): Promise<boolean>;
+  /** Resolve a presented `bta_...` token to its user (null when unknown/revoked). */
+  findUserByApiToken(rawToken: string): Promise<AuthUser | null>;
   audit(entry: {
     workspaceId?: string;
     userId?: string;
@@ -141,6 +177,47 @@ export class DbAuthStore implements AuthStore {
     await updateWorkspaceName(this.getDatabase(), workspaceId, name);
   }
 
+  async createApiToken(userId: string, name: string) {
+    const raw = generateApiToken();
+    const row = await createApiTokenRow(this.getDatabase(), {
+      userId,
+      name,
+      tokenHash: hashApiToken(raw),
+      prefix: apiTokenDisplayPrefix(raw),
+    });
+    return {
+      raw,
+      token: {
+        id: row.id, name: row.name, prefix: row.prefix,
+        lastUsedAt: null, revokedAt: null, createdAt: row.createdAt.toISOString(),
+      },
+    };
+  }
+
+  async listApiTokens(userId: string) {
+    const rows = await listApiTokensByUser(this.getDatabase(), userId);
+    return rows.map((row) => ({
+      id: row.id, name: row.name, prefix: row.prefix,
+      lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
+      revokedAt: row.revokedAt?.toISOString() ?? null,
+      createdAt: row.createdAt.toISOString(),
+    }));
+  }
+
+  async revokeApiToken(userId: string, id: string) {
+    return revokeApiTokenRow(this.getDatabase(), userId, id);
+  }
+
+  async findUserByApiToken(rawToken: string) {
+    const db = this.getDatabase();
+    const row = await findApiTokenByHash(db, hashApiToken(rawToken));
+    if (!row) return null;
+    // Best-effort usage stamp - a failed stamp must never fail auth.
+    await touchApiToken(db, row.id, new Date()).catch(() => undefined);
+    const user = await getUserById(db, row.userId);
+    return user ? { id: user.id, email: user.email, name: user.name, passwordHash: user.passwordHash } : null;
+  }
+
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
     await insertAuditLog(this.getDatabase(), entry);
   }
@@ -152,6 +229,7 @@ export class InMemoryAuthStore implements AuthStore {
   readonly workspaces = new Map<string, { id: string; name: string; slug: string }>();
   readonly members = new Map<string, { workspaceId: string; userId: string; role: string }>();
   readonly auditLog: Array<{ workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }> = [];
+  readonly apiTokens = new Map<string, ApiTokenView & { userId: string; tokenHash: string }>();
 
   private memberKey(workspaceId: string, userId: string) {
     return `${workspaceId}:${userId}`;
@@ -234,6 +312,44 @@ export class InMemoryAuthStore implements AuthStore {
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
     this.auditLog.push(entry);
+  }
+
+  async createApiToken(userId: string, name: string) {
+    const raw = generateApiToken();
+    const token: ApiTokenView & { userId: string; tokenHash: string } = {
+      id: crypto.randomUUID(),
+      userId,
+      name,
+      prefix: apiTokenDisplayPrefix(raw),
+      tokenHash: hashApiToken(raw),
+      lastUsedAt: null,
+      revokedAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    this.apiTokens.set(token.id, token);
+    const { userId: _userId, tokenHash: _hash, ...view } = token;
+    return { raw, token: view };
+  }
+
+  async listApiTokens(userId: string) {
+    return [...this.apiTokens.values()]
+      .filter((tk) => tk.userId === userId)
+      .map(({ userId: _userId, tokenHash: _hash, ...view }) => view);
+  }
+
+  async revokeApiToken(userId: string, id: string) {
+    const token = this.apiTokens.get(id);
+    if (!token || token.userId !== userId || token.revokedAt) return false;
+    token.revokedAt = new Date().toISOString();
+    return true;
+  }
+
+  async findUserByApiToken(rawToken: string) {
+    const hash = hashApiToken(rawToken);
+    const token = [...this.apiTokens.values()].find((tk) => tk.tokenHash === hash && !tk.revokedAt);
+    if (!token) return null;
+    token.lastUsedAt = new Date().toISOString();
+    return this.users.get(token.userId) ?? null;
   }
 }
 
