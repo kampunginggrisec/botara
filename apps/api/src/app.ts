@@ -845,7 +845,39 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     }
     const events = await getAdapter("email").parseWebhook(payload);
     await deps.eventSink.handle(events);
-    return c.json({ received: true, events: events.length });
+    // Fase 3 producer: an email.received event is routed by RECIPIENT
+    // DOMAIN (workspace_domains) and enqueued as an email-inbound job; the
+    // worker fetches the full content and files it into the inbox. When a
+    // domain matches but Redis is down, the enqueue throws 503 - Resend
+    // retries the webhook and nothing is silently dropped or faked.
+    let enqueued = 0;
+    for (const event of events) {
+      if (event.type !== "message.received" || event.channel !== "email") continue;
+      const domains = new Set(
+        (event.recipients ?? [])
+          .map((r) => r.split("@")[1]?.toLowerCase())
+          .filter((d): d is string => Boolean(d)),
+      );
+      const routedAccounts = new Set<string>();
+      for (const domain of domains) {
+        const route = await deps.emailRouter.resolveRecipientDomain(domain);
+        if (!route) {
+          console.warn(
+            `[api] resend inbound: no workspace domain registered for "${domain}" - email ${event.messageExternalId} is not routed`,
+          );
+          continue;
+        }
+        if (routedAccounts.has(route.channelAccountId)) continue;
+        routedAccounts.add(route.channelAccountId);
+        await deps.emailInboundEnqueuer.enqueueEmailInbound({
+          workspaceId: route.workspaceId,
+          channelAccountId: route.channelAccountId,
+          emailId: event.messageExternalId,
+        });
+        enqueued++;
+      }
+    }
+    return c.json({ received: true, events: events.length, enqueued });
   });
 
   // ------------------------------------------- broadcasts: estimate (pure)
@@ -1451,6 +1483,82 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         };
       }),
     });
+  });
+
+  // ------------------------------------------- email domains (Fase 3)
+  const serializeDomain = (d: Awaited<ReturnType<typeof listWorkspaceDomains>>[number]) => ({
+    ...d,
+    createdAt: iso(d.createdAt),
+  });
+
+  const createEmailDomainRoute = createRoute({
+    method: "post", path: "/channels/email/domains",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              domain: z.string().min(3).max(255),
+              channelAccountId: z.string().optional(),
+              resendDomainId: z.string().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Workspace email domain registered" } },
+  });
+  app.openapi(createEmailDomainRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const body = c.req.valid("json");
+    const domain = body.domain.toLowerCase().trim();
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain)) {
+      throw new AppError("VALIDATION", `"${body.domain}" is not a valid domain name.`, { status: 400 });
+    }
+    const db = deps.getDatabase();
+    if (body.channelAccountId) {
+      const account = await getChannelAccount(db, ws, body.channelAccountId);
+      if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+      if (account.channel !== "email") {
+        throw new AppError("VALIDATION", "channelAccountId must reference an email channel account.", { status: 400 });
+      }
+    }
+    if (await findWorkspaceDomain(db, domain)) {
+      throw new AppError("CONFLICT", `Domain ${domain} is already registered to a workspace.`, { status: 409 });
+    }
+    const row = await createWorkspaceDomain(db, {
+      workspaceId: ws,
+      domain,
+      channelAccountId: body.channelAccountId,
+      resendDomainId: body.resendDomainId,
+    });
+    return c.json({ domain: serializeDomain(row) }, 201);
+  });
+
+  const listEmailDomainsRoute = createRoute({
+    method: "get", path: "/channels/email/domains",
+    responses: { 200: { description: "Workspace email domains" } },
+  });
+  app.openapi(listEmailDomainsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listWorkspaceDomains(db, ws);
+    return c.json({ domains: rows.map(serializeDomain) });
+  });
+
+  const deleteEmailDomainRoute = createRoute({
+    method: "delete", path: "/channels/email/domains/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Workspace email domain removed" } },
+  });
+  app.openapi(deleteEmailDomainRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const deleted = await deleteWorkspaceDomain(db, ws, c.req.valid("param").id);
+    if (!deleted) throw new AppError("NOT_FOUND", "Email domain not found.", { status: 404 });
+    return c.json({ deleted: true });
   });
 
   const embeddedSignupRoute = createRoute({
