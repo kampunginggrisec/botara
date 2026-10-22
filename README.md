@@ -33,6 +33,8 @@ from ChatbotX or any other project (see docs/adr/ADR-001).
 bun install
 docker compose -f infra/docker/docker-compose.yml up -d
 bun run dev        # API on http://localhost:3000 (GET /health)
+# Web dev server: VITE_API_URL=http://localhost:3000 bun run --cwd apps/web dev
+# (production builds need no variable: the SPA calls same-origin /api)
 bun test
 bun run typecheck
 bun run build      # builds apps/web

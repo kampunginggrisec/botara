@@ -1,6 +1,12 @@
 /**
  * Botara web API client (Fase 3: real auth).
- * Base URL from VITE_API_URL (default: local API). The session JWT from
+ * Base URL from VITE_API_URL (default: same-origin "/api" — the reverse
+ * proxy in front of every deployment, trial nginx and production Caddy
+ * alike, routes /api/* to the API process; an absolute localhost default
+ * here made the deployed SPA call the VISITOR's own machine and report
+ * "Cannot reach the API" while the API was perfectly healthy). For the
+ * vite dev server, set VITE_API_URL=http://localhost:3000 (the dev API).
+ * The session JWT from
  * /auth/login|register is kept in localStorage and sent as a Bearer token;
  * the selected workspace id rides along as X-Workspace-Id, which the API
  * now treats purely as a workspace SELECTOR - membership and role are
@@ -8,7 +14,7 @@
  * session cookie; the Bearer token is what this SPA uses.)
  */
 
-export const BASE_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+export const BASE_URL: string = import.meta.env.VITE_API_URL ?? "/api";
 
 const WORKSPACE_KEY = "botara.workspaceId";
 const TOKEN_KEY = "botara.token";
