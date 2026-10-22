@@ -287,7 +287,7 @@ async function pingRedis(redisUrl: string): Promise<DependencyStatus> {
   const connection = new IORedis(redisUrl, {
     maxRetriesPerRequest: 1,
     connectTimeout: 1500,
-    enableOfflineQueue: false,
+    lazyConnect: true,
     retryStrategy: () => null,
   });
   connection.on("error", () => { /* surfaced via the raced ping below */ });
@@ -295,7 +295,15 @@ async function pingRedis(redisUrl: string): Promise<DependencyStatus> {
     const timeout = new Promise<never>((_, reject) =>
       setTimeout(() => reject(new Error("redis ping timed out")), 2000),
     );
-    const res = await Promise.race([connection.ping(), timeout]);
+    // With lazyConnect + no offline queue, PING before connect rejects with
+    // "Stream isn't writeable" - so await the connection itself first.
+    const res = await Promise.race([
+      (async () => {
+        await connection.connect();
+        return connection.ping();
+      })(),
+      timeout,
+    ]);
     return res === "PONG"
       ? { ok: true }
       : { ok: false, detail: `unexpected PING response: ${String(res)}` };
