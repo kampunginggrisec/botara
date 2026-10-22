@@ -1,4 +1,7 @@
 import { NotImplementedError } from "@botara/shared";
+import { envTelegramCredentials, envWhatsAppCredentials } from "./credentials";
+import { TelegramAdapter } from "./telegram";
+import { WhatsAppAdapter } from "./whatsapp";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type ChannelKey, type InboundEvent, type PublishInput, type SendInput, type SendResult,
@@ -42,10 +45,26 @@ export function registerAdapter(adapter: ChannelAdapter): void {
   registry.set(adapter.key, adapter);
 }
 
+/**
+ * Default adapter factory. Fase 1: whatsapp and telegram resolve to the REAL
+ * adapters (credentials from the env-backed provider until the vault lands).
+ * Every other channel stays an honest placeholder.
+ */
+function createDefaultAdapter(key: ChannelKey): ChannelAdapter {
+  switch (key) {
+    case "whatsapp":
+      return new WhatsAppAdapter({ credentials: envWhatsAppCredentials() });
+    case "telegram":
+      return new TelegramAdapter({ credentials: envTelegramCredentials() });
+    default:
+      return new PlaceholderAdapter(key);
+  }
+}
+
 export function getAdapter(key: ChannelKey): ChannelAdapter {
   let adapter = registry.get(key);
   if (!adapter) {
-    adapter = new PlaceholderAdapter(key);
+    adapter = createDefaultAdapter(key);
     registry.set(key, adapter);
   }
   return adapter;
