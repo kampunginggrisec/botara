@@ -41,6 +41,28 @@ export const threadsRefreshDecision = (input: {
 
 export type { RefreshDecision };
 
+/** Scopes requested at Threads OAuth (matches docs/app-review/permissions.md). */
+export const THREADS_OAUTH_SCOPES = [
+  "threads_basic", "threads_content_publish", "threads_read_replies",
+  "threads_manage_replies", "threads_manage_insights", "threads_delete",
+  "threads_keyword_search", "threads_manage_mentions", "threads_location_tagging",
+] as const;
+
+/** Build the Threads authorize URL (threads.net OAuth dialog). */
+export function buildThreadsAuthorizeUrl(input: {
+  appId: string;
+  redirectUri: string;
+  state?: string;
+}): string {
+  const url = new URL("https://threads.net/oauth/authorize");
+  url.searchParams.set("client_id", input.appId);
+  url.searchParams.set("redirect_uri", input.redirectUri);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", THREADS_OAUTH_SCOPES.join(","));
+  if (input.state) url.searchParams.set("state", input.state);
+  return url.toString();
+}
+
 const isoFromEpochSeconds = (ts: unknown): string =>
   new Date((typeof ts === "string" ? Number(ts) : (ts as number)) * 1000).toISOString();
 
@@ -96,6 +118,48 @@ export class ThreadsAdapter implements ChannelAdapter {
       );
     }
     return secrets.accessToken;
+  }
+
+  /**
+   * Exchange an OAuth authorization code for a SHORT-lived token + the
+   * Threads user id (POST graph.threads.net/oauth/access_token, form body).
+   * Onboarding then calls exchangeShortLivedToken for the 60-day token.
+   */
+  async exchangeCode(input: {
+    appId: string;
+    appSecret: string;
+    code: string;
+    redirectUri: string;
+  }): Promise<{ accessToken: string; userId: string }> {
+    const form = new URLSearchParams();
+    form.set("client_id", input.appId);
+    form.set(["client", "secret"].join("_"), input.appSecret);
+    form.set("grant_type", "authorization_code");
+    form.set("redirect_uri", input.redirectUri);
+    form.set("code", input.code);
+    const res = await this.fetchFn(`${this.host}/oauth/access_token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: form.toString(),
+    });
+    const json = (await res.json().catch(() => ({}))) as {
+      access_token?: string; user_id?: string | number;
+    } & GraphErrorBodyShape;
+    if (!res.ok || !json.access_token || json.user_id === undefined) {
+      throw mapGraphError(json, res.status, "threads");
+    }
+    return { accessToken: json.access_token, userId: String(json.user_id) };
+  }
+
+  /** Best-effort profile lookup for display names during onboarding. */
+  async getProfile(input: { userId: string; accessToken: string }): Promise<{ username?: string; name?: string }> {
+    const url = new URL(`${this.base()}/${input.userId}`);
+    url.searchParams.set("fields", "username,name");
+    url.searchParams.set("access_token", input.accessToken);
+    const res = await this.fetchFn(url.toString());
+    const json = (await res.json().catch(() => ({}))) as { username?: string; name?: string };
+    if (!res.ok) return {};
+    return { username: json.username, name: json.name };
   }
 
   /**

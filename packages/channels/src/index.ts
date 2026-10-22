@@ -34,9 +34,12 @@ export {
   INSTAGRAM_LOGIN_SCOPES, FACEBOOK_LOGIN_SCOPES,
   type InstagramAdapterOptions, type InstagramAuthMode,
 } from "./instagram";
-export { MessengerAdapter, type MessengerAdapterOptions } from "./messenger";
 export {
-  ThreadsAdapter, threadsRefreshDecision,
+  MessengerAdapter, buildMessengerAuthorizeUrl, MESSENGER_OAUTH_SCOPES,
+  type MessengerAdapterOptions, type MessengerPageSummary,
+} from "./messenger";
+export {
+  ThreadsAdapter, threadsRefreshDecision, buildThreadsAuthorizeUrl, THREADS_OAUTH_SCOPES,
   type ThreadsAdapterOptions,
 } from "./threads";
 export {

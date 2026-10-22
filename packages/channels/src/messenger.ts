@@ -30,6 +30,34 @@ export interface MessengerAdapterOptions {
 const isoFromEpochMs = (ts: unknown): string =>
   new Date(typeof ts === "number" ? ts : Number(ts)).toISOString();
 
+/** Scopes requested at Facebook Login for Messenger Page onboarding. */
+export const MESSENGER_OAUTH_SCOPES = [
+  "pages_show_list", "pages_messaging", "pages_manage_metadata", "pages_read_engagement",
+] as const;
+
+/** Build the Facebook Login authorize URL for Messenger onboarding. */
+export function buildMessengerAuthorizeUrl(input: {
+  appId: string;
+  redirectUri: string;
+  graphVersion?: string;
+  state?: string;
+}): string {
+  const url = new URL(`https://www.facebook.com/${input.graphVersion ?? "v26.0"}/dialog/oauth`);
+  url.searchParams.set("client_id", input.appId);
+  url.searchParams.set("redirect_uri", input.redirectUri);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope", MESSENGER_OAUTH_SCOPES.join(","));
+  if (input.state) url.searchParams.set("state", input.state);
+  return url.toString();
+}
+
+export interface MessengerPageSummary {
+  id: string;
+  name: string;
+  /** Page access token - return to the API layer ONLY so it can be vaulted. */
+  accessToken: string;
+}
+
 export class MessengerAdapter implements ChannelAdapter {
   readonly key = "messenger" as const;
   readonly apiVersion: string;
@@ -56,6 +84,56 @@ export class MessengerAdapter implements ChannelAdapter {
 
   async disconnect(): Promise<void> {
     // Page tokens are revoked app-side; nothing to call here in Fase 2.
+  }
+
+  /**
+   * OAuth onboarding (API layer): exchange an authorization code for a
+   * LONG-LIVED user access token (code -> short-lived -> fb_exchange_token).
+   */
+  async exchangeCode(input: {
+    appId: string;
+    appSecret: string;
+    code: string;
+    redirectUri: string;
+  }): Promise<{ userAccessToken: string; expiresAt: string }> {
+    const base = `${this.baseUrl}/${this.apiVersion}/oauth/access_token`;
+    const shortUrl = new URL(base);
+    shortUrl.searchParams.set("client_id", input.appId);
+    shortUrl.searchParams.set("client_secret", input.appSecret);
+    shortUrl.searchParams.set("redirect_uri", input.redirectUri);
+    shortUrl.searchParams.set("code", input.code);
+    const shortRes = await this.fetchFn(shortUrl.toString());
+    const shortJson = (await shortRes.json().catch(() => ({}))) as { access_token?: string } & GraphErrorBodyShape;
+    if (!shortRes.ok || !shortJson.access_token) throw mapGraphError(shortJson, shortRes.status, "messenger");
+    const longUrl = new URL(base);
+    longUrl.searchParams.set("grant_type", "fb_exchange_token");
+    longUrl.searchParams.set("client_id", input.appId);
+    longUrl.searchParams.set("client_secret", input.appSecret);
+    longUrl.searchParams.set("fb_exchange_token", shortJson.access_token);
+    const longRes = await this.fetchFn(longUrl.toString());
+    const longJson = (await longRes.json().catch(() => ({}))) as {
+      access_token?: string; expires_in?: number;
+    } & GraphErrorBodyShape;
+    if (!longRes.ok || !longJson.access_token) throw mapGraphError(longJson, longRes.status, "messenger");
+    return {
+      userAccessToken: longJson.access_token,
+      expiresAt: new Date(Date.now() + (longJson.expires_in ?? 5184000) * 1000).toISOString(),
+    };
+  }
+
+  /** Pages the token's user manages, each with its Page access token. */
+  async listPages(userAccessToken: string): Promise<MessengerPageSummary[]> {
+    const url = new URL(`${this.baseUrl}/${this.apiVersion}/me/accounts`);
+    url.searchParams.set("fields", "id,name,access_token");
+    url.searchParams.set("access_token", userAccessToken);
+    const res = await this.fetchFn(url.toString());
+    const json = (await res.json().catch(() => ({}))) as {
+      data?: Array<{ id?: string; name?: string; access_token?: string }>;
+    } & GraphErrorBodyShape;
+    if (!res.ok) throw mapGraphError(json, res.status, "messenger");
+    return (json.data ?? [])
+      .filter((p) => p.id && p.access_token)
+      .map((p) => ({ id: String(p.id), name: p.name ?? String(p.id), accessToken: p.access_token! }));
   }
 
   async refreshTokenIfNeeded(): Promise<{ refreshed: boolean }> {

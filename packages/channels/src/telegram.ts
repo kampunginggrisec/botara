@@ -82,6 +82,23 @@ export class TelegramAdapter implements ChannelAdapter {
     return json.result as T;
   }
 
+  /**
+   * Public bot identity for the connect flow (API layer): validates the
+   * configured token against getMe and returns the bot's id + username.
+   * Throws ProviderApiError (401) for an invalid token.
+   */
+  async describeBot(): Promise<{ id: number; username?: string; firstName?: string }> {
+    return this.call<{ id: number; username?: string; first_name?: string }>(
+      { id: "", externalId: "" },
+      "getMe",
+    ).then((me) => ({ id: me.id, username: me.username, firstName: me.first_name }));
+  }
+
+  /** Register the webhook with an EXPLICIT token (connect flow, pre-vault). */
+  async setWebhookWithToken(input: { url: string; secretToken?: string }): Promise<{ ok: true }> {
+    return this.setWebhook({ id: "", externalId: "" }, input);
+  }
+
   // --- account lifecycle ---------------------------------------------------
 
   async connect(input: { workspaceId: string }): Promise<ChannelAccountRef> {
