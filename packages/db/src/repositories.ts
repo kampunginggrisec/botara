@@ -417,6 +417,12 @@ export async function getChannelAccount(
   return row ?? null;
 }
 
+/** Worker-side lookup: jobs carry only the account id, not the workspace. */
+export async function getChannelAccountById(db: Database, id: string): Promise<ChannelAccountRow | null> {
+  const [row] = await db.select().from(channelAccounts).where(eq(channelAccounts.id, id)).limit(1);
+  return row ?? null;
+}
+
 export async function listChannelAccounts(db: Database, workspaceId: string): Promise<ChannelAccountRow[]> {
   return db
     .select()

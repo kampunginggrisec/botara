@@ -59,6 +59,7 @@
         "@botara/config": "workspace:*",
         "@botara/db": "workspace:*",
         "@botara/flow-engine": "workspace:*",
+        "@botara/media": "workspace:*",
         "@botara/shared": "workspace:*",
         "bullmq": "^5.34.0",
         "ioredis": "^5.4.0",

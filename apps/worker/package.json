@@ -17,6 +17,7 @@
     "@botara/db": "workspace:*",
     "@botara/channels": "workspace:*",
     "@botara/billing": "workspace:*",
-    "@botara/flow-engine": "workspace:*"
+    "@botara/flow-engine": "workspace:*",
+    "@botara/media": "workspace:*"
   }
 }
