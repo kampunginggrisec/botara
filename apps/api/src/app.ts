@@ -928,7 +928,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       const body = await readJsonBody(c).catch(() => ({}));
       if (typeof body.signed_request === "string") signedRequest = body.signed_request;
     } else {
-      const form = await c.req.parseBody().catch(() => ({} as Record<string, unknown>));
+      const form = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>;
       if (typeof form.signed_request === "string") signedRequest = form.signed_request;
     }
     if (!signedRequest) {
