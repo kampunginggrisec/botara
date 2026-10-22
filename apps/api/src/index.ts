@@ -1,40 +1,20 @@
-import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
+import { createApp, defaultDeps } from "./app";
 
 /**
- * Botara API - Fase 0 entrypoint (Bun runtime; Bun-specific serving is
- * allowed here in apps/*, packages stay runtime-agnostic).
+ * Botara API entrypoint (Bun runtime). All route logic lives in app.ts
+ * (createApp with injectable deps, used by tests and the smoke check);
+ * this file only wires the production defaults and serves.
  *
- * Routes:
- *   GET /health  -> { status: "ok", service: "api" }
- *   GET /doc     -> OpenAPI JSON
- *   GET /        -> service banner
+ * Routes (Fase 1):
+ *   GET  /health, GET /doc (OpenAPI)
+ *   GET+POST /webhooks/whatsapp, POST /webhooks/telegram
+ *   GET  /conversations, GET /conversations/:id/messages, POST /conversations/:id/reply
+ *   GET/POST /contacts, PATCH /contacts/:id, GET /segments
+ *   GET/POST /templates, PATCH /templates/:id/category
+ *   POST /broadcasts/estimate (pure, no DB), POST /broadcasts, GET /broadcasts/:id
  */
 
-const HealthResponse = z
-  .object({ status: z.literal("ok"), service: z.literal("api") })
-  .openapi("HealthResponse");
-
-const app = new OpenAPIHono();
-
-const healthRoute = createRoute({
-  method: "get",
-  path: "/health",
-  responses: {
-    200: {
-      description: "Service health",
-      content: { "application/json": { schema: HealthResponse } },
-    },
-  },
-});
-
-app.openapi(healthRoute, (c) => c.json({ status: "ok" as const, service: "api" as const }));
-
-app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 0 scaffold" }));
-
-app.doc("/doc", {
-  openapi: "3.0.0",
-  info: { title: "Botara API", version: "0.0.0", description: "Omnichannel chatbot platform API (Fase 0)" },
-});
+const app = createApp(defaultDeps());
 
 const port = Number(process.env.PORT_API ?? process.env.PORT ?? 3000);
 console.log(`[api] listening on http://localhost:${port} (health: /health, openapi: /doc)`);
