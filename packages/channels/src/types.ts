@@ -65,24 +65,58 @@ export const CHANNEL_CAPABILITIES: Record<ChannelKey, CapabilitySet> = {
   },
 };
 
+/** Media attached to a message, normalized across providers. */
+export interface MessageMedia {
+  type: "image" | "video" | "document" | "audio" | "sticker" | "photo" | "unknown";
+  /** Provider media id (e.g. WhatsApp media id, Telegram file_id). */
+  id?: string;
+  caption?: string;
+  mimeType?: string;
+  filename?: string;
+}
+
+export interface MessageStatusError {
+  code: number;
+  title?: string;
+  message?: string;
+}
+
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
-  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; receivedAt: string }
+  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string }
+  | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; receivedAt: string }
   | { type: "comment.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId: string; text?: string; receivedAt: string }
   | { type: "mention.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; receivedAt: string }
-  | { type: "message.status"; channel: ChannelKey; messageExternalId: string; status: "sent" | "delivered" | "read" | "failed"; receivedAt: string }
-  | { type: "template.category_changed"; channel: ChannelKey; templateExternalId: string; newCategory: string; receivedAt: string };
+  | { type: "message.status"; channel: ChannelKey; accountExternalId?: string; messageExternalId: string; status: "sent" | "delivered" | "read" | "failed"; errors?: MessageStatusError[]; receivedAt: string }
+  | { type: "template.category_changed"; channel: ChannelKey; templateExternalId: string; templateName?: string; language?: string; previousCategory?: string; newCategory: string; receivedAt: string };
 
 export interface ChannelAccountRef {
   id: string;
   externalId: string;
   authMode?: string;
+  /** Opaque pointer into the credential vault (channel_accounts.token_vault_ref). */
+  tokenVaultRef?: string;
+}
+
+export interface SendTemplateInput {
+  name: string;
+  language: string;
+  /**
+   * The template's LATEST provider category (DB owns this via
+   * templates.latest_category). WhatsApp routing depends on it: "marketing"
+   * goes to the Marketing Messages API, everything else to /messages.
+   * Callers must pass it explicitly - adapters never guess.
+   */
+  latestCategory: string;
+  components?: unknown[];
 }
 
 export interface SendInput {
   account: ChannelAccountRef;
   toExternalId: string;
   text?: string;
+  media?: MessageMedia & { link?: string };
+  template?: SendTemplateInput;
   templateName?: string;
   /** REQUIRED: providers are called with this key so retries never double-send. */
   idempotencyKey: string;
@@ -128,4 +162,36 @@ export interface ChannelAdapter {
   /** Normalize a raw provider webhook payload into standardized events. */
   parseWebhook(payload: unknown): Promise<InboundEvent[]>;
   health(): Promise<AdapterHealth>;
+}
+
+/**
+ * Secrets an adapter needs for one account, resolved at call time.
+ * Raw tokens are NEVER stored on channel_accounts rows and NEVER logged;
+ * the row only carries `tokenVaultRef`, an opaque pointer into the vault.
+ */
+export interface ChannelSecrets {
+  /** Meta user/system access token, or generic bearer token. */
+  accessToken?: string;
+  /** Telegram bot token. */
+  botToken?: string;
+  /** Meta app secret, used for webhook signature verification. */
+  appSecret?: string;
+}
+
+/**
+ * Resolves the secrets for an account from its tokenVaultRef.
+ * Implementations: a real vault/KMS in production, env vars in dev
+ * (see EnvCredentialProvider), in-memory maps in tests.
+ */
+export interface CredentialProvider {
+  resolve(account: ChannelAccountRef): Promise<ChannelSecrets>;
+}
+
+/** fetch-compatible function, injected into adapters so tests can mock HTTP. */
+export type FetchLike = (input: string | URL, init?: RequestInit) => Promise<Response>;
+
+/** Options shared by the real (Fase 1) adapters. */
+export interface RealAdapterOptions {
+  credentials: CredentialProvider;
+  fetchFn?: FetchLike;
 }

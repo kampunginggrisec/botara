@@ -1,0 +1,397 @@
+import { createHmac, timingSafeEqual } from "node:crypto";
+import { AppError, NotImplementedError } from "@botara/shared";
+import {
+  MarketingPausedError, ProviderApiError, ProviderAuthError, ProviderRateLimitError,
+  TemplateCategoryMismatchError,
+} from "./errors";
+import {
+  CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
+  type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
+  type PublishInput, type SendInput, type SendResult,
+} from "./types";
+
+/**
+ * WhatsApp Cloud API adapter (Fase 1 - real).
+ *
+ * Design points from the blueprint / ADR-008:
+ * - Graph API version is PINNED (default v26.0, overridable per deployment).
+ * - Template sends route by the template's LATEST category:
+ *     marketing            -> POST /{phone-number-id}/marketing_messages
+ *     utility/auth/etc.    -> POST /{phone-number-id}/messages
+ *   (Cloud API marketing sunsets 2027-10-13; new accounts lose it 2027-04-13.)
+ * - Access tokens come from the injected CredentialProvider keyed by the
+ *   account's tokenVaultRef. They are never logged, never persisted here.
+ */
+
+export interface WhatsAppAdapterOptions {
+  credentials: CredentialProvider;
+  fetchFn?: FetchLike;
+  graphVersion?: string;
+  baseUrl?: string;
+}
+
+export type WhatsAppRoute = "messages" | "marketing_messages";
+
+/** Pure routing decision - the heart of ADR-008. */
+export function routeForTemplateCategory(latestCategory: string | undefined | null): WhatsAppRoute {
+  return (latestCategory ?? "").toLowerCase() === "marketing" ? "marketing_messages" : "messages";
+}
+
+interface GraphErrorBody {
+  error?: {
+    message?: string;
+    type?: string;
+    code?: number;
+    error_subcode?: number;
+    fbtrace_id?: string;
+  };
+}
+
+/** Map a Graph API error payload onto the shared taxonomy. Exported for tests. */
+export function mapWhatsAppError(
+  body: GraphErrorBody,
+  httpStatus: number,
+  attemptedRoute?: WhatsAppRoute,
+): ProviderApiError {
+  const e = body.error ?? {};
+  const details = {
+    provider: "whatsapp",
+    providerCode: e.code,
+    providerSubcode: e.error_subcode,
+    fbtraceId: e.fbtrace_id,
+    retryable: httpStatus >= 500,
+  };
+  const message = e.message ?? `WhatsApp Graph API error (HTTP ${httpStatus})`;
+  switch (e.code) {
+    case 131063:
+      return new TemplateCategoryMismatchError(message, {
+        ...details, retryable: false, attemptedRoute: attemptedRoute ?? "messages",
+      });
+    case 131049:
+      return new MarketingPausedError(message, details);
+    case 130429: // messaging throughput limit
+    case 80007: // account-level rate limit
+    case 4: // app-level rate limit
+      return new ProviderRateLimitError(message, details);
+    case 190:
+      return new ProviderAuthError(message, details);
+    default:
+      return new ProviderApiError(message, details);
+  }
+}
+
+/**
+ * Verify an X-Hub-Signature-256 header against the raw request body.
+ * MUST be called with the exact raw bytes Meta sent (before JSON parsing).
+ */
+export function verifyWebhookSignature(
+  rawBody: string | Uint8Array,
+  signatureHeader: string | null | undefined,
+  appSecret: string,
+): boolean {
+  if (!signatureHeader || !appSecret) return false;
+  const expected = "sha256=" + createHmac("sha256", appSecret).update(rawBody).digest("hex");
+  const a = Buffer.from(expected);
+  const b = Buffer.from(signatureHeader);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** GET webhook verification (hub.mode / hub.verify_token / hub.challenge). */
+export function verifyWebhookChallenge(
+  params: { mode?: string | null; token?: string | null; challenge?: string | null },
+  expectedVerifyToken: string | undefined,
+): string | null {
+  if (!expectedVerifyToken) return null;
+  if (params.mode === "subscribe" && params.token === expectedVerifyToken && params.challenge) {
+    return params.challenge;
+  }
+  return null;
+}
+
+const isoFromEpochSeconds = (ts: unknown): string =>
+  new Date((typeof ts === "string" ? Number(ts) : (ts as number)) * 1000).toISOString();
+
+export class WhatsAppAdapter implements ChannelAdapter {
+  readonly key = "whatsapp" as const;
+  readonly apiVersion: string;
+  readonly capabilities = CHANNEL_CAPABILITIES.whatsapp;
+
+  private readonly credentials: CredentialProvider;
+  private readonly fetchFn: FetchLike;
+  private readonly baseUrl: string;
+
+  constructor(options: WhatsAppAdapterOptions) {
+    this.credentials = options.credentials;
+    this.fetchFn = options.fetchFn ?? ((input, init) => fetch(input, init));
+    this.apiVersion = options.graphVersion ?? "v26.0";
+    this.baseUrl = (options.baseUrl ?? "https://graph.facebook.com").replace(/\/$/, "");
+  }
+
+  // --- account lifecycle -------------------------------------------------
+
+  async connect(): Promise<ChannelAccountRef> {
+    // Onboarding is Embedded Signup v4, an API-layer browser flow that ends
+    // with a provisioned channel_accounts row - not an adapter call.
+    throw new NotImplementedError("whatsapp.connect (Embedded Signup onboarding provisions accounts at the API layer)");
+  }
+
+  async disconnect(): Promise<void> {
+    // The credential lives in the vault; Fase 1 has no provider-side
+    // deregistration (deregistering a number is destructive and out of scope).
+  }
+
+  async refreshTokenIfNeeded(): Promise<{ refreshed: boolean }> {
+    // WhatsApp Cloud API uses long-lived system-user tokens; nothing rotates
+    // on a schedule. Health checks surface dead tokens via error 190 instead.
+    return { refreshed: false };
+  }
+
+  async health(account?: ChannelAccountRef): Promise<AdapterHealth> {
+    if (!account) return { ok: false, detail: "whatsapp: an account is required for a health check" };
+    const secrets = await this.credentials.resolve(account);
+    return secrets.accessToken
+      ? { ok: true, detail: `whatsapp adapter ready (Graph ${this.apiVersion})` }
+      : { ok: false, detail: "whatsapp: no access token resolvable for this account (vault/env)" };
+  }
+
+  // --- sending -------------------------------------------------------------
+
+  private async tokenFor(account: ChannelAccountRef): Promise<string> {
+    const secrets = await this.credentials.resolve(account);
+    if (!secrets.accessToken) {
+      throw new AppError(
+        "CONFIGURATION",
+        "WhatsApp access token is not configured for this account (credential provider returned none)",
+        { status: 503 },
+      );
+    }
+    return secrets.accessToken;
+  }
+
+  private async graphPost(
+    account: ChannelAccountRef,
+    path: string,
+    body: Record<string, unknown>,
+    attemptedRoute?: WhatsAppRoute,
+  ): Promise<Record<string, unknown>> {
+    const token = await this.tokenFor(account);
+    const res = await this.fetchFn(`${this.baseUrl}/${this.apiVersion}/${path}`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphErrorBody & Record<string, unknown>;
+    if (!res.ok || json.error) throw mapWhatsAppError(json, res.status, attemptedRoute);
+    return json;
+  }
+
+  private async graphGet(account: ChannelAccountRef, path: string): Promise<Record<string, unknown>> {
+    const token = await this.tokenFor(account);
+    const res = await this.fetchFn(`${this.baseUrl}/${this.apiVersion}/${path}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphErrorBody & Record<string, unknown>;
+    if (!res.ok || json.error) throw mapWhatsAppError(json, res.status);
+    return json;
+  }
+
+  async send(input: SendInput): Promise<SendResult> {
+    const phoneNumberId = input.account.externalId;
+    let route: WhatsAppRoute = "messages";
+    let body: Record<string, unknown>;
+
+    if (input.template) {
+      route = routeForTemplateCategory(input.template.latestCategory);
+      body = {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: input.toExternalId,
+        type: "template",
+        template: {
+          name: input.template.name,
+          language: { code: input.template.language },
+          ...(input.template.components ? { components: input.template.components } : {}),
+        },
+      };
+    } else if (input.media) {
+      const type = input.media.type === "photo" ? "image" : input.media.type;
+      const mediaObj: Record<string, unknown> = {};
+      if (input.media.id) mediaObj.id = input.media.id;
+      else if (input.media.link) mediaObj.link = input.media.link;
+      if (input.media.caption && (type === "image" || type === "video" || type === "document")) {
+        mediaObj.caption = input.media.caption;
+      }
+      if (input.media.filename && type === "document") mediaObj.filename = input.media.filename;
+      body = { messaging_product: "whatsapp", recipient_type: "individual", to: input.toExternalId, type, [type]: mediaObj };
+    } else if (input.text !== undefined) {
+      body = {
+        messaging_product: "whatsapp",
+        recipient_type: "individual",
+        to: input.toExternalId,
+        type: "text",
+        text: { body: input.text },
+      };
+    } else {
+      throw new AppError("VALIDATION", "whatsapp.send requires text, media, or a template");
+    }
+
+    const json = await this.graphPost(input.account, `${phoneNumberId}/${route}`, body, route);
+    const messages = json.messages as Array<{ id?: string }> | undefined;
+    const externalMessageId = messages?.[0]?.id;
+    if (!externalMessageId) {
+      throw new ProviderApiError("WhatsApp send returned no message id", {
+        provider: "whatsapp", retryable: false,
+      });
+    }
+    return { externalMessageId, status: "sent" };
+  }
+
+  // --- media ---------------------------------------------------------------
+
+  /** Upload media to Meta; returns the media id usable in send(). */
+  async uploadMedia(
+    account: ChannelAccountRef,
+    file: { data: Blob | Uint8Array | ArrayBuffer; mimeType: string; filename?: string },
+  ): Promise<{ mediaId: string }> {
+    const token = await this.tokenFor(account);
+    const blob = file.data instanceof Blob
+      ? file.data
+      : new Blob(
+          [file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data)],
+          { type: file.mimeType },
+        );
+    const form = new FormData();
+    form.set("messaging_product", "whatsapp");
+    form.set("type", file.mimeType);
+    form.set("file", blob, file.filename ?? "upload");
+    const res = await this.fetchFn(`${this.baseUrl}/${this.apiVersion}/${account.externalId}/media`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphErrorBody & { id?: string };
+    if (!res.ok || json.error) throw mapWhatsAppError(json, res.status);
+    if (!json.id) throw new ProviderApiError("WhatsApp media upload returned no id", { provider: "whatsapp", retryable: false });
+    return { mediaId: json.id };
+  }
+
+  /** Resolve a media id to its (short-lived, auth-required) download URL + metadata. */
+  async fetchMediaUrl(account: ChannelAccountRef, mediaId: string): Promise<{ url: string; mimeType?: string; fileSize?: number }> {
+    const json = await this.graphGet(account, mediaId);
+    return {
+      url: json.url as string,
+      mimeType: json.mime_type as string | undefined,
+      fileSize: json.file_size as number | undefined,
+    };
+  }
+
+  /** Download media bytes. The URL from fetchMediaUrl requires the same bearer token. */
+  async downloadMedia(
+    account: ChannelAccountRef,
+    mediaId: string,
+  ): Promise<{ data: ArrayBuffer; mimeType?: string; fileSize?: number }> {
+    const meta = await this.fetchMediaUrl(account, mediaId);
+    const token = await this.tokenFor(account);
+    const res = await this.fetchFn(meta.url, { headers: { Authorization: `Bearer ${token}` } });
+    if (!res.ok) {
+      throw new ProviderApiError(`WhatsApp media download failed (HTTP ${res.status})`, {
+        provider: "whatsapp", retryable: res.status >= 500,
+      });
+    }
+    return { data: await res.arrayBuffer(), mimeType: meta.mimeType, fileSize: meta.fileSize };
+  }
+
+  // --- webhooks --------------------------------------------------------------
+
+  async parseWebhook(payload: unknown): Promise<InboundEvent[]> {
+    const events: InboundEvent[] = [];
+    const root = payload as { entry?: Array<Record<string, unknown>> } | null;
+    for (const entry of root?.entry ?? []) {
+      const changes = (entry.changes as Array<Record<string, unknown>> | undefined) ?? [];
+      for (const change of changes) {
+        const value = (change.value ?? {}) as Record<string, any>;
+        const accountExternalId: string =
+          value.metadata?.phone_number_id ?? (entry.id as string) ?? "";
+        const field = change.field as string;
+
+        if (field === "message_template_category_update") {
+          events.push({
+            type: "template.category_changed",
+            channel: "whatsapp",
+            templateExternalId: String(value.message_template_id ?? ""),
+            templateName: value.message_template_name,
+            language: value.message_template_language,
+            previousCategory: typeof value.previous_category === "string" ? value.previous_category.toLowerCase() : undefined,
+            newCategory: String(value.new_category ?? "").toLowerCase(),
+            receivedAt: new Date().toISOString(),
+          });
+          continue;
+        }
+
+        if (field === "smb_message_echoes" || field === "messages") {
+          for (const echo of (value.message_echoes as Array<Record<string, any>> | undefined) ?? []) {
+            events.push({
+              type: "message.echo",
+              channel: "whatsapp",
+              accountExternalId,
+              contactExternalId: String(echo.to ?? ""),
+              messageExternalId: String(echo.id ?? ""),
+              text: echo.text?.body,
+              receivedAt: isoFromEpochSeconds(echo.timestamp),
+            });
+          }
+        }
+
+        if (field !== "messages") continue;
+
+        for (const msg of (value.messages as Array<Record<string, any>> | undefined) ?? []) {
+          const base = {
+            channel: "whatsapp" as const,
+            accountExternalId,
+            contactExternalId: String(msg.from ?? ""),
+            messageExternalId: String(msg.id ?? ""),
+            receivedAt: isoFromEpochSeconds(msg.timestamp),
+          };
+          if (msg.type === "text") {
+            events.push({ type: "message.received", ...base, text: msg.text?.body });
+          } else if (["image", "video", "document", "audio", "sticker"].includes(msg.type)) {
+            const m = (msg[msg.type] ?? {}) as Record<string, any>;
+            const media: MessageMedia = {
+              type: msg.type,
+              id: m.id,
+              caption: m.caption,
+              mimeType: m.mime_type,
+              filename: m.filename,
+            };
+            events.push({ type: "message.received", ...base, media, ...(m.caption ? { text: m.caption } : {}) });
+          } else {
+            events.push({ type: "message.received", ...base });
+          }
+        }
+
+        for (const st of (value.statuses as Array<Record<string, any>> | undefined) ?? []) {
+          events.push({
+            type: "message.status",
+            channel: "whatsapp",
+            accountExternalId,
+            messageExternalId: String(st.id ?? ""),
+            status: st.status,
+            errors: Array.isArray(st.errors)
+              ? st.errors.map((err: Record<string, any>) => ({
+                  code: err.code,
+                  title: err.title,
+                  message: err.error_data?.details ?? err.message,
+                }))
+              : undefined,
+            receivedAt: isoFromEpochSeconds(st.timestamp),
+          });
+        }
+      }
+    }
+    return events;
+  }
+
+  async publish(_input: PublishInput): Promise<{ externalPostId: string }> {
+    throw new NotImplementedError("whatsapp.publish (WhatsApp has no post publishing surface)");
+  }
+}
