@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import type { Context, Next } from "hono";
 import { Queue } from "bullmq";
@@ -6,15 +7,31 @@ import { AppError, evaluateReplyWindow, MessagingWindowClosedError } from "@bota
 import {
   getDb, listContacts, createContact, updateContact, segmentCounts,
   listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
+  touchConversationLastUserMessage,
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
-  getChannelAccount, getTemplate, type Database,
+  getChannelAccount, getTemplate, listChannelAccounts, createChannelAccount,
+  applyTemplateCategoryChange,
+  findOrCreateWebchatAccount, createConversation as createConversationRow,
+  createWebchatSession, getWebchatSessionByToken, touchWebchatSession,
+  createScheduledPost, listScheduledPosts, getScheduledPost, updateScheduledPost, deleteScheduledPost,
+  createSequence, listSequences, getSequence, updateSequence, createEnrollment,
+  type Database, type ScheduledPostTarget, type SequenceStep,
 } from "@botara/db";
 import {
-  getAdapter, verifyWebhookChallenge, verifyWebhookSignature,
+  getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
+  WebchatAdapter, CHANNEL_CAPABILITIES,
   type ChannelKey, type InboundEvent,
 } from "@botara/channels";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
+import {
+  createAIProviderFromEnv, moderateText, DEFAULT_AI_MODEL, type AIProvider,
+} from "@botara/ai";
+import {
+  InMemoryVault, exchangeEmbeddedSignup,
+  type EmbeddedSignupInput, type EmbeddedSignupResult,
+} from "./whatsapp-onboarding";
+import { createDbWebchatStore } from "./webchat-store";
 
 /**
  * Botara API - Fase 1.
@@ -49,11 +66,31 @@ export interface BroadcastEnqueuer {
   enqueueBroadcast(broadcastId: string): Promise<void>;
 }
 
+/** Enqueues a publish job for one scheduled post. */
+export interface PublishEnqueuer {
+  enqueuePublish(postId: string): Promise<void>;
+}
+
+/**
+ * Applies a WhatsApp template category-change event to the templates table
+ * (latest_category + messaging account id). A port so webhook tests can use
+ * a fake repository instead of a live Postgres.
+ */
+export interface TemplateCategoryUpdater {
+  applyCategoryChange(event: Extract<InboundEvent, { type: "template.category_changed" }>): Promise<void>;
+}
+
 export interface ApiDeps {
   /** Returns the DB or throws AppError CONFIGURATION (503) when unconfigured. */
   getDatabase: () => Database;
   eventSink: WebhookEventSink;
   broadcastEnqueuer: BroadcastEnqueuer;
+  publishEnqueuer: PublishEnqueuer;
+  templateCategoryUpdater: TemplateCategoryUpdater;
+  /** Embedded Signup v4 code exchange (Graph calls + vault + persistence). */
+  whatsappOnboarding: (workspaceId: string, input: EmbeddedSignupInput) => Promise<EmbeddedSignupResult>;
+  /** The configured AI provider, or null - routes answer 503, never fake. */
+  getAiProvider: () => AIProvider | null;
   env: Record<string, string | undefined>;
 }
 
@@ -68,13 +105,20 @@ export function defaultGetDatabase(): Database {
   return getDb(process.env.DATABASE_URL);
 }
 
+/** BullMQ job ids cannot contain ":" - the canonical key is sanitized for jobId use only. */
+const jobIdFor = (idempotencyKey: string) => idempotencyKey.replace(/:/g, "_");
+
 /**
- * Production broadcast enqueuer: BullMQ on Redis. Fails fast and honestly -
- * when Redis is unreachable the caller gets a 503, never a fake success.
+ * Generic BullMQ enqueuer: fails fast and honestly - when Redis is
+ * unreachable the caller gets a 503, never a fake success.
  */
-export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueuer {
+export function createBullMqEnqueuer(
+  redisUrl: string,
+  queueName: string,
+  jobName: string,
+): { enqueue(data: Record<string, unknown>, jobId: string): Promise<void> } {
   return {
-    async enqueueBroadcast(broadcastId: string): Promise<void> {
+    async enqueue(data: Record<string, unknown>, jobId: string): Promise<void> {
       const connection = new IORedis(redisUrl, {
         maxRetriesPerRequest: 1,
         connectTimeout: 2000,
@@ -82,9 +126,9 @@ export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueu
         retryStrategy: () => null,
       });
       connection.on("error", () => { /* surfaced via the raced add() below */ });
-      const queue = new Queue("broadcast", { connection });
+      const queue = new Queue(queueName, { connection });
       try {
-        const add = queue.add("broadcast", { broadcastId }, { jobId: `broadcast:${broadcastId}` });
+        const add = queue.add(jobName, data, { jobId: jobIdFor(jobId) });
         const timeout = new Promise<never>((_, reject) =>
           setTimeout(() => reject(new Error("redis enqueue timed out")), 3000),
         );
@@ -92,7 +136,7 @@ export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueu
       } catch (err) {
         throw new AppError(
           "CONFIGURATION",
-          `Broadcast queue (Redis) is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          `${queueName} queue (Redis) is unavailable: ${err instanceof Error ? err.message : String(err)}`,
           { status: 503 },
         );
       } finally {
@@ -103,11 +147,62 @@ export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueu
   };
 }
 
+/** Production broadcast enqueuer: BullMQ on Redis. */
+export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "broadcast", "broadcast");
+  return {
+    enqueueBroadcast: (broadcastId) => inner.enqueue({ broadcastId }, `broadcast:${broadcastId}`),
+  };
+}
+
+export function createBullMqPublishEnqueuer(redisUrl: string): PublishEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "publish", "publish");
+  return {
+    enqueuePublish: (postId) => inner.enqueue({ postId }, `publish:${postId}`),
+  };
+}
+
+/** Default template-category updater: the Drizzle repository behind the DB getter. */
+export function createDbTemplateCategoryUpdater(getDatabase: () => Database): TemplateCategoryUpdater {
+  return {
+    async applyCategoryChange(event) {
+      const db = getDatabase();
+      await applyTemplateCategoryChange(db, {
+        templateExternalId: event.templateExternalId,
+        templateName: event.templateName,
+        newCategory: event.newCategory,
+        messagingAccountId: event.accountExternalId,
+      });
+    },
+  };
+}
+
 export function defaultDeps(): ApiDeps {
+  const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
+  const vault = new InMemoryVault();
   return {
     getDatabase: defaultGetDatabase,
     eventSink: logEventSink,
-    broadcastEnqueuer: createBullMqBroadcastEnqueuer(process.env.REDIS_URL ?? "redis://localhost:6379"),
+    broadcastEnqueuer: createBullMqBroadcastEnqueuer(redisUrl),
+    publishEnqueuer: createBullMqPublishEnqueuer(redisUrl),
+    templateCategoryUpdater: createDbTemplateCategoryUpdater(defaultGetDatabase),
+    whatsappOnboarding: (workspaceId, input) =>
+      exchangeEmbeddedSignup(
+        {
+          fetchFn: (url, init) => fetch(url, init),
+          graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+          appId: process.env.META_APP_ID,
+          appSecret: process.env.META_APP_SECRET,
+          vault,
+          async persistAccount(persistInput) {
+            const row = await createChannelAccount(defaultGetDatabase(), persistInput);
+            return { id: row.id };
+          },
+        },
+        workspaceId,
+        input,
+      ),
+    getAiProvider: () => createAIProviderFromEnv(process.env),
     env: process.env,
   };
 }
@@ -172,7 +267,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Service health", content: { "application/json": { schema: z.object({ status: z.literal("ok"), service: z.literal("api") }) } } } },
   });
   app.openapi(healthRoute, (c) => c.json({ status: "ok" as const, service: "api" as const }));
-  app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 1" }));
+  app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 2" }));
 
   // ------------------------------------------------------------ webhooks
   // Webhooks are provider-facing: no workspace header, no DB. Auth is the
@@ -205,6 +300,22 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
     }
     const events = await getAdapter("whatsapp").parseWebhook(payload);
+    // Fase 2 wiring: template category changes are APPLIED, not just logged -
+    // templates.latest_category (+ the WABA/messaging account id) is patched
+    // so subsequent sends route by the newest category. Failures are logged
+    // for ops but never fail the webhook (the PATCH is idempotent; Meta
+    // redelivery would simply re-apply it).
+    for (const event of events) {
+      if (event.type === "template.category_changed") {
+        try {
+          await deps.templateCategoryUpdater.applyCategoryChange(event);
+        } catch (err) {
+          console.error(
+            `[api] template category update failed for ${event.templateExternalId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
+    }
     await deps.eventSink.handle(events);
     return c.json({ received: true, events: events.length });
   });
@@ -216,6 +327,91 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     }
     const payload = await readJsonBody(c);
     const events = await getAdapter("telegram").parseWebhook(payload);
+    await deps.eventSink.handle(events);
+    return c.json({ received: true, events: events.length });
+  });
+
+  // ------------------------------------------------- Fase 2 channel webhooks
+  // Instagram / Messenger share the Meta hub verification + HMAC scheme;
+  // Threads uses its own app secret; Resend uses Svix signatures.
+
+  const metaVerifyToken = () => deps.env.META_VERIFY_TOKEN ?? deps.env.WHATSAPP_VERIFY_TOKEN;
+
+  for (const channel of ["instagram", "messenger"] as const) {
+    app.get(`/webhooks/${channel}`, (c) => {
+      const challenge = verifyWebhookChallenge(
+        {
+          mode: c.req.query("hub.mode"),
+          token: c.req.query("hub.verify_token"),
+          challenge: c.req.query("hub.challenge"),
+        },
+        metaVerifyToken(),
+      );
+      if (!challenge) throw new AppError("FORBIDDEN", `${channel} webhook verification failed.`, { status: 403 });
+      return c.text(challenge);
+    });
+    app.post(`/webhooks/${channel}`, async (c) => {
+      const raw = await c.req.text();
+      const appSecret = deps.env.META_APP_SECRET;
+      if (appSecret && !verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret)) {
+        throw new AppError("UNAUTHORIZED", `Invalid X-Hub-Signature-256 (${channel}).`, { status: 401 });
+      }
+      let payload: unknown;
+      try { payload = JSON.parse(raw); } catch {
+        throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
+      }
+      const events = await getAdapter(channel).parseWebhook(payload);
+      await deps.eventSink.handle(events);
+      return c.json({ received: true, events: events.length });
+    });
+  }
+
+  app.get("/webhooks/threads", (c) => {
+    const challenge = verifyWebhookChallenge(
+      {
+        mode: c.req.query("hub.mode"),
+        token: c.req.query("hub.verify_token"),
+        challenge: c.req.query("hub.challenge"),
+      },
+      deps.env.THREADS_VERIFY_TOKEN ?? metaVerifyToken(),
+    );
+    if (!challenge) throw new AppError("FORBIDDEN", "threads webhook verification failed.", { status: 403 });
+    return c.text(challenge);
+  });
+
+  app.post("/webhooks/threads", async (c) => {
+    const raw = await c.req.text();
+    const appSecret = deps.env.THREADS_APP_SECRET ?? deps.env.META_APP_SECRET;
+    if (appSecret && !verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret)) {
+      throw new AppError("UNAUTHORIZED", "Invalid X-Hub-Signature-256 (threads).", { status: 401 });
+    }
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch {
+      throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
+    }
+    const events = await getAdapter("threads").parseWebhook(payload);
+    await deps.eventSink.handle(events);
+    return c.json({ received: true, events: events.length });
+  });
+
+  app.post("/webhooks/resend", async (c) => {
+    const raw = await c.req.text();
+    const secret = deps.env.RESEND_WEBHOOK_SECRET;
+    if (secret) {
+      const ok = verifyResendWebhookSignature({
+        rawBody: raw,
+        svixId: c.req.header("svix-id"),
+        svixTimestamp: c.req.header("svix-timestamp"),
+        svixSignature: c.req.header("svix-signature"),
+        secret,
+      });
+      if (!ok) throw new AppError("UNAUTHORIZED", "Invalid Resend (Svix) webhook signature.", { status: 401 });
+    }
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch {
+      throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
+    }
+    const events = await getAdapter("email").parseWebhook(payload);
     await deps.eventSink.handle(events);
     return c.json({ received: true, events: events.length });
   });
@@ -258,7 +454,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (id) c.set("workspaceId", id);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences"]) {
     app.use(prefix, workspaceMiddleware);
     app.use(`${prefix}/*`, workspaceMiddleware);
   }
@@ -369,7 +565,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       idempotencyKey,
     });
 
-    const adapter = getAdapter(conversation.channel as ChannelKey);
+    // Webchat replies persist through the DB-backed store (the registry's
+    // webchat adapter has no store on purpose - it is wired here, where the
+    // request's DB lives).
+    const adapter = conversation.channel === "webchat"
+      ? new WebchatAdapter({ store: createDbWebchatStore(db) })
+      : getAdapter(conversation.channel as ChannelKey);
     try {
       const result = await adapter.send({
         account: {
@@ -626,11 +827,510 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     });
   });
 
+  // ------------------------------------------------------- AI (Fase 2)
+  const aiSuggestRoute = createRoute({
+    method: "post", path: "/conversations/{id}/ai-suggest",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "AI-suggested reply" } },
+  });
+  app.openapi(aiSuggestRoute, async (c) => {
+    const provider = deps.getAiProvider();
+    if (!provider) {
+      throw new AppError(
+        "CONFIGURATION",
+        "No AI provider is configured (AI_API_KEY); suggestions are unavailable and are never faked.",
+        { status: 503 },
+      );
+    }
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    const history = (await listMessages(db, id)).slice(-20);
+    const result = await provider.chatCompletion({
+      model: deps.env.AI_MODEL ?? DEFAULT_AI_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You help a customer-support agent. Draft a helpful, concise reply to the customer, " +
+            "in the same language as the conversation. Return only the reply text.",
+        },
+        ...(history.length > 0
+          ? history.map((m) => ({
+              role: (m.direction === "in" ? "user" : "assistant") as "user" | "assistant",
+              content: m.body ?? "",
+            }))
+          : [{ role: "user" as const, content: "(no prior messages)" }]),
+      ],
+    });
+    return c.json({ suggestion: result.text, model: result.model });
+  });
+
+  const moderationRoute = createRoute({
+    method: "post", path: "/moderation/check",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              text: z.string().min(1),
+              flagList: z.array(z.string()).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Keyword moderation result" } },
+  });
+  app.openapi(moderationRoute, (c) => {
+    const body = c.req.valid("json");
+    const result = moderateText(body.text, body.flagList);
+    return c.json({ ...result });
+  });
+
+  // ---------------------------------------------------- channels (Fase 2)
+  const listAccountsRoute = createRoute({
+    method: "get", path: "/channels/accounts",
+    responses: { 200: { description: "Channel accounts of the workspace" } },
+  });
+  app.openapi(listAccountsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listChannelAccounts(db, ws);
+    return c.json({
+      accounts: rows.map((r) => {
+        const { tokenVaultRef: _vaultRef, ...safe } = r;
+        return {
+          ...safe,
+          hasCredential: Boolean(r.tokenVaultRef),
+          createdAt: iso(r.createdAt),
+          tokenExpiresAt: iso(r.tokenExpiresAt),
+        };
+      }),
+    });
+  });
+
+  const embeddedSignupRoute = createRoute({
+    method: "post", path: "/channels/whatsapp/embedded-signup/exchange",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              code: z.string().min(1),
+              sessionInfo: z.object({
+                wabaId: z.string().optional(),
+                phoneNumberId: z.string().optional(),
+                isCoexistence: z.boolean().optional(),
+              }).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "WhatsApp account(s) onboarded" } },
+  });
+  app.openapi(embeddedSignupRoute, async (c) => {
+    const ws = workspaceId(c);
+    const result = await deps.whatsappOnboarding(ws, c.req.valid("json"));
+    // The result summary carries no token material by construction.
+    return c.json({ result }, 201);
+  });
+
+  // ------------------------------------------------------ webchat (Fase 2)
+  // Public widget endpoints: the workspace comes from the PATH and the
+  // visitor authenticates with the session token - no X-Workspace-Id here.
+
+  const webchatHits = new Map<string, number[]>();
+  const WEBCHAT_MAX_MSGS_PER_MIN = 30;
+  function webchatRateOk(sessionId: string, now: Date): boolean {
+    const hits = (webchatHits.get(sessionId) ?? []).filter((t) => now.getTime() - t < 60_000);
+    if (hits.length >= WEBCHAT_MAX_MSGS_PER_MIN) return false;
+    hits.push(now.getTime());
+    webchatHits.set(sessionId, hits);
+    return true;
+  }
+
+  async function requireWebchatSession(c: Ctx, workspaceIdParam: string) {
+    const token = c.req.header("x-webchat-session");
+    if (!token) {
+      throw new AppError("UNAUTHORIZED", "Missing webchat session token (x-webchat-session header).", { status: 401 });
+    }
+    const db = deps.getDatabase();
+    const session = await getWebchatSessionByToken(db, token);
+    if (!session || session.workspaceId !== workspaceIdParam) {
+      throw new AppError("UNAUTHORIZED", "Invalid webchat session token.", { status: 401 });
+    }
+    return { db, session };
+  }
+
+  app.post("/public/webchat/:workspaceId/session", async (c) => {
+    const workspaceIdParam = c.req.param("workspaceId");
+    let visitorName: string | undefined;
+    try {
+      const body = (await c.req.json()) as { visitorName?: unknown };
+      if (typeof body?.visitorName === "string") visitorName = body.visitorName;
+    } catch { /* an empty body is fine */ }
+    const db = deps.getDatabase();
+    const account = await findOrCreateWebchatAccount(db, workspaceIdParam);
+    const sessionId = crypto.randomUUID();
+    const contact = await createContact(db, {
+      workspaceId: workspaceIdParam,
+      channel: "webchat",
+      externalId: `webchat-session:${sessionId}`,
+      displayName: visitorName,
+    });
+    const conversation = await createConversationRow(db, {
+      workspaceId: workspaceIdParam,
+      channelAccountId: account.id,
+      contactId: contact.id,
+    });
+    const token = randomBytes(32).toString("hex");
+    const session = await createWebchatSession(db, {
+      id: sessionId,
+      workspaceId: workspaceIdParam,
+      token,
+      contactId: contact.id,
+      conversationId: conversation.id,
+      visitorName,
+    });
+    return c.json({
+      sessionToken: session.token,
+      sessionId: session.id,
+      conversationId: session.conversationId,
+    }, 201);
+  });
+
+  app.post("/public/webchat/:workspaceId/messages", async (c) => {
+    const { db, session } = await requireWebchatSession(c, c.req.param("workspaceId"));
+    const body = await readJsonBody(c);
+    const text = typeof body.text === "string" ? body.text.trim() : "";
+    if (text.length < 1 || text.length > 2000) {
+      throw new AppError("VALIDATION", "Message text must be 1-2000 characters.", { status: 400 });
+    }
+    if (!webchatRateOk(session.id, new Date())) {
+      throw new AppError("RATE_LIMITED", "Too many messages - please slow down.", { status: 429 });
+    }
+    const now = new Date();
+    const message = await createMessage(db, {
+      conversationId: session.conversationId,
+      direction: "in",
+      type: "text",
+      body: text,
+      status: "delivered",
+    });
+    await touchConversationLastUserMessage(db, session.conversationId, now);
+    await touchWebchatSession(db, session.id, now);
+    return c.json({ message: { ...message, createdAt: iso(message.createdAt) } }, 201);
+  });
+
+  app.get("/public/webchat/:workspaceId/messages", async (c) => {
+    const { db, session } = await requireWebchatSession(c, c.req.param("workspaceId"));
+    const after = c.req.query("after");
+    const rows = await listMessages(db, session.conversationId);
+    const filtered = after
+      ? rows.filter((m) => m.createdAt.toISOString() > after)
+      : rows;
+    return c.json({
+      messages: filtered.map((m) => ({ ...m, createdAt: iso(m.createdAt) })),
+    });
+  });
+
+  // --------------------------------------------------- publishing (Fase 2)
+  const serializePost = (p: Awaited<ReturnType<typeof listScheduledPosts>>[number]) => ({
+    ...p,
+    createdAt: iso(p.createdAt),
+    scheduledAt: iso(p.scheduledAt),
+  });
+
+  const postTargetSchema = z.object({ channelAccountId: z.string().min(1) });
+
+  const createPostRoute = createRoute({
+    method: "post", path: "/posts",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              text: z.string().optional(),
+              mediaUrls: z.array(z.string().url()).optional(),
+              mediaKeys: z.array(z.string()).optional(),
+              targets: z.array(postTargetSchema).min(1),
+              scheduledAt: z.string().datetime().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Scheduled post created" } },
+  });
+  app.openapi(createPostRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    if (!body.text && (!body.mediaUrls || body.mediaUrls.length === 0)) {
+      throw new AppError("VALIDATION", "A post needs text or at least one media URL.", { status: 400 });
+    }
+    const targets: ScheduledPostTarget[] = [];
+    for (const t of body.targets) {
+      const account = await getChannelAccount(db, ws, t.channelAccountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", `Channel account ${t.channelAccountId} not found.`, { status: 404 });
+      }
+      targets.push({ channelAccountId: account.id, channel: account.channel });
+    }
+    const post = await createScheduledPost(db, {
+      workspaceId: ws,
+      text: body.text,
+      mediaUrls: body.mediaUrls,
+      mediaKeys: body.mediaKeys,
+      targets,
+      scheduledAt: body.scheduledAt ? new Date(body.scheduledAt) : null,
+      status: body.scheduledAt ? "scheduled" : "draft",
+    });
+    return c.json({ post: serializePost(post) }, 201);
+  });
+
+  const listPostsRoute = createRoute({
+    method: "get", path: "/posts",
+    request: { query: z.object({ status: z.string().optional() }) },
+    responses: { 200: { description: "Scheduled posts" } },
+  });
+  app.openapi(listPostsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listScheduledPosts(db, ws, { status: c.req.valid("query").status });
+    return c.json({ posts: rows.map(serializePost) });
+  });
+
+  const getPostRoute = createRoute({
+    method: "get", path: "/posts/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One scheduled post with per-target results" } },
+  });
+  app.openapi(getPostRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const post = await getScheduledPost(db, ws, c.req.valid("param").id);
+    if (!post) throw new AppError("NOT_FOUND", "Post not found.", { status: 404 });
+    return c.json({ post: serializePost(post) });
+  });
+
+  const patchPostRoute = createRoute({
+    method: "patch", path: "/posts/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              text: z.string().optional(),
+              mediaUrls: z.array(z.string().url()).optional(),
+              scheduledAt: z.string().datetime().nullable().optional(),
+              status: z.enum(["draft", "scheduled", "cancelled"]).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Scheduled post updated" } },
+  });
+  app.openapi(patchPostRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const existing = await getScheduledPost(db, ws, id);
+    if (!existing) throw new AppError("NOT_FOUND", "Post not found.", { status: 404 });
+    if (!["draft", "scheduled"].includes(existing.status)) {
+      throw new AppError("CONFLICT", `Post is ${existing.status} and can no longer be edited.`, { status: 409 });
+    }
+    await updateScheduledPost(db, id, {
+      text: body.text,
+      mediaUrls: body.mediaUrls,
+      scheduledAt: body.scheduledAt === undefined ? undefined : body.scheduledAt === null ? null : new Date(body.scheduledAt),
+      status: body.status,
+    });
+    const updated = await getScheduledPost(db, ws, id);
+    return c.json({ post: serializePost(updated!) });
+  });
+
+  const deletePostRoute = createRoute({
+    method: "delete", path: "/posts/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Scheduled post deleted" } },
+  });
+  app.openapi(deletePostRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const deleted = await deleteScheduledPost(db, ws, c.req.valid("param").id);
+    if (!deleted) throw new AppError("NOT_FOUND", "Post not found.", { status: 404 });
+    return c.json({ deleted: true });
+  });
+
+  const publishNowRoute = createRoute({
+    method: "post", path: "/posts/{id}/publish-now",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 202: { description: "Publish job enqueued" } },
+  });
+  app.openapi(publishNowRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const post = await getScheduledPost(db, ws, id);
+    if (!post) throw new AppError("NOT_FOUND", "Post not found.", { status: 404 });
+    if (post.status === "published") {
+      throw new AppError("CONFLICT", "Post is already published.", { status: 409 });
+    }
+    // Throws 503 when Redis is unavailable - the post keeps its old status.
+    await deps.publishEnqueuer.enqueuePublish(id);
+    await updateScheduledPost(db, id, { status: "publishing" });
+    return c.json({ post: serializePost({ ...post, status: "publishing" }) }, 202);
+  });
+
+  // ---------------------------------------------------- sequences (Fase 2)
+  const sequenceStepSchema = z.object({
+    delaySeconds: z.number().int().min(0),
+    text: z.string().optional(),
+    template: z.object({
+      name: z.string().min(1),
+      language: z.string().min(1),
+      latestCategory: z.string().min(1),
+    }).optional(),
+  });
+
+  const createSequenceRoute = createRoute({
+    method: "post", path: "/sequences",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              channelAccountId: z.string().min(1),
+              name: z.string().min(1),
+              steps: z.array(sequenceStepSchema).min(1),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Sequence created" } },
+  });
+  app.openapi(createSequenceRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const account = await getChannelAccount(db, ws, body.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    const row = await createSequence(db, {
+      workspaceId: ws,
+      channelAccountId: body.channelAccountId,
+      name: body.name,
+      steps: body.steps as SequenceStep[],
+    });
+    return c.json({ sequence: { ...row, createdAt: iso(row.createdAt) } }, 201);
+  });
+
+  const listSequencesRoute = createRoute({
+    method: "get", path: "/sequences",
+    responses: { 200: { description: "Sequences" } },
+  });
+  app.openapi(listSequencesRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listSequences(db, ws);
+    return c.json({ sequences: rows.map((r) => ({ ...r, createdAt: iso(r.createdAt) })) });
+  });
+
+  const getSequenceRoute = createRoute({
+    method: "get", path: "/sequences/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One sequence" } },
+  });
+  app.openapi(getSequenceRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const row = await getSequence(db, ws, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Sequence not found.", { status: 404 });
+    return c.json({ sequence: { ...row, createdAt: iso(row.createdAt) } });
+  });
+
+  const patchSequenceRoute = createRoute({
+    method: "patch", path: "/sequences/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              name: z.string().min(1).optional(),
+              steps: z.array(sequenceStepSchema).min(1).optional(),
+              status: z.enum(["active", "paused", "archived"]).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Sequence updated" } },
+  });
+  app.openapi(patchSequenceRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const row = await updateSequence(db, ws, id, {
+      name: body.name,
+      steps: body.steps as SequenceStep[] | undefined,
+      status: body.status,
+    });
+    if (!row) throw new AppError("NOT_FOUND", "Sequence not found.", { status: 404 });
+    return c.json({ sequence: { ...row, createdAt: iso(row.createdAt) } });
+  });
+
+  const enrollRoute = createRoute({
+    method: "post", path: "/sequences/{id}/enroll",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({ tag: z.string().min(1) }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Contacts enrolled by tag" } },
+  });
+  app.openapi(enrollRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const { tag } = c.req.valid("json");
+    const sequence = await getSequence(db, ws, id);
+    if (!sequence) throw new AppError("NOT_FOUND", "Sequence not found.", { status: 404 });
+    const steps = (sequence.steps as SequenceStep[]) ?? [];
+    if (steps.length === 0) {
+      throw new AppError("VALIDATION", "Sequence has no steps to enroll into.", { status: 400 });
+    }
+    const targets = await listContacts(db, ws, { tag });
+    const nextStepAt = new Date(Date.now() + (steps[0]!.delaySeconds ?? 0) * 1000);
+    let enrolled = 0;
+    for (const contact of targets) {
+      const row = await createEnrollment(db, {
+        workspaceId: ws, sequenceId: id, contactId: contact.id, nextStepAt,
+      });
+      if (row) enrolled++;
+    }
+    return c.json({ enrolled, skipped: targets.length - enrolled, total: targets.length }, 201);
+  });
+
   app.doc("/doc", {
     openapi: "3.0.0",
     info: {
-      title: "Botara API", version: "0.1.0",
-      description: "Omnichannel chatbot platform API (Fase 1). DB routes use the X-Workspace-Id header as the Fase 1 workspace-context stand-in.",
+      title: "Botara API", version: "0.2.0",
+      description: "Omnichannel chatbot platform API (Fase 2). DB routes use the X-Workspace-Id header as the Fase 1 workspace-context stand-in.",
     },
   });
 

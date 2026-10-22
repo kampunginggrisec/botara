@@ -615,11 +615,20 @@ export async function getContactByExternal(
 
 export async function createWebchatSession(
   db: Database,
-  input: { workspaceId: string; token: string; contactId: string; conversationId: string; visitorName?: string },
+  input: {
+    /** Explicit id so the contact externalId `webchat-session:{id}` can reference it before insert. */
+    id?: string;
+    workspaceId: string;
+    token: string;
+    contactId: string;
+    conversationId: string;
+    visitorName?: string;
+  },
 ): Promise<WebchatSessionRow> {
   const [row] = await db
     .insert(webchatSessions)
     .values({
+      ...(input.id ? { id: input.id } : {}),
       workspaceId: input.workspaceId,
       token: input.token,
       contactId: input.contactId,
@@ -628,6 +637,14 @@ export async function createWebchatSession(
     })
     .returning();
   return row!;
+}
+
+/** Hard delete (publishing CRUD); worker publish jobs tolerate a missing post. */
+export async function deleteScheduledPost(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getScheduledPost(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(scheduledPosts).where(eq(scheduledPosts.id, id));
+  return true;
 }
 
 export async function getWebchatSessionByToken(db: Database, token: string): Promise<WebchatSessionRow | null> {

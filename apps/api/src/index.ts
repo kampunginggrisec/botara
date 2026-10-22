@@ -5,13 +5,20 @@ import { createApp, defaultDeps } from "./app";
  * (createApp with injectable deps, used by tests and the smoke check);
  * this file only wires the production defaults and serves.
  *
- * Routes (Fase 1):
+ * Routes (Fase 1 + Fase 2):
  *   GET  /health, GET /doc (OpenAPI)
- *   GET+POST /webhooks/whatsapp, POST /webhooks/telegram
+ *   GET+POST /webhooks/whatsapp (template category changes are applied),
+ *   POST /webhooks/telegram, GET+POST /webhooks/instagram|messenger|threads,
+ *   POST /webhooks/resend (Svix-verified)
  *   GET  /conversations, GET /conversations/:id/messages, POST /conversations/:id/reply
+ *   POST /conversations/:id/ai-suggest, POST /moderation/check
  *   GET/POST /contacts, PATCH /contacts/:id, GET /segments
  *   GET/POST /templates, PATCH /templates/:id/category
  *   POST /broadcasts/estimate (pure, no DB), POST /broadcasts, GET /broadcasts/:id
+ *   GET  /channels/accounts, POST /channels/whatsapp/embedded-signup/exchange
+ *   POST /public/webchat/:workspaceId/session, GET+POST /public/webchat/:workspaceId/messages
+ *   CRUD /posts + POST /posts/:id/publish-now
+ *   CRUD /sequences + POST /sequences/:id/enroll
  */
 
 const app = createApp(defaultDeps());
