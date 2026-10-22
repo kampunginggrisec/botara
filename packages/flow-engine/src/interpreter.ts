@@ -23,6 +23,7 @@ export type FlowAction =
   | { type: "send_message"; text: string; channel?: string }
   | { type: "schedule_delay"; seconds: number }
   | { type: "call_webhook"; url: string; method: "GET" | "POST" }
+  | { type: "set_contact_field"; field: string; value: string }
   | { type: "complete" };
 
 export function initialState(flow: Flow): FlowState {
@@ -59,5 +60,12 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
       return { state: { ...advance(node.next), status: "waiting" }, actions: [{ type: "schedule_delay", seconds: node.seconds }] };
     case "webhook":
       return { state: advance(node.next), actions: [{ type: "call_webhook", url: node.url, method: node.method }] };
+    case "set_field": {
+      const value = node.value.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
+      return {
+        state: advance(node.next),
+        actions: [{ type: "set_contact_field", field: node.field, value }],
+      };
+    }
   }
 }

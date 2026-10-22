@@ -44,8 +44,16 @@ export const webhookNodeSchema = z.object({
   method: z.enum(["GET", "POST"]).default("POST"),
 });
 
+export const setFieldNodeSchema = z.object({
+  ...base,
+  type: z.literal("set_field"),
+  field: z.string().min(1),
+  value: z.string(),
+});
+
 export const flowNodeSchema = z.discriminatedUnion("type", [
   triggerNodeSchema, sendMessageNodeSchema, conditionNodeSchema, delayNodeSchema, webhookNodeSchema,
+  setFieldNodeSchema,
 ]);
 
 export type FlowNode = z.infer<typeof flowNodeSchema>;
