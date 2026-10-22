@@ -1,0 +1,114 @@
+# Botara - PRODUCTION compose.
+# Usage (on the VPS):
+#   cp .env.production.example .env.production   # fill in real values
+#   docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
+# Only the Caddy proxy publishes ports (80/443). Postgres is bound to
+# localhost only; Redis is internal-only. Full guide: docs/deploy/vps.md
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: botara
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.production}
+      POSTGRES_DB: botara
+    ports:
+      # Localhost only - never expose Postgres publicly.
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - botara-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U botara -d botara"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - botara-redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: api
+    restart: unless-stopped
+    env_file:
+      - ../../.env.production
+    environment:
+      PORT_API: "3000"
+      DATABASE_URL: postgres://botara:${POSTGRES_PASSWORD}@postgres:5432/botara
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: worker
+    restart: unless-stopped
+    env_file:
+      - ../../.env.production
+    environment:
+      DATABASE_URL: postgres://botara:${POSTGRES_PASSWORD}@postgres:5432/botara
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  realtime:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: realtime
+    restart: unless-stopped
+    env_file:
+      - ../../.env.production
+    environment:
+      PORT_REALTIME: "3002"
+
+  web:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: web
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ../deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - botara-caddy-data:/data
+      - botara-caddy-config:/config
+    depends_on:
+      - api
+      - realtime
+      - web
+
+volumes:
+  botara-postgres-data:
+  botara-redis-data:
+  botara-caddy-data:
+  botara-caddy-config:

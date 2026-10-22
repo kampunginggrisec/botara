@@ -1,0 +1,140 @@
+# Panduan Deploy Botara ke VPS (Produksi)
+
+Panduan ini menyiapkan Botara di satu VPS dengan Docker Compose + Caddy
+(HTTPS otomatis). Domain dan VPS bersifat *menyusul* — file deploy sudah
+disiapkan dari sekarang, dan panduan ini dijalankan pada hari go-live.
+
+## Yang sudah disiapkan di repo
+
+- `Dockerfile` (root) — satu image multi-target: `api`, `worker`, `realtime`, `web`.
+- `infra/docker/docker-compose.prod.yml` — Postgres 18 (pgvector), Redis, API,
+  worker, realtime, web statis, dan Caddy sebagai satu-satunya layanan publik.
+- `infra/deploy/Caddyfile` — reverse proxy dengan placeholder `{$DOMAIN}`:
+  domain → web, `/api/*` → API (prefix dibuang), `/ws` → realtime.
+- `.env.production.example` — template env produksi (placeholder saja).
+
+## Langkah deploy
+
+### 1. Install Docker Engine + Compose plugin
+
+Di VPS (Ubuntu/Debian), ikuti panduan resmi Docker untuk memasang Docker
+Engine dan plugin Compose v2, lalu pastikan perintah berikut bekerja:
+
+```bash
+docker version
+docker compose version
+```
+
+### 2. Clone repo
+
+```bash
+git clone git@github.com:kampunginggrisec/botara.git
+cd botara
+```
+
+### 3. Siapkan env produksi
+
+```bash
+cp .env.production.example .env.production
+nano .env.production   # isi semua nilai asli DI VPS SAJA
+```
+
+Peringatan: `.env.production` berisi rahasia. Jangan pernah di-commit,
+jangan dikirim lewat chat/email.
+
+### 4. Generate secret
+
+Setiap nilai rahasia dibuat acak di VPS:
+
+```bash
+openssl rand -hex 24   # contoh: POSTGRES_PASSWORD
+openssl rand -hex 32   # contoh: TELEGRAM_WEBHOOK_SECRET, TOKEN_VAULT_KEY, SESSION_SECRET, JWT_SECRET
+```
+
+`WHATSAPP_VERIFY_TOKEN` boleh string acak buatan sendiri — nilainya harus
+sama dengan yang dimasukkan di konfigurasi webhook aplikasi Meta.
+
+### 5. Jalankan stack
+
+```bash
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
+docker compose -f infra/docker/docker-compose.prod.yml ps
+```
+
+### 6. Verifikasi
+
+```bash
+# Health API lewat proxy (menguji Caddy + routing /api sekaligus;
+# prefix /api dibuang oleh proxy sehingga API menerima /health):
+curl https://DOMAIN/api/health
+# -> {"status":"ok","service":"api"}
+```
+
+Ganti `DOMAIN` dengan domain asli dari `.env.production`. Web dashboard
+dibuka di `https://DOMAIN/`.
+
+## URL webhook yang didaftarkan (setelah domain aktif)
+
+Daftarkan URL berikut persis seperti ini:
+
+- **WhatsApp (Meta App → WhatsApp → Configuration → Webhook):**
+  - Callback URL: `https://DOMAIN/api/webhooks/whatsapp`
+  - Verify token: nilai `WHATSAPP_VERIFY_TOKEN` dari `.env.production`
+  - Langganan field: `messages` dan `message_template_category_update`
+- **Telegram (Bot API setWebhook):**
+  ```bash
+  curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \
+    -d "url=https://DOMAIN/api/webhooks/telegram" \
+    -d "secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+  ```
+
+## Update (rilis baru)
+
+```bash
+cd botara
+git pull
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
+```
+
+## Rollback
+
+Jika rilis baru bermasalah, kembali ke commit sebelumnya lalu build ulang:
+
+```bash
+git log --oneline -5          # catat commit terakhir yang sehat
+git checkout <commit-sehat>
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
+```
+
+Data Postgres/Redis berada di named volume dan tidak ikut terhapus oleh
+rollback kode. Jangan menjalankan `docker compose down -v` di produksi
+(perintah itu menghapus volume = menghapus data).
+
+## Backup Postgres
+
+Contoh backup manual ke file bertanggal:
+
+```bash
+docker compose -f infra/docker/docker-compose.prod.yml exec -T postgres \
+  pg_dump -U botara -d botara > backup-$(date +%Y%m%d-%H%M).sql
+```
+
+Contoh cron harian (pukul 02:30) — sesuaikan path:
+
+```cron
+30 2 * * * cd /path/ke/botara && docker compose -f infra/docker/docker-compose.prod.yml exec -T postgres pg_dump -U botara -d botara > /var/backups/botara-$(date +\%Y\%m\%d).sql
+```
+
+Simpan juga salinan backup di luar VPS (mis. bucket R2 terpisah).
+
+## Yang masih harus disiapkan pada hari go-live
+
+1. **Domain asli + DNS**: buat A record domain → IP publik VPS, tunggu
+   propagasi. Caddy menerbitkan sertifikat HTTPS otomatis setelah DNS benar.
+2. **Kredensial aplikasi Meta**: App ID/Secret, token WhatsApp, dan verify
+   token — isi ke `.env.production`.
+3. **Bucket Cloudflare R2** + custom domain untuk media publik, lalu isi
+   variabel `R2_*`.
+4. **Domain email terverifikasi di Resend** (DKIM/SPF/DMARC), lalu isi
+   `RESEND_API_KEY` dan `RESEND_FROM_EMAIL`.
+5. Daftarkan URL webhook di atas ke Meta dan Telegram.

@@ -1,0 +1,28 @@
+# Botara public reverse proxy.
+# {$DOMAIN} is substituted by Caddy from the DOMAIN environment variable
+# (see docker-compose.prod.yml) - no real domain is hardcoded anywhere.
+# Caddy obtains and renews the HTTPS certificate automatically (ACME),
+# provided DOMAIN resolves to this server and ports 80/443 are reachable.
+
+{$DOMAIN} {
+	encode gzip
+
+	# API: the /api prefix is stripped, so the API sees its own routes
+	# (/conversations, /webhooks/whatsapp, /broadcasts/estimate, ...).
+	# Public webhook URLs are therefore:
+	#   https://{$DOMAIN}/api/webhooks/whatsapp
+	#   https://{$DOMAIN}/api/webhooks/telegram
+	handle_path /api/* {
+		reverse_proxy api:3000
+	}
+
+	# Realtime WebSocket (upgrade handled by reverse_proxy automatically).
+	handle /ws {
+		reverse_proxy realtime:3002
+	}
+
+	# Everything else: the static web app.
+	handle {
+		reverse_proxy web:80
+	}
+}

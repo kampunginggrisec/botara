@@ -1,0 +1,9 @@
+# Static SPA server for the web build (internal only - the public reverse
+# proxy in Caddyfile routes traffic here). SPA fallback: unknown paths
+# return index.html so client-side page state works on refresh.
+:80 {
+	root * /srv
+	encode gzip
+	try_files {path} /index.html
+	file_server
+}
