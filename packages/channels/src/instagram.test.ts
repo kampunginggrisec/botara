@@ -200,3 +200,70 @@ describe("instagram webhooks", () => {
     }
   });
 });
+
+describe("instagram video containers (Fase 3 polling)", () => {
+  const noSleep = async () => {};
+
+  test("video publish polls container status until FINISHED, then media_publish", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "creation-v1" } },               // create container
+      { body: { status_code: "IN_PROGRESS" } },      // poll 1
+      { body: { status_code: "FINISHED" } },         // poll 2
+      { body: { id: "post-v1" } },                   // media_publish
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn, containerPoll: { attempts: 5, delayMs: 1, sleep: noSleep } });
+    const res = await ig.publish({
+      account: IG_ACCOUNT, mediaUrls: ["https://media.example.com/clip.mp4"], idempotencyKey: "k",
+    });
+    expect(res.externalPostId).toBe("post-v1");
+    expect(calls.map((c) => c.url)).toEqual([
+      "https://graph.instagram.com/ig-user-1/media",
+      "https://graph.instagram.com/creation-v1?fields=status_code",
+      "https://graph.instagram.com/creation-v1?fields=status_code",
+      "https://graph.instagram.com/ig-user-1/media_publish",
+    ]);
+    expect(JSON.parse(calls[0]!.init!.body as string)).toMatchObject({ media_type: "REELS", video_url: "https://media.example.com/clip.mp4" });
+  });
+
+  test("image publish does NOT poll the container status", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "creation-i1" } },
+      { body: { id: "post-i1" } },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn, containerPoll: { attempts: 5, delayMs: 1, sleep: noSleep } });
+    await ig.publish({ account: IG_ACCOUNT, mediaUrls: ["https://media.example.com/a.jpg"], idempotencyKey: "k" });
+    expect(calls).toHaveLength(2);
+    expect(calls.some((c) => c.url.includes("status_code"))).toBe(false);
+  });
+
+  test("container ERROR fails the publish (non-retryable)", async () => {
+    const { fetchFn } = mockFetch([
+      { body: { id: "creation-e1" } },
+      { body: { status_code: "ERROR" } },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn, containerPoll: { attempts: 3, delayMs: 1, sleep: noSleep } });
+    await expect(ig.publish({ account: IG_ACCOUNT, mediaUrls: ["https://media.example.com/bad.mp4"], idempotencyKey: "k" }))
+      .rejects.toMatchObject({ code: "PROVIDER_ERROR" });
+  });
+
+  test("polling is bounded: never-FINISHED containers fail retryably after the attempts run out", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "creation-s1" } },
+      { body: { status_code: "IN_PROGRESS" } },
+      { body: { status_code: "IN_PROGRESS" } },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn, containerPoll: { attempts: 2, delayMs: 1, sleep: noSleep } });
+    await expect(ig.publish({ account: IG_ACCOUNT, mediaUrls: ["https://media.example.com/slow.mov"], idempotencyKey: "k" }))
+      .rejects.toThrow(/not FINISHED after 2 status checks/);
+    // 1 create + exactly 2 status polls, and media_publish was never attempted.
+    expect(calls).toHaveLength(3);
+    expect(calls.some((c) => c.url.includes("media_publish"))).toBe(false);
+  });
+
+  test("getMediaContainerStatus reads status_code", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { status_code: "FINISHED" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    expect(await ig.getMediaContainerStatus(IG_ACCOUNT, "creation-9")).toBe("FINISHED");
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/creation-9?fields=status_code");
+  });
+});

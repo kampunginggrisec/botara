@@ -54,6 +54,16 @@ export interface InstagramAdapterOptions {
   graphVersion?: string;
   instagramHost?: string;
   facebookHost?: string;
+  /**
+   * Video container polling bounds (Fase 3): a REELS container must reach
+   * status FINISHED before media_publish. Polling is bounded - attempts x
+   * delay - and the sleep is injectable so tests never wait in real time.
+   */
+  containerPoll?: {
+    attempts?: number;
+    delayMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  };
 }
 
 export function instagramModeOf(account: ChannelAccountRef): InstagramAuthMode {
@@ -109,6 +119,9 @@ export class InstagramAdapter implements ChannelAdapter {
   private readonly fetchFn: FetchLike;
   private readonly instagramHost: string;
   private readonly facebookHost: string;
+  private readonly pollAttempts: number;
+  private readonly pollDelayMs: number;
+  private readonly pollSleep: (ms: number) => Promise<void>;
 
   constructor(options: InstagramAdapterOptions) {
     this.credentials = options.credentials;
@@ -116,6 +129,10 @@ export class InstagramAdapter implements ChannelAdapter {
     this.apiVersion = options.graphVersion ?? "v26.0";
     this.instagramHost = (options.instagramHost ?? "https://graph.instagram.com").replace(/\/$/, "");
     this.facebookHost = (options.facebookHost ?? "https://graph.facebook.com").replace(/\/$/, "");
+    this.pollAttempts = options.containerPoll?.attempts ?? 10;
+    this.pollDelayMs = options.containerPoll?.delayMs ?? 3000;
+    this.pollSleep = options.containerPoll?.sleep
+      ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   /** Mode-correct API base for an account (host selection is THE dual-mode rule). */
@@ -349,7 +366,11 @@ export class InstagramAdapter implements ChannelAdapter {
 
   // --- publishing ----------------------------------------------------------------
 
-  async publish(input: PublishInput): Promise<{ externalPostId: string }> {
+  /** Step 1 of publishing: create the media container (image or REELS video). */
+  async createMediaContainer(
+    account: ChannelAccountRef,
+    input: PublishInput,
+  ): Promise<{ creationId: string; mediaKind: "image" | "video" }> {
     const mediaUrl = input.mediaUrls?.[0];
     if (!mediaUrl) {
       throw new AppError(
@@ -357,10 +378,8 @@ export class InstagramAdapter implements ChannelAdapter {
         "instagram.publish requires a media URL - Instagram has no text-only posts (media is fetched by Meta from a public https URL)",
       );
     }
-    const igId = input.account.externalId;
     const isVideo = input.mediaType === "video" || /\.(mp4|mov)(\?|$)/i.test(mediaUrl);
-    // Step 1: create the media container.
-    const container = await this.graph(input.account, "POST", `${igId}/media`, {
+    const container = await this.graph(account, "POST", `${account.externalId}/media`, {
       ...(isVideo ? { media_type: "REELS", video_url: mediaUrl } : { image_url: mediaUrl }),
       ...(input.text ? { caption: input.text } : {}),
     });
@@ -368,10 +387,25 @@ export class InstagramAdapter implements ChannelAdapter {
     if (!creationId) {
       throw new ProviderApiError("Instagram media container returned no id", { provider: "instagram", retryable: false });
     }
-    // Step 2: publish the container. (Video containers must reach FINISHED
-    // status first - callers schedule a short delay for Reels; the status
-    // check endpoint is GET /{creation-id}?fields=status_code.)
-    const published = await this.graph(input.account, "POST", `${igId}/media_publish`, {
+    return { creationId, mediaKind: isVideo ? "video" : "image" };
+  }
+
+  /**
+   * Container processing status: IN_PROGRESS | FINISHED | ERROR | EXPIRED |
+   * PUBLISHED (GET /{creation-id}?fields=status_code). Video containers MUST
+   * be FINISHED before media_publish; images are ready immediately.
+   */
+  async getMediaContainerStatus(account: ChannelAccountRef, creationId: string): Promise<string> {
+    const json = await this.graph(account, "GET", `${creationId}?fields=status_code`);
+    return typeof json.status_code === "string" ? json.status_code : "UNKNOWN";
+  }
+
+  /** Step 2 of publishing: media_publish an existing (FINISHED) container. */
+  async publishMediaContainer(
+    account: ChannelAccountRef,
+    creationId: string,
+  ): Promise<{ externalPostId: string }> {
+    const published = await this.graph(account, "POST", `${account.externalId}/media_publish`, {
       creation_id: creationId,
     });
     const postId = published.id as string | undefined;
@@ -379,6 +413,39 @@ export class InstagramAdapter implements ChannelAdapter {
       throw new ProviderApiError("Instagram media_publish returned no id", { provider: "instagram", retryable: false });
     }
     return { externalPostId: postId };
+  }
+
+  /**
+   * Poll a video container until FINISHED, bounded by the adapter's poll
+   * configuration. ERROR/EXPIRED fail non-retryably; exhausting the attempts
+   * fails retryably so the worker can requeue the publish job later.
+   */
+  async waitForContainerFinished(account: ChannelAccountRef, creationId: string): Promise<void> {
+    for (let attempt = 1; attempt <= this.pollAttempts; attempt++) {
+      const status = await this.getMediaContainerStatus(account, creationId);
+      if (status === "FINISHED" || status === "PUBLISHED") return;
+      if (status === "ERROR" || status === "EXPIRED") {
+        throw new ProviderApiError(
+          `Instagram media container ${creationId} failed processing (status ${status})`,
+          { provider: "instagram", retryable: false },
+        );
+      }
+      if (attempt < this.pollAttempts) await this.pollSleep(this.pollDelayMs);
+    }
+    throw new ProviderApiError(
+      `Instagram media container ${creationId} was not FINISHED after ${this.pollAttempts} status checks`,
+      { provider: "instagram", retryable: true },
+    );
+  }
+
+  async publish(input: PublishInput): Promise<{ externalPostId: string }> {
+    const { creationId, mediaKind } = await this.createMediaContainer(input.account, input);
+    // Video/Reels containers process asynchronously - publishing before
+    // FINISHED is rejected by Meta, so poll (bounded) first. Images skip this.
+    if (mediaKind === "video") {
+      await this.waitForContainerFinished(input.account, creationId);
+    }
+    return this.publishMediaContainer(input.account, creationId);
   }
 
   // --- insights ---------------------------------------------------------------------

@@ -12,7 +12,8 @@ import { WebchatAdapter } from "./webchat";
 import { WhatsAppAdapter } from "./whatsapp";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
-  type ChannelKey, type InboundEvent, type PublishInput, type SendInput, type SendResult,
+  type ChannelKey, type CredentialProvider, type InboundEvent, type PublishInput,
+  type SendInput, type SendResult,
 } from "./types";
 
 /**
@@ -54,6 +55,33 @@ export function registerAdapter(adapter: ChannelAdapter): void {
 }
 
 /**
+ * Optional credentials factory (Fase 3): process wiring (API/worker) calls
+ * this ONCE at startup - BEFORE the first getAdapter() - to give every
+ * default adapter a vault-backed provider (with env fallback) instead of
+ * the plain env providers. Adapters already constructed are unaffected.
+ */
+let credentialsFactory: ((key: ChannelKey) => CredentialProvider) | undefined;
+
+export function configureAdapterCredentials(
+  factory: ((key: ChannelKey) => CredentialProvider) | undefined,
+): void {
+  credentialsFactory = factory;
+}
+
+function credentialsFor(key: ChannelKey): CredentialProvider {
+  if (credentialsFactory) return credentialsFactory(key);
+  switch (key) {
+    case "whatsapp": return envWhatsAppCredentials();
+    case "telegram": return envTelegramCredentials();
+    case "instagram": return envInstagramCredentials();
+    case "messenger": return envMessengerCredentials();
+    case "threads": return envThreadsCredentials();
+    case "email": return envEmailCredentials();
+    case "webchat": return envWhatsAppCredentials(); // unused - webchat resolves no secrets
+  }
+}
+
+/**
  * Default adapter factory. Fase 1 made whatsapp + telegram real; Fase 2
  * completes the set: instagram (dual-mode), messenger, threads, email
  * (Resend), and webchat (self-built; its registry instance has no store, so
@@ -64,17 +92,17 @@ export function registerAdapter(adapter: ChannelAdapter): void {
 function createDefaultAdapter(key: ChannelKey): ChannelAdapter {
   switch (key) {
     case "whatsapp":
-      return new WhatsAppAdapter({ credentials: envWhatsAppCredentials() });
+      return new WhatsAppAdapter({ credentials: credentialsFor(key) });
     case "telegram":
-      return new TelegramAdapter({ credentials: envTelegramCredentials() });
+      return new TelegramAdapter({ credentials: credentialsFor(key) });
     case "instagram":
-      return new InstagramAdapter({ credentials: envInstagramCredentials() });
+      return new InstagramAdapter({ credentials: credentialsFor(key) });
     case "messenger":
-      return new MessengerAdapter({ credentials: envMessengerCredentials() });
+      return new MessengerAdapter({ credentials: credentialsFor(key) });
     case "threads":
-      return new ThreadsAdapter({ credentials: envThreadsCredentials() });
+      return new ThreadsAdapter({ credentials: credentialsFor(key) });
     case "email":
-      return new EmailAdapter({ credentials: envEmailCredentials() });
+      return new EmailAdapter({ credentials: credentialsFor(key) });
     case "webchat":
       return new WebchatAdapter();
   }

@@ -5,16 +5,20 @@ export {
   type MessageAttachment, type MessageStatusError, type ChannelSecrets,
   type CredentialProvider, type FetchLike, type RealAdapterOptions,
 } from "./types";
-export { PlaceholderAdapter, registerAdapter, getAdapter, listAdapters } from "./registry";
+export {
+  PlaceholderAdapter, registerAdapter, getAdapter, listAdapters, configureAdapterCredentials,
+} from "./registry";
 export {
   ProviderApiError, ProviderAuthError, ProviderRateLimitError,
   TemplateCategoryMismatchError, MarketingPausedError, mapGraphError,
   type ProviderErrorDetails, type GraphErrorBodyShape,
 } from "./errors";
 export {
-  StaticCredentialProvider, EnvCredentialProvider, envWhatsAppCredentials,
+  StaticCredentialProvider, EnvCredentialProvider, VaultCredentialProvider,
+  CompositeCredentialProvider, envWhatsAppCredentials,
   envTelegramCredentials, envInstagramCredentials, envMessengerCredentials,
-  envThreadsCredentials, envEmailCredentials, type EnvCredentialProviderOptions,
+  envThreadsCredentials, envEmailCredentials,
+  type EnvCredentialProviderOptions, type VaultSecretResolver,
 } from "./credentials";
 export {
   evaluateLongLivedRefresh, type RefreshDecision, type LongLivedRefreshInput,

@@ -276,6 +276,9 @@ export class EmailAdapter implements ChannelAdapter {
           messageExternalId: String(data.email_id ?? data.id ?? ""),
           subject: data.subject,
           attachments,
+          // Recipient addresses - the API route routes by their domain
+          // (workspace_domains) into the owning workspace's email account.
+          recipients: Array.isArray(data.to) ? data.to.map(String) : undefined,
           receivedAt,
         }];
       }

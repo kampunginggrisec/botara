@@ -97,7 +97,7 @@ export interface MessageAttachment {
 
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
-  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[] }
+  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[] }
   | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; receivedAt: string }
   | { type: "comment.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId: string; text?: string; authorExternalId?: string; parentPostExternalId?: string; receivedAt: string }
   | { type: "mention.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId?: string; authorExternalId?: string; receivedAt: string }

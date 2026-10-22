@@ -59,6 +59,66 @@ export class EnvCredentialProvider implements CredentialProvider {
   }
 }
 
+/** Resolves a vault reference (`vault:...`) to its decrypted secret. */
+export interface VaultSecretResolver {
+  getSecret(ref: string): Promise<string | null>;
+}
+
+/**
+ * Vault-backed credential provider (Fase 3) - the production default.
+ *
+ * Resolution for an account, in order:
+ * 1. `vault:` refs are resolved (decrypted) through the vault resolver.
+ *    The single secret is placed in BOTH token slots: each adapter reads
+ *    only its own slot (accessToken for Meta/Resend, botToken for
+ *    Telegram), so one sealed value serves every channel shape.
+ * 2. `env:VAR` refs read that env var (the Fase 1/2 dev behaviour).
+ * 3. Otherwise the call delegates to the fallback provider (typically the
+ *    per-channel EnvCredentialProvider).
+ *
+ * Secrets are resolved at send-time and never cached on the account row.
+ */
+export class VaultCredentialProvider implements CredentialProvider {
+  constructor(
+    private readonly vault: VaultSecretResolver,
+    private readonly fallback?: CredentialProvider,
+    private readonly env: Record<string, string | undefined> = process.env,
+  ) {}
+
+  async resolve(account: ChannelAccountRef): Promise<ChannelSecrets> {
+    const ref = account.tokenVaultRef;
+    if (ref?.startsWith("vault:")) {
+      const secret = await this.vault.getSecret(ref);
+      if (secret) return { accessToken: secret, botToken: secret };
+    } else if (ref?.startsWith("env:")) {
+      const value = this.env[ref.slice("env:".length)];
+      if (value) return { accessToken: value, botToken: value };
+    }
+    if (this.fallback) return this.fallback.resolve(account);
+    return {};
+  }
+}
+
+/**
+ * Ordered composition: providers are consulted in order and the first
+ * non-empty value per secret slot wins.
+ */
+export class CompositeCredentialProvider implements CredentialProvider {
+  constructor(private readonly providers: CredentialProvider[]) {}
+
+  async resolve(account: ChannelAccountRef): Promise<ChannelSecrets> {
+    const merged: ChannelSecrets = {};
+    for (const provider of this.providers) {
+      const secrets = await provider.resolve(account);
+      merged.accessToken ??= secrets.accessToken;
+      merged.botToken ??= secrets.botToken;
+      merged.appSecret ??= secrets.appSecret;
+      merged.webhookSecret ??= secrets.webhookSecret;
+    }
+    return merged;
+  }
+}
+
 /** Preconfigured providers for the real channels (Fase 1 + Fase 2). */
 export const envWhatsAppCredentials = (): CredentialProvider =>
   new EnvCredentialProvider({ tokenEnv: "WHATSAPP_ACCESS_TOKEN", appSecretEnv: "META_APP_SECRET" });
