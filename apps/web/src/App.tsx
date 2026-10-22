@@ -1,15 +1,16 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  api, ApiError, BASE_URL, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
-  type AuthUser, type BroadcastEstimate, type ChannelAccount, type Contact, type Conversation,
-  type Flow, type KbDocument, type Member, type Message, type PublicConfig, type ScheduledPost,
-  type Sequence, type SequenceStep, type StatsOverview, type Template, type WorkspaceSummary,
+  api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
+  type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type ChannelAccount, type Contact,
+  type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
+  type Member, type Message, type PublicConfig, type RichBlock, type ScheduledPost, type Sequence,
+  type SequenceStep, type StatsOverview, type Template, type WorkspaceSummary,
 } from "./api";
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 
-type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "settings";
+type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings";
 
 const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "dashboard", labelKey: "nav.dashboard" },
@@ -21,6 +22,7 @@ const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["
   { id: "publish", labelKey: "nav.publish" },
   { id: "channels", labelKey: "nav.channels" },
   { id: "knowledge", labelKey: "nav.knowledge" },
+  { id: "growth", labelKey: "nav.growth" },
   { id: "settings", labelKey: "nav.settings" },
 ];
 
@@ -80,6 +82,11 @@ function InboxPage() {
   const [error, setError] = useState<string | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
   const [sending, setSending] = useState(false);
+  // Rich buttons builder (adopted features): reply/url buttons attached
+  // to the reply as a rich block; channels render or degrade them.
+  const [showButtons, setShowButtons] = useState(false);
+  const [richButtons, setRichButtons] = useState<Array<{ type: "reply" | "url"; title: string; payload: string; url: string }>>([]);
+  const [richWarning, setRichWarning] = useState<string | null>(null);
 
   const loadConversations = useCallback(async () => {
     try {
@@ -107,9 +114,25 @@ function InboxPage() {
   const sendReply = async () => {
     if (!selected || !replyText.trim()) return;
     setSending(true);
+    setRichWarning(null);
     try {
-      await api.reply(selected.id, { kind: "free_form", text: replyText.trim() });
+      const validButtons = richButtons.filter((b) => b.title.trim());
+      const rich: RichBlock | undefined = showButtons && validButtons.length > 0
+        ? {
+            kind: "buttons",
+            text: replyText.trim(),
+            buttons: validButtons.map((b) => (b.type === "url"
+              ? { type: "url" as const, title: b.title.trim(), url: b.url.trim() }
+              : { type: "reply" as const, title: b.title.trim(), payload: b.payload.trim() || b.title.trim() })),
+          }
+        : undefined;
+      const res = await api.reply(selected.id, { kind: "free_form", text: replyText.trim(), ...(rich ? { rich } : {}) });
+      if (res.warnings && res.warnings.length > 0) {
+        setRichWarning(t("inbox.richDegraded", { warnings: res.warnings.join(", ") }));
+      }
       setReplyText("");
+      setRichButtons([]);
+      setShowButtons(false);
       setWindowClosed(false);
       await openConversation(selected);
     } catch (err) {
@@ -176,17 +199,80 @@ function InboxPage() {
                   <strong>{t("inbox.windowClosedTitle")}</strong> {t("inbox.windowClosedBody")}
                 </div>
               )}
-              <div className="border-t border-slate-100 dark:border-slate-800 p-3 flex gap-2">
-                <textarea
-                  value={replyText}
-                  onChange={(e) => setReplyText(e.target.value)}
-                  rows={2}
-                  placeholder={t("inbox.replyPlaceholder")}
-                  className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                />
-                <button onClick={() => void sendReply()} disabled={sending || !replyText.trim()} className={`self-end ${primaryBtn}`}>
-                  {sending ? t("common.sending") : t("common.send")}
+              {richWarning && (
+                <div className="mx-4 mb-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                  {richWarning}
+                </div>
+              )}
+              <div className="border-t border-slate-100 dark:border-slate-800 p-3">
+                <div className="flex gap-2">
+                  <textarea
+                    value={replyText}
+                    onChange={(e) => setReplyText(e.target.value)}
+                    rows={2}
+                    placeholder={t("inbox.replyPlaceholder")}
+                    className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  />
+                  <button onClick={() => void sendReply()} disabled={sending || !replyText.trim()} className={`self-end ${primaryBtn}`}>
+                    {sending ? t("common.sending") : t("common.send")}
+                  </button>
+                </div>
+                <button
+                  onClick={() => setShowButtons((v) => !v)}
+                  className="mt-2 text-xs text-slate-600 underline dark:text-slate-300"
+                >
+                  {showButtons ? t("inbox.hideButtons") : t("inbox.addButtons")}
                 </button>
+                {showButtons && (
+                  <div className="mt-2 space-y-2 rounded-md border border-slate-200 p-2 dark:border-slate-700">
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{t("inbox.buttonsHint")}</p>
+                    {richButtons.map((b, i) => (
+                      <div key={i} className="flex flex-wrap gap-2">
+                        <select
+                          value={b.type}
+                          onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, type: e.target.value as "reply" | "url" } : x)))}
+                          className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                        >
+                          <option value="reply">{t("inbox.buttonReply")}</option>
+                          <option value="url">{t("inbox.buttonUrl")}</option>
+                        </select>
+                        <input
+                          value={b.title}
+                          onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, title: e.target.value } : x)))}
+                          placeholder={t("inbox.buttonTitle")}
+                          className="w-36 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                        />
+                        {b.type === "url" ? (
+                          <input
+                            value={b.url}
+                            onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))}
+                            placeholder="https://..."
+                            className="w-52 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                          />
+                        ) : (
+                          <input
+                            value={b.payload}
+                            onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, payload: e.target.value } : x)))}
+                            placeholder={t("inbox.buttonPayload")}
+                            className="w-52 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                          />
+                        )}
+                        <button
+                          onClick={() => setRichButtons((prev) => prev.filter((_, j) => j !== i))}
+                          className="text-xs text-red-600 underline dark:text-red-400"
+                        >
+                          {t("common.remove")}
+                        </button>
+                      </div>
+                    ))}
+                    <button
+                      onClick={() => setRichButtons((prev) => [...prev, { type: "reply", title: "", payload: "", url: "" }])}
+                      className="text-xs text-slate-600 underline dark:text-slate-300"
+                    >
+                      {t("inbox.addButtonRow")}
+                    </button>
+                  </div>
+                )}
               </div>
             </>
           )}
@@ -203,6 +289,14 @@ function ContactsPage() {
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [tag, setTag] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Import/export (adopted features).
+  const [showImport, setShowImport] = useState(false);
+  const [importText, setImportText] = useState("");
+  const [importFormat, setImportFormat] = useState<"csv" | "json">("csv");
+  const [importConflict, setImportConflict] = useState<"skip" | "update">("skip");
+  const [importResult, setImportResult] = useState<ContactImportResult | null>(null);
+  const [importBusy, setImportBusy] = useState(false);
+  const [exportBusy, setExportBusy] = useState(false);
 
   const load = useCallback(async (filterTag: string) => {
     try {
@@ -216,18 +310,103 @@ function ContactsPage() {
 
   useEffect(() => { void load(""); }, [load]);
 
+  const onImportFile = async (file: File | undefined) => {
+    if (!file) return;
+    setImportText(await file.text());
+    setImportFormat(file.name.toLowerCase().endsWith(".json") ? "json" : "csv");
+  };
+
+  const runImport = async () => {
+    setImportBusy(true);
+    setImportResult(null);
+    setError(null);
+    try {
+      const res = await api.importContacts({ format: importFormat, content: importText, conflict: importConflict });
+      setImportResult(res);
+      await load(tag);
+    } catch (err) {
+      setError(errText(err, t("contacts.importFailed")));
+    } finally { setImportBusy(false); }
+  };
+
+  const runExport = async (format: "csv" | "json") => {
+    setExportBusy(true);
+    setError(null);
+    try {
+      const text = await api.exportContacts(format);
+      downloadTextFile(`contacts.${format}`, text, format === "csv" ? "text/csv" : "application/json");
+    } catch (err) {
+      setError(errText(err, t("contacts.exportFailed")));
+    } finally { setExportBusy(false); }
+  };
+
   return (
     <div>
       <PageTitle title={t("contacts.title")} subtitle={t("contacts.subtitle")} />
-      <div className="mt-4 flex gap-2 max-w-md">
-        <input
-          value={tag}
-          onChange={(e) => setTag(e.target.value)}
-          placeholder={t("contacts.filterPlaceholder")}
-          className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-        />
-        <button onClick={() => void load(tag)} className={primaryBtn}>{t("common.filter")}</button>
+      <div className="mt-4 flex flex-wrap gap-2">
+        <div className="flex gap-2 max-w-md flex-1 min-w-64">
+          <input
+            value={tag}
+            onChange={(e) => setTag(e.target.value)}
+            placeholder={t("contacts.filterPlaceholder")}
+            className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+          <button onClick={() => void load(tag)} className={primaryBtn}>{t("common.filter")}</button>
+        </div>
+        <button onClick={() => setShowImport((v) => !v)} className={outlineBtn}>{t("contacts.import")}</button>
+        <button onClick={() => void runExport("csv")} disabled={exportBusy} className={outlineBtn}>{t("contacts.exportCsv")}</button>
+        <button onClick={() => void runExport("json")} disabled={exportBusy} className={outlineBtn}>{t("contacts.exportJson")}</button>
       </div>
+      {showImport && (
+        <div className={`mt-4 ${cardCls} p-4 space-y-3 max-w-3xl`}>
+          <div className="font-medium text-sm">{t("contacts.importTitle")}</div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">{t("contacts.importHint")}</p>
+          <div className="flex flex-wrap gap-2 items-center">
+            <input
+              type="file"
+              accept=".csv,.json,text/csv,application/json"
+              onChange={(e) => void onImportFile(e.target.files?.[0])}
+              className="text-sm"
+            />
+            <select value={importFormat} onChange={(e) => setImportFormat(e.target.value as "csv" | "json")} className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+              <option value="csv">CSV</option>
+              <option value="json">JSON</option>
+            </select>
+            <select value={importConflict} onChange={(e) => setImportConflict(e.target.value as "skip" | "update")} className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+              <option value="skip">{t("contacts.conflictSkip")}</option>
+              <option value="update">{t("contacts.conflictUpdate")}</option>
+            </select>
+          </div>
+          <textarea
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+            rows={6}
+            placeholder={t("contacts.importPlaceholder")}
+            className={`${inputCls} font-mono text-xs`}
+          />
+          <button onClick={() => void runImport()} disabled={importBusy || !importText.trim()} className={primaryBtn}>
+            {importBusy ? t("common.sending") : t("contacts.importRun")}
+          </button>
+          {importResult && (
+            <div className="rounded-md border border-slate-200 p-3 text-sm dark:border-slate-700">
+              <div>
+                {t("contacts.importSummary", {
+                  inserted: String(importResult.inserted),
+                  updated: String(importResult.updated),
+                  skipped: String(importResult.skipped),
+                })}
+              </div>
+              {importResult.errors.length > 0 && (
+                <ul className="mt-2 list-disc pl-5 text-xs text-red-600 dark:text-red-400">
+                  {importResult.errors.slice(0, 20).map((e, i) => (
+                    <li key={i}>{t("contacts.importRowError", { row: String(e.row), message: e.message })}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </div>
+      )}
       {error && <div className="mt-4"><ErrorBox error={error} /></div>}
       <div className={`mt-4 ${cardCls} overflow-hidden`}>
         {contacts.length === 0 && !error ? (
@@ -745,6 +924,10 @@ function triggerSummary(flow: Flow, t: ReturnType<typeof useI18n>["t"]): string 
   if (trigger.type === "postback") {
     const payload = typeof trigger.config.payload === "string" ? trigger.config.payload : "";
     return t("flows.triggerPostback", { payload });
+  }
+  if (trigger.type === "comment_keyword") {
+    const keyword = typeof trigger.config.keyword === "string" ? trigger.config.keyword : "";
+    return t("flows.triggerComment", { keyword });
   }
   return t("flows.triggerManual");
 }
@@ -1393,6 +1576,202 @@ function ChannelsPage() {
 
 const ROLES = ["owner", "admin", "member", "agent"];
 
+// ----------------------------------------------------------------- Growth
+
+function GrowthPage() {
+  const { t } = useI18n();
+  const [links, setLinks] = useState<GrowthLink[]>([]);
+  const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
+  const [flows, setFlows] = useState<Flow[]>([]);
+  const [accountId, setAccountId] = useState("");
+  const [label, setLabel] = useState("");
+  const [prefilledText, setPrefilledText] = useState("");
+  const [boundFlowId, setBoundFlowId] = useState("");
+  const [targetRef, setTargetRef] = useState("");
+  const [targetUrl, setTargetUrl] = useState("");
+  const [qrSvgs, setQrSvgs] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [ln, acc, fl] = await Promise.all([
+        api.listGrowthLinks(), api.listChannelAccounts(), api.listFlows(),
+      ]);
+      setLinks(ln.links);
+      setAccounts(acc.accounts);
+      setFlows(fl.flows);
+      setError(null);
+    } catch (err) {
+      setError(errText(err, t("growth.loadFailed")));
+    }
+  }, [t]);
+  useEffect(() => { void load(); }, [load]);
+
+  const selectedAccount = accounts.find((a) => a.id === accountId);
+  const kind = selectedAccount?.channel ?? "";
+
+  const create = async () => {
+    if (!accountId || !label.trim()) return;
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await api.createGrowthLink({
+        channelAccountId: accountId,
+        label: label.trim(),
+        ...(prefilledText.trim() ? { prefilledText: prefilledText.trim() } : {}),
+        ...(boundFlowId ? { boundFlowId } : {}),
+        ...(targetRef.trim() ? { targetRef: targetRef.trim() } : {}),
+        ...(targetUrl.trim() ? { targetUrl: targetUrl.trim() } : {}),
+      });
+      setLabel("");
+      setPrefilledText("");
+      setTargetRef("");
+      setTargetUrl("");
+      setBoundFlowId("");
+      setNotice(t("growth.created"));
+      await load();
+    } catch (err) {
+      setError(errText(err, t("growth.createFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const remove = async (link: GrowthLink) => {
+    if (!window.confirm(t("growth.deleteConfirm"))) return;
+    try {
+      await api.deleteGrowthLink(link.id);
+      await load();
+    } catch (err) {
+      setError(errText(err, t("growth.deleteFailed")));
+    }
+  };
+
+  const toggleQr = async (link: GrowthLink) => {
+    if (qrSvgs[link.id]) {
+      setQrSvgs((prev) => { const next = { ...prev }; delete next[link.id]; return next; });
+      return;
+    }
+    try {
+      const svg = await api.growthLinkQrSvg(link.id);
+      setQrSvgs((prev) => ({ ...prev, [link.id]: svg }));
+    } catch (err) {
+      setError(errText(err, t("growth.qrFailed")));
+    }
+  };
+
+  return (
+    <div>
+      <PageTitle title={t("growth.title")} subtitle={t("growth.subtitle")} />
+      {error && <div className="mt-4 max-w-3xl"><ErrorBox error={error} /></div>}
+      {notice && <div className="mt-4 max-w-3xl"><NoticeBox>{notice}</NoticeBox></div>}
+
+      <div className={`mt-6 ${cardCls} p-4 space-y-3 max-w-3xl`}>
+        <div className="font-medium text-sm">{t("growth.createTitle")}</div>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
+            <label className={labelCls}>{t("growth.account")}</label>
+            <select value={accountId} onChange={(e) => setAccountId(e.target.value)} className={inputCls}>
+              <option value="">{t("growth.selectAccount")}</option>
+              {accounts.map((a) => (
+                <option key={a.id} value={a.id}>{a.channel} · {a.displayName ?? a.externalId}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>{t("growth.label")}</label>
+            <input value={label} onChange={(e) => setLabel(e.target.value)} placeholder={t("growth.labelPlaceholder")} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("growth.prefilledText")}</label>
+            <input value={prefilledText} onChange={(e) => setPrefilledText(e.target.value)} placeholder={t("growth.prefilledPlaceholder")} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("growth.boundFlow")}</label>
+            <select value={boundFlowId} onChange={(e) => setBoundFlowId(e.target.value)} className={inputCls}>
+              <option value="">{t("growth.noBoundFlow")}</option>
+              {flows.map((f) => <option key={f.id} value={f.id}>{f.name}</option>)}
+            </select>
+          </div>
+          {(kind === "whatsapp" || kind === "messenger" || kind === "telegram" || kind === "instagram") && (
+            <div>
+              <label className={labelCls}>{t("growth.targetRef")}</label>
+              <input value={targetRef} onChange={(e) => setTargetRef(e.target.value)} placeholder={t("growth.targetRefPlaceholder")} className={inputCls} />
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("growth.targetRefHint")}</p>
+            </div>
+          )}
+          {kind === "webchat" && (
+            <div>
+              <label className={labelCls}>{t("growth.targetUrl")}</label>
+              <input value={targetUrl} onChange={(e) => setTargetUrl(e.target.value)} placeholder="https://..." className={inputCls} />
+            </div>
+          )}
+        </div>
+        <button onClick={() => void create()} disabled={busy || !accountId || !label.trim()} className={primaryBtn}>
+          {t("growth.create")}
+        </button>
+      </div>
+
+      <div className={`mt-4 ${cardCls} overflow-hidden`}>
+        {links.length === 0 && !error ? (
+          <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("growth.empty")}</div>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+              <tr>
+                <th className="px-4 py-2 font-medium">{t("growth.label")}</th>
+                <th className="px-4 py-2 font-medium">{t("common.channel")}</th>
+                <th className="px-4 py-2 font-medium">{t("growth.shortUrl")}</th>
+                <th className="px-4 py-2 font-medium">{t("growth.clicks")}</th>
+                <th className="px-4 py-2 font-medium">{t("growth.conversions")}</th>
+                <th className="px-4 py-2 font-medium">{t("common.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {links.map((link) => (
+                <tr key={link.id} className="border-t border-slate-100 align-top dark:border-slate-800">
+                  <td className="px-4 py-2">{link.label}</td>
+                  <td className="px-4 py-2">{link.kind}</td>
+                  <td className="px-4 py-2">
+                    <span className="flex items-center gap-2">
+                      <code className="text-xs break-all">{link.shortUrl}</code>
+                      <button onClick={() => void navigator.clipboard.writeText(link.shortUrl)} className="text-xs text-slate-600 underline dark:text-slate-300">
+                        {t("common.copy")}
+                      </button>
+                    </span>
+                    {qrSvgs[link.id] && (
+                      <span className="mt-2 flex items-start gap-2">
+                        <span className="block h-24 w-24 bg-white p-1 [&>svg]:h-full [&>svg]:w-full" dangerouslySetInnerHTML={{ __html: qrSvgs[link.id] ?? "" }} />
+                        <button
+                          onClick={() => downloadTextFile(`qr-${link.slug}.svg`, qrSvgs[link.id] ?? "", "image/svg+xml")}
+                          className="text-xs text-slate-600 underline dark:text-slate-300"
+                        >
+                          {t("growth.qrDownload")}
+                        </button>
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2">{link.clicks}</td>
+                  <td className="px-4 py-2">{link.conversions}</td>
+                  <td className="px-4 py-2">
+                    <span className="flex gap-2">
+                      <button onClick={() => void toggleQr(link)} className="text-xs text-slate-600 underline dark:text-slate-300">
+                        {t("growth.qr")}
+                      </button>
+                      <button onClick={() => void remove(link)} className="text-xs text-red-600 underline dark:text-red-400">
+                        {t("common.delete")}
+                      </button>
+                    </span>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function SettingsPage({ user, workspace, refreshSession }: {
   user: AuthUser;
   workspace: WorkspaceSummary | undefined;
@@ -1409,8 +1788,46 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // API tokens (adopted features): raw token shown ONCE after creation.
+  const [apiTokens, setApiTokens] = useState<ApiTokenInfo[]>([]);
+  const [tokenName, setTokenName] = useState("");
+  const [newRawToken, setNewRawToken] = useState<string | null>(null);
 
   useEffect(() => { setWsName(workspace?.name ?? ""); }, [workspace?.name]);
+
+  const loadTokens = useCallback(async () => {
+    try {
+      const res = await api.listApiTokens();
+      setApiTokens(res.tokens);
+    } catch (err) {
+      setError(errText(err, t("settings.tokensFailed")));
+    }
+  }, [t]);
+  useEffect(() => { void loadTokens(); }, [loadTokens]);
+
+  const createToken = async () => {
+    if (!tokenName.trim()) return;
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const res = await api.createApiToken(tokenName.trim());
+      setNewRawToken(res.token);
+      setTokenName("");
+      await loadTokens();
+    } catch (err) {
+      setError(errText(err, t("settings.tokensFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const revokeToken = async (token: ApiTokenInfo) => {
+    if (!window.confirm(t("settings.tokenRevokeConfirm"))) return;
+    try {
+      await api.revokeApiToken(token.id);
+      if (newRawToken && newRawToken.startsWith(token.prefix)) setNewRawToken(null);
+      await loadTokens();
+    } catch (err) {
+      setError(errText(err, t("settings.tokensFailed")));
+    }
+  };
 
   const loadMembers = useCallback(async () => {
     if (!workspace) return;
@@ -1547,6 +1964,66 @@ function SettingsPage({ user, workspace, refreshSession }: {
             <ThemeToggle />
           </div>
         </div>
+      </div>
+
+      <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+        <div className="font-medium text-sm">{t("settings.tokensTitle")}</div>
+        <p className={`mt-1 ${mutedCls}`}>{t("settings.tokensBody")}</p>
+        {newRawToken && (
+          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950">
+            <div className="text-xs font-medium text-amber-900 dark:text-amber-200">{t("settings.tokenOnce")}</div>
+            <div className="mt-1 flex items-center gap-2">
+              <code className="flex-1 break-all rounded bg-white px-2 py-1 text-xs text-slate-900 dark:bg-slate-900 dark:text-slate-100">{newRawToken}</code>
+              <button
+                onClick={() => void navigator.clipboard.writeText(newRawToken)}
+                className="text-xs text-slate-700 underline dark:text-slate-200"
+              >
+                {t("common.copy")}
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <input
+            value={tokenName}
+            onChange={(e) => setTokenName(e.target.value)}
+            placeholder={t("settings.tokenNamePlaceholder")}
+            className="w-64 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+          <button onClick={() => void createToken()} disabled={busy || !tokenName.trim()} className={primaryBtn}>
+            {t("settings.tokenCreate")}
+          </button>
+        </div>
+        {apiTokens.length === 0 ? (
+          <p className={`mt-3 ${mutedCls}`}>{t("settings.tokensEmpty")}</p>
+        ) : (
+          <table className="mt-3 w-full text-sm">
+            <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+              <tr>
+                <th className="px-3 py-2 font-medium">{t("common.name")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenPrefix")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenCreated")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenLastUsed")}</th>
+                <th className="px-3 py-2 font-medium">{t("common.actions")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {apiTokens.map((token) => (
+                <tr key={token.id} className="border-t border-slate-100 dark:border-slate-800">
+                  <td className="px-3 py-2">{token.name}</td>
+                  <td className="px-3 py-2"><code className="text-xs">{token.prefix}...</code></td>
+                  <td className="px-3 py-2">{new Date(token.createdAt).toLocaleString()}</td>
+                  <td className="px-3 py-2">{token.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</td>
+                  <td className="px-3 py-2">
+                    <button onClick={() => void revokeToken(token)} className="text-xs text-red-600 dark:text-red-400 underline">
+                      {t("settings.tokenRevoke")}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
@@ -1896,6 +2373,7 @@ function AuthedApp() {
         {page === "publish" && <PublishPage />}
         {page === "channels" && <ChannelsPage />}
         {page === "knowledge" && <KnowledgePage />}
+        {page === "growth" && <GrowthPage />}
         {page === "settings" && (
           <SettingsPage
             user={user}

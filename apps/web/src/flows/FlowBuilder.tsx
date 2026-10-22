@@ -5,7 +5,10 @@ import {
   type Connection, type Edge, type Node, type NodeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { api, ApiError, type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger } from "../api";
+import {
+  api, ApiError,
+  type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger, type RichBlock, type RichButton,
+} from "../api";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 
@@ -75,10 +78,15 @@ function nodeSummary(node: EngineNode): string {
     case "trigger": {
       const kind = cfgStr(node, "flowTriggerType") || (node.trigger === "keyword" ? "keyword" : "manual");
       if (kind === "keyword") return `"${cfgStr(node, "keyword")}"`;
+      if (kind === "comment_keyword") return `comment: "${cfgStr(node, "keyword")}"`;
       if (kind === "postback") return `payload: ${cfgStr(node, "payload")}`;
       return "manual";
     }
-    case "send_message": return str(node, "text").slice(0, 60) || "...";
+    case "send_message": {
+      const rich = node.rich as RichBlock | undefined;
+      const base = str(node, "text").slice(0, 60) || "...";
+      return rich ? `${base} [+${rich.kind}]` : base;
+    }
     case "condition": return `${str(node, "field")} ${str(node, "operator")} ${str(node, "value")}`.trim();
     case "delay": return `${String(node.seconds ?? 0)}s`;
     case "webhook": return str(node, "url").slice(0, 40);
@@ -188,7 +196,255 @@ function deriveTrigger(graph: FlowGraph): FlowTrigger {
   if (kind === "postback") {
     return { type: "postback", config: { payload: String(config.payload ?? ""), match: "equals" } };
   }
+  if (kind === "comment_keyword") {
+    return {
+      type: "comment_keyword",
+      config: {
+        keyword: String(config.keyword ?? ""),
+        match: config.match === "equals" ? "equals" : "contains",
+        ...(typeof config.publicReplyText === "string" && config.publicReplyText ? { publicReplyText: config.publicReplyText } : {}),
+        ...(config.autoHide === true ? { autoHide: true } : {}),
+        ...(typeof config.privateText === "string" && config.privateText ? { privateText: config.privateText } : {}),
+      },
+    };
+  }
   return { type: "manual", config: {} };
+}
+
+const RICH_KINDS = ["buttons", "list", "carousel", "product", "catalog"] as const;
+
+// Same primitives as BuilderInner's locals (kept in sync deliberately).
+const richInputCls = "w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100";
+const richLabelCls = "block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1";
+
+function defaultRichBlock(kind: RichBlock["kind"]): RichBlock {
+  switch (kind) {
+    case "buttons": return { kind, text: "", buttons: [{ type: "reply", title: "", payload: "" }] };
+    case "list": return { kind, text: "", buttonText: "View", sections: [{ title: "", rows: [{ id: "1", title: "" }] }] };
+    case "carousel": return { kind, cards: [{ title: "" }] };
+    case "product": return { kind, catalogId: "", productId: "", text: "" };
+    case "catalog": return { kind, catalogId: "", text: "" };
+  }
+}
+
+/**
+ * Rich-block editor for send_message nodes (adopted features). Functional
+ * over fancy: kind select + the fields each block kind needs. List rows
+ * and catalog sections use one-line-per-entry textareas
+ * ("id | title | description" / "Section title: id1, id2").
+ * Channels render what they support and degrade the rest to text with a
+ * typed warning - the editor therefore allows every combination.
+ */
+function RichBlockEditor({ node, patch, t }: {
+  node: EngineNode;
+  patch: (patch: Record<string, unknown>) => void;
+  t: ReturnType<typeof useI18n>["t"];
+}) {
+  const rich = (node.rich && typeof node.rich === "object" ? (node.rich as RichBlock) : null);
+  const setRich = (next: RichBlock | undefined) => patch({ rich: next });
+
+  if (!rich) {
+    return (
+      <button
+        onClick={() => setRich(defaultRichBlock("buttons"))}
+        className="text-xs text-slate-600 underline dark:text-slate-300"
+      >
+        {t("flows.rich.add")}
+      </button>
+    );
+  }
+
+  const rowsText = rich.kind === "list"
+    ? rich.sections.flatMap((s) => s.rows.map((r) => `${s.title} | ${r.id} | ${r.title}${r.description ? ` | ${r.description}` : ""}`)).join("\n")
+    : "";
+  const applyRowsText = (text: string) => {
+    if (rich.kind !== "list") return;
+    const sections: Array<{ title: string; rows: Array<{ id: string; title: string; description?: string }> }> = [];
+    for (const line of text.split("\n")) {
+      const parts = line.split("|").map((p) => p.trim());
+      if (parts.length < 3 || !parts[1] || !parts[2]) continue;
+      const [sectionTitle, id, title, description] = parts as [string, string, string, string?];
+      let section = sections.find((s) => s.title === sectionTitle);
+      if (!section) {
+        section = { title: sectionTitle, rows: [] };
+        sections.push(section);
+      }
+      section.rows.push({ id, title, ...(description ? { description } : {}) });
+    }
+    setRich({ ...rich, sections });
+  };
+
+  const sectionsText = rich.kind === "catalog"
+    ? (rich.sections ?? []).map((s) => `${s.title}: ${s.productIds.join(",")}`).join("\n")
+    : "";
+  const applySectionsText = (text: string) => {
+    if (rich.kind !== "catalog") return;
+    const sections = text.split("\n").map((line) => {
+      const idx = line.indexOf(":");
+      if (idx < 0) return null;
+      const title = line.slice(0, idx).trim();
+      const productIds = line.slice(idx + 1).split(",").map((p) => p.trim()).filter(Boolean);
+      return title && productIds.length > 0 ? { title, productIds } : null;
+    }).filter((s): s is { title: string; productIds: string[] } => s !== null);
+    setRich({ ...rich, sections });
+  };
+
+  return (
+    <div className="space-y-3 rounded-md border border-slate-200 p-3 dark:border-slate-700">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-slate-700 dark:text-slate-200">{t("flows.rich.title")}</span>
+        <button onClick={() => setRich(undefined)} className="text-xs text-red-600 underline dark:text-red-400">
+          {t("common.remove")}
+        </button>
+      </div>
+      <div>
+        <label className={richLabelCls}>{t("flows.rich.kind")}</label>
+        <select
+          value={rich.kind}
+          onChange={(e) => setRich(defaultRichBlock(e.target.value as RichBlock["kind"]))}
+          className={richInputCls}
+        >
+          {RICH_KINDS.map((k) => <option key={k} value={k}>{k}</option>)}
+        </select>
+      </div>
+
+      {(rich.kind === "buttons" || rich.kind === "list" || rich.kind === "product" || rich.kind === "catalog") && (
+        <div>
+          <label className={richLabelCls}>{t("flows.field.text")}</label>
+          <textarea value={rich.text ?? ""} onChange={(e) => setRich({ ...rich, text: e.target.value } as RichBlock)} rows={2} className={richInputCls} />
+        </div>
+      )}
+
+      {rich.kind === "buttons" && (
+        <div className="space-y-2">
+          {rich.buttons.map((b, i) => (
+            <div key={i} className="flex flex-wrap gap-2">
+              <select
+                value={b.type}
+                onChange={(e) => {
+                  const type = e.target.value as RichButton["type"];
+                  const buttons = rich.buttons.map((x, j) => (j === i ? { ...x, type } : x));
+                  setRich({ ...rich, buttons });
+                }}
+                className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              >
+                <option value="reply">reply</option>
+                <option value="postback">postback</option>
+                <option value="url">url</option>
+              </select>
+              <input
+                value={b.title}
+                onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, title: e.target.value } : x)) })}
+                placeholder={t("flows.rich.buttonTitle")}
+                className="w-28 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              />
+              {b.type === "url" ? (
+                <input
+                  value={b.url ?? ""}
+                  onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)) })}
+                  placeholder="https://..."
+                  className="w-40 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                />
+              ) : (
+                <input
+                  value={b.payload ?? ""}
+                  onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, payload: e.target.value } : x)) })}
+                  placeholder="payload"
+                  className="w-40 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                />
+              )}
+              <button
+                onClick={() => setRich({ ...rich, buttons: rich.buttons.filter((_, j) => j !== i) })}
+                className="text-xs text-red-600 underline dark:text-red-400"
+              >
+                {t("common.remove")}
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={() => setRich({ ...rich, buttons: [...rich.buttons, { type: "reply", title: "", payload: "" }] })}
+            className="text-xs text-slate-600 underline dark:text-slate-300"
+          >
+            {t("flows.rich.addButton")}
+          </button>
+        </div>
+      )}
+
+      {rich.kind === "list" && (
+        <>
+          <div>
+            <label className={richLabelCls}>{t("flows.rich.buttonText")}</label>
+            <input value={rich.buttonText} onChange={(e) => setRich({ ...rich, buttonText: e.target.value })} className={richInputCls} />
+          </div>
+          <div>
+            <label className={richLabelCls}>{t("flows.rich.rows")}</label>
+            <textarea defaultValue={rowsText} key={rowsText} onBlur={(e) => applyRowsText(e.target.value)} rows={4} className={`${richInputCls} font-mono text-xs`} placeholder="Section | id | Title | Description" />
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.rich.rowsHint")}</p>
+          </div>
+        </>
+      )}
+
+      {rich.kind === "carousel" && (
+        <div className="space-y-2">
+          {rich.cards.map((card, i) => (
+            <div key={i} className="space-y-1 rounded border border-slate-100 p-2 dark:border-slate-800">
+              <input
+                value={card.title}
+                onChange={(e) => setRich({ ...rich, cards: rich.cards.map((x, j) => (j === i ? { ...x, title: e.target.value } : x)) })}
+                placeholder={t("flows.rich.cardTitle")}
+                className={richInputCls}
+              />
+              <input
+                value={card.subtitle ?? ""}
+                onChange={(e) => setRich({ ...rich, cards: rich.cards.map((x, j) => (j === i ? { ...x, subtitle: e.target.value } : x)) })}
+                placeholder={t("flows.rich.cardSubtitle")}
+                className={richInputCls}
+              />
+              <input
+                value={card.imageUrl ?? ""}
+                onChange={(e) => setRich({ ...rich, cards: rich.cards.map((x, j) => (j === i ? { ...x, imageUrl: e.target.value } : x)) })}
+                placeholder="https://.../image.jpg"
+                className={richInputCls}
+              />
+              <button
+                onClick={() => setRich({ ...rich, cards: rich.cards.filter((_, j) => j !== i) })}
+                className="text-xs text-red-600 underline dark:text-red-400"
+              >
+                {t("common.remove")}
+              </button>
+            </div>
+          ))}
+          <button
+            onClick={() => setRich({ ...rich, cards: [...rich.cards, { title: "" }] })}
+            className="text-xs text-slate-600 underline dark:text-slate-300"
+          >
+            {t("flows.rich.addCard")}
+          </button>
+        </div>
+      )}
+
+      {(rich.kind === "product" || rich.kind === "catalog") && (
+        <div>
+          <label className={richLabelCls}>{t("flows.rich.catalogId")}</label>
+          <input value={rich.catalogId} onChange={(e) => setRich({ ...rich, catalogId: e.target.value })} className={richInputCls} />
+        </div>
+      )}
+      {rich.kind === "product" && (
+        <div>
+          <label className={richLabelCls}>{t("flows.rich.productId")}</label>
+          <input value={rich.productId} onChange={(e) => setRich({ ...rich, productId: e.target.value })} className={richInputCls} />
+        </div>
+      )}
+      {rich.kind === "catalog" && (
+        <div>
+          <label className={richLabelCls}>{t("flows.rich.sections")}</label>
+          <textarea defaultValue={sectionsText} key={sectionsText} onBlur={(e) => applySectionsText(e.target.value)} rows={3} className={`${richInputCls} font-mono text-xs`} placeholder="Featured: sku-1,sku-2" />
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.rich.sectionsHint")}</p>
+        </div>
+      )}
+      <p className="text-xs text-slate-500 dark:text-slate-400">{t("flows.rich.degradeHint")}</p>
+    </div>
+  );
 }
 
 interface BuilderProps {
@@ -376,7 +632,10 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                         onChange={(e) => {
                           const kind = e.target.value;
                           patchSelected({
-                            trigger: kind === "keyword" ? "keyword" : kind === "postback" ? "message.received" : "manual",
+                            trigger: kind === "keyword" ? "keyword"
+                              : kind === "postback" ? "message.received"
+                              : kind === "comment_keyword" ? "comment.received"
+                              : "manual",
                           });
                           patchSelectedConfig({ flowTriggerType: kind });
                         }}
@@ -384,6 +643,7 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                       >
                         <option value="keyword">keyword</option>
                         <option value="postback">postback</option>
+                        <option value="comment_keyword">{t("flows.field.triggerComment")}</option>
                         <option value="manual">manual</option>
                       </select>
                     </div>
@@ -408,6 +668,38 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                         <input value={cfgStr(selected, "payload")} onChange={(e) => patchSelectedConfig({ payload: e.target.value })} className={inputCls} />
                       </div>
                     )}
+                    {cfgStr(selected, "flowTriggerType") === "comment_keyword" && (
+                      <>
+                        <div>
+                          <label className={labelCls}>{t("flows.field.keyword")}</label>
+                          <input value={cfgStr(selected, "keyword")} onChange={(e) => patchSelectedConfig({ keyword: e.target.value })} className={inputCls} />
+                        </div>
+                        <div>
+                          <label className={labelCls}>{t("flows.field.match")}</label>
+                          <select value={cfgStr(selected, "match") || "contains"} onChange={(e) => patchSelectedConfig({ match: e.target.value })} className={inputCls}>
+                            <option value="contains">{t("flows.field.matchContains")}</option>
+                            <option value="equals">{t("flows.field.matchEquals")}</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className={labelCls}>{t("flows.field.publicReply")}</label>
+                          <input value={cfgStr(selected, "publicReplyText")} onChange={(e) => patchSelectedConfig({ publicReplyText: e.target.value })} placeholder={t("flows.field.publicReplyPlaceholder")} className={inputCls} />
+                        </div>
+                        <label className="flex items-center gap-2 text-sm text-slate-700 dark:text-slate-200">
+                          <input
+                            type="checkbox"
+                            checked={cfg(selected).autoHide === true}
+                            onChange={(e) => patchSelectedConfig({ autoHide: e.target.checked })}
+                          />
+                          {t("flows.field.autoHide")}
+                        </label>
+                        <div>
+                          <label className={labelCls}>{t("flows.field.privateText")}</label>
+                          <textarea value={cfgStr(selected, "privateText")} onChange={(e) => patchSelectedConfig({ privateText: e.target.value })} rows={2} className={inputCls} />
+                          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.privateTextHint")}</p>
+                        </div>
+                      </>
+                    )}
                   </>
                 )}
                 {selected.type === "send_message" && (
@@ -416,6 +708,7 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                       <label className={labelCls}>{t("flows.field.text")}</label>
                       <textarea value={str(selected, "text")} onChange={(e) => patchSelected({ text: e.target.value })} rows={3} className={inputCls} />
                     </div>
+                    <RichBlockEditor node={selected} patch={patchSelected} t={t} />
                     <div>
                       <label className={labelCls}>{t("flows.field.channelAccount")}</label>
                       <select

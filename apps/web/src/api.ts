@@ -102,6 +102,42 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
+/** Like request(), but for non-JSON payloads (CSV/JSON export text, QR SVG). */
+async function requestText(path: string): Promise<string> {
+  const workspaceId = getWorkspaceId();
+  const token = getToken();
+  let res: Response;
+  try {
+    res = await fetch(`${BASE_URL}${path}`, {
+      headers: {
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
+        ...(workspaceId ? { "x-workspace-id": workspaceId } : {}),
+      },
+    });
+  } catch {
+    throw new ApiError("NETWORK", 0, API_STRINGS[apiLanguage].unreachable);
+  }
+  if (!res.ok) {
+    const body = (await res.json().catch(() => null)) as { error?: { code: string; message: string } } | null;
+    throw new ApiError(
+      body?.error?.code ?? "INTERNAL",
+      res.status,
+      body?.error?.message ?? API_STRINGS[apiLanguage].requestFailed.replace("{status}", String(res.status)),
+    );
+  }
+  return res.text();
+}
+
+/** Save text as a downloaded file (exports, QR SVGs). */
+export function downloadTextFile(filename: string, text: string, mime = "text/plain"): void {
+  const url = URL.createObjectURL(new Blob([text], { type: mime }));
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export interface AuthUser {
   id: string;
   email: string;
@@ -233,8 +269,68 @@ export interface PublicConfig {
 }
 
 export interface FlowTrigger {
-  type: "keyword" | "postback" | "manual";
+  type: "keyword" | "postback" | "manual" | "comment_keyword";
   config: Record<string, unknown>;
+}
+
+/** Rich message blocks (adopted features) - mirrors @botara/channels. */
+export interface RichButton {
+  type: "reply" | "url" | "postback";
+  title: string;
+  payload?: string;
+  url?: string;
+}
+export type RichBlock =
+  | { kind: "buttons"; text: string; buttons: RichButton[] }
+  | {
+      kind: "list";
+      text: string;
+      buttonText: string;
+      sections: Array<{ title: string; rows: Array<{ id: string; title: string; description?: string }> }>;
+    }
+  | {
+      kind: "carousel";
+      cards: Array<{ title: string; subtitle?: string; imageUrl?: string; buttons?: RichButton[] }>;
+    }
+  | { kind: "product"; catalogId: string; productId: string; text?: string }
+  | {
+      kind: "catalog";
+      catalogId: string;
+      text?: string;
+      sections?: Array<{ title: string; productIds: string[] }>;
+    };
+
+export interface ApiTokenInfo {
+  id: string;
+  name: string;
+  prefix: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+export interface ContactImportResult {
+  inserted: number;
+  updated: number;
+  skipped: number;
+  errors: Array<{ row: number; message: string }>;
+}
+
+export interface GrowthLink {
+  id: string;
+  channelAccountId: string;
+  kind: string;
+  slug: string;
+  label: string;
+  prefilledText: string | null;
+  boundFlowId: string | null;
+  targetRef: string | null;
+  targetUrl: string | null;
+  clicks: number;
+  conversions: number;
+  shortUrl: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface FlowGraphNode {
@@ -317,6 +413,16 @@ export const api = {
   me(): Promise<{ user: AuthUser }> {
     return request("/auth/me");
   },
+  // -------------------------------------------------------- API tokens
+  listApiTokens(): Promise<{ tokens: ApiTokenInfo[] }> {
+    return request("/auth/tokens");
+  },
+  createApiToken(name: string): Promise<{ token: string; tokenInfo: ApiTokenInfo }> {
+    return request("/auth/tokens", { method: "POST", body: JSON.stringify({ name }) });
+  },
+  revokeApiToken(id: string): Promise<{ revoked: boolean }> {
+    return request(`/auth/tokens/${id}`, { method: "DELETE" });
+  },
   listWorkspaces(): Promise<{ workspaces: WorkspaceSummary[] }> {
     return request("/workspaces");
   },
@@ -344,7 +450,10 @@ export const api = {
   listMessages(conversationId: string): Promise<{ messages: Message[] }> {
     return request(`/conversations/${conversationId}/messages`);
   },
-  reply(conversationId: string, body: { kind: "free_form" | "template"; text?: string; templateId?: string }): Promise<unknown> {
+  reply(
+    conversationId: string,
+    body: { kind: "free_form" | "template"; text?: string; templateId?: string; rich?: RichBlock },
+  ): Promise<{ message: unknown; delivery: string; warnings?: string[] }> {
     return request(`/conversations/${conversationId}/reply`, {
       method: "POST",
       body: JSON.stringify(body),
@@ -353,6 +462,38 @@ export const api = {
   listContacts(tag?: string): Promise<{ contacts: Contact[] }> {
     const suffix = tag ? `?tag=${encodeURIComponent(tag)}` : "";
     return request(`/contacts${suffix}`);
+  },
+  importContacts(body: {
+    format: "csv" | "json";
+    content: string;
+    conflict: "skip" | "update";
+  }): Promise<ContactImportResult> {
+    return request("/contacts/import", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** Export downloads raw text (CSV/JSON); the caller saves it as a file. */
+  async exportContacts(format: "csv" | "json"): Promise<string> {
+    return requestText(`/contacts/export?format=${format}`);
+  },
+  // -------------------------------------------------------- growth links
+  listGrowthLinks(): Promise<{ links: GrowthLink[] }> {
+    return request("/growth-links");
+  },
+  createGrowthLink(body: {
+    channelAccountId: string;
+    label: string;
+    prefilledText?: string;
+    boundFlowId?: string;
+    targetRef?: string;
+    targetUrl?: string;
+  }): Promise<{ link: GrowthLink }> {
+    return request("/growth-links", { method: "POST", body: JSON.stringify(body) });
+  },
+  deleteGrowthLink(id: string): Promise<{ deleted: boolean }> {
+    return request(`/growth-links/${id}`, { method: "DELETE" });
+  },
+  /** QR SVG markup for a link's short URL (auth-required endpoint). */
+  async growthLinkQrSvg(id: string): Promise<string> {
+    return requestText(`/growth-links/${id}/qr.svg`);
   },
   listTemplates(): Promise<{ templates: Template[] }> {
     return request("/templates");
