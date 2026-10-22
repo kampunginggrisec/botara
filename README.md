@@ -78,6 +78,60 @@ tests; live credentials arrive with the VPS/domain):
 - **Web:** Inbox (thread + reply box with window-closed state), Contacts
   (tag filter), and Broadcast (estimate + create) screens wired to the API.
 
+## Fase 2 status
+
+Channel completion + publishing suite + sequences + basic AI, again
+code-complete against the real APIs with mocked-HTTP tests:
+
+- **Instagram (dual mode, one adapter):** `instagram-login` talks to
+  graph.instagram.com with the `instagram_business_*` scopes; `facebook-login`
+  talks to graph.facebook.com (pinned v26.0) with the `instagram_*` scopes via
+  a linked Page. The authorize-URL builder ALWAYS sends the full scope list
+  (with Instagram Login a partial `scope` parameter replaces the defaults).
+  DMs, public comment replies, private replies (1 per comment), hide/delete,
+  two-step media publish, and insights using the Views metric family only.
+- **Messenger:** Send API with a Page token, handover protocol
+  (pass/take thread control), Get Started + persistent-menu helpers, Page
+  feed publishing, comment moderation; webhooks normalize messages,
+  postbacks, and referrals.
+- **Threads (the differentiator):** graph.threads.net container→publish
+  flow, `auto_publish_text` one-step text posts, replies, quotes, reply
+  hide/unhide, own-post delete, keyword search, Views insights — and the
+  full token lifecycle: short (1h) → long-lived (60d) exchange, refresh
+  only inside the 24h–60d window (a pure decision function, unit-tested).
+  Threads still has **no DM and no like API**; the adapter refuses DMs
+  honestly. Note: private profiles' permissions expire after 90 days.
+- **Webchat (self-built):** Meta's Customer Chat Plugin retired 2024-05-09,
+  so the website widget is Botara's own — an embeddable `widget.js`, public
+  session/send/poll endpoints, and inbox replies persisted through a
+  store-port adapter. See [docs/webchat.md](docs/webchat.md).
+- **Email via Resend:** sends always carry an `Idempotency-Key`; the
+  `email.received` webhook is metadata-only, full content is fetched via
+  the Receiving + Attachments APIs and attachments are copied into R2 by
+  the worker. Svix signature verification included.
+- **WhatsApp onboarding:** `POST /channels/whatsapp/embedded-signup/exchange`
+  performs the Embedded Signup v4 server exchange (code → debug_token →
+  phone numbers), stores the token ONLY in the vault port, persists channel
+  accounts with their coexistence flag, and returns a summary with no token
+  material. Template category-change webhooks now actually PATCH
+  `templates.latest_category` and persist the messaging account (WABA) id.
+- **Publishing suite:** `scheduled_posts` with per-channel targets and
+  per-target results; CRUD + publish-now API; a worker publish processor
+  with partial-failure semantics (one target failing never fails others).
+  The Publish screen (composer + channel checkboxes + schedule + per-target
+  status) is wired to it.
+- **Sequences:** drip campaigns as ordered delay+message steps; enroll by
+  tag; a worker processor advances due enrollments through the send-message
+  queue with stable per-step idempotency keys.
+- **Token-refresh worker:** daily scan enqueues per-account refresh jobs
+  (jobId per account+day), adapters decide by the refresh window, failures
+  mark the account `refresh_failed` and emit a structured alert.
+- **AI basics:** an OpenAI-compatible provider (any endpoint speaking the
+  OpenAI wire format; base URL/key/model from env), `POST
+  /conversations/:id/ai-suggest` (503 when unconfigured — suggestions are
+  never faked), and a keyword moderation helper behind
+  `POST /moderation/check`.
+
 ## Deployment
 
 Production package is prepared (VPS/domain menyusul): root `Dockerfile`

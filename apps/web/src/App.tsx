@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   api, ApiError, getWorkspaceId, setWorkspaceId,
-  type BroadcastEstimate, type Contact, type Conversation, type Message, type Template,
+  type BroadcastEstimate, type ChannelAccount, type Contact, type Conversation,
+  type Message, type ScheduledPost, type Template,
 } from "./api";
 
 const NAV = ["Dashboard", "Inbox", "Contacts", "Flows", "Broadcast", "Sequences", "Publish", "Channels", "Settings"];
@@ -362,6 +363,198 @@ function BroadcastPage() {
   );
 }
 
+// ----------------------------------------------------------------- Publish
+
+function PublishPage() {
+  const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [text, setText] = useState("");
+  const [mediaUrl, setMediaUrl] = useState("");
+  const [scheduledAt, setScheduledAt] = useState("");
+  const [posts, setPosts] = useState<ScheduledPost[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const [acc, pst] = await Promise.all([api.listChannelAccounts(), api.listPosts()]);
+      setAccounts(acc.accounts);
+      setPosts(pst.posts);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Gagal memuat data publishing.");
+    }
+  }, []);
+
+  useEffect(() => { void load(); }, [load]);
+
+  const publishable = accounts.filter((a) => ["instagram", "threads", "messenger", "telegram"].includes(a.channel));
+  const accountLabel = (id: string) => {
+    const acc = accounts.find((a) => a.id === id);
+    return acc ? `${acc.channel} · ${acc.displayName ?? acc.externalId}` : id;
+  };
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  const create = async () => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await api.createPost({
+        text: text.trim() || undefined,
+        mediaUrls: mediaUrl.trim() ? [mediaUrl.trim()] : undefined,
+        targets: [...selected].map((channelAccountId) => ({ channelAccountId })),
+        scheduledAt: scheduledAt ? new Date(scheduledAt).toISOString() : undefined,
+      });
+      setText("");
+      setMediaUrl("");
+      setScheduledAt("");
+      setNotice(scheduledAt ? "Post terjadwal dibuat. Worker akan mempublikasikannya saat waktunya tiba." : "Post dibuat sebagai draft. Gunakan tombol Terbitkan untuk mengirim sekarang.");
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Gagal membuat post.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const publishNow = async (post: ScheduledPost) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.publishPostNow(post.id);
+      setNotice("Job publish masuk antrean worker. Status per-target akan muncul setelah worker selesai.");
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Gagal menerbitkan post.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (post: ScheduledPost) => {
+    setBusy(true);
+    try {
+      await api.deletePost(post.id);
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Gagal menghapus post.");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const inputCls = "w-full rounded-md border border-slate-300 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400";
+  const labelCls = "block text-xs font-medium text-slate-500 mb-1";
+
+  return (
+    <div>
+      <h1 className="text-2xl font-semibold">Publish</h1>
+      <p className="mt-1 text-sm text-slate-500">
+        Satu konten, banyak channel. Instagram &amp; Threads mempublikasikan dari URL media publik (R2);
+        kegagalan satu target tidak menggagalkan target lain (status parsial).
+      </p>
+      {error && <div className="mt-4 max-w-3xl"><ErrorBox error={error} /></div>}
+      {notice && (
+        <div className="mt-4 max-w-3xl rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-3 text-sm text-emerald-900">{notice}</div>
+      )}
+
+      <div className="mt-6 max-w-3xl rounded-lg border border-slate-200 bg-white shadow-sm p-4 space-y-4">
+        <div>
+          <label className={labelCls}>Konten</label>
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={3}
+            placeholder="Tulis caption / isi post..."
+            className={inputCls}
+          />
+        </div>
+        <div>
+          <label className={labelCls}>URL media publik (opsional, untuk Instagram/Threads wajib)</label>
+          <input value={mediaUrl} onChange={(e) => setMediaUrl(e.target.value)} placeholder="https://media.example.com/foto.jpg" className={inputCls} />
+        </div>
+        <div>
+          <label className={labelCls}>Channel tujuan</label>
+          {publishable.length === 0 ? (
+            <div className="text-sm text-slate-400">Belum ada akun channel yang bisa publish (Instagram/Threads/Messenger/Telegram). Hubungkan akun dulu di menu Channels.</div>
+          ) : (
+            <div className="flex flex-wrap gap-2">
+              {publishable.map((acc) => (
+                <label key={acc.id} className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm cursor-pointer ${selected.has(acc.id) ? "border-slate-900 bg-slate-900 text-white" : "border-slate-300 bg-white"}`}>
+                  <input type="checkbox" checked={selected.has(acc.id)} onChange={() => toggle(acc.id)} className="hidden" />
+                  {acc.channel} · {acc.displayName ?? acc.externalId}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
+        <div className="max-w-xs">
+          <label className={labelCls}>Jadwal terbit (kosongkan = draft)</label>
+          <input type="datetime-local" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} className={inputCls} />
+        </div>
+        <button
+          onClick={() => void create()}
+          disabled={busy || selected.size === 0 || (!text.trim() && !mediaUrl.trim())}
+          className="rounded-md bg-slate-900 text-white text-sm px-4 py-2 disabled:opacity-50"
+        >
+          {scheduledAt ? "Jadwalkan Post" : "Simpan Draft"}
+        </button>
+      </div>
+
+      <div className="mt-6 max-w-3xl space-y-3">
+        <div className="font-medium text-sm">Post terjadwal &amp; terbit</div>
+        {posts.length === 0 && !error && <EmptyState>Belum ada post. Buat dari composer di atas.</EmptyState>}
+        {posts.map((post) => (
+          <div key={post.id} className="rounded-lg border border-slate-200 bg-white shadow-sm p-4">
+            <div className="flex items-start justify-between gap-3">
+              <div className="text-sm whitespace-pre-wrap">{post.text ?? <em className="text-slate-400">(tanpa teks)</em>}</div>
+              <span className="shrink-0 text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600">{post.status}</span>
+            </div>
+            {post.mediaUrls.length > 0 && (
+              <div className="mt-2 text-xs text-slate-500 break-all">{post.mediaUrls.join(", ")}</div>
+            )}
+            <div className="mt-1 text-xs text-slate-500">
+              {post.scheduledAt ? `Terjadwal: ${new Date(post.scheduledAt).toLocaleString()}` : "Draft / terbit manual"}
+            </div>
+            <div className="mt-3 flex flex-wrap gap-2">
+              {post.targets.map((t) => {
+                const result = post.results[t.channelAccountId];
+                return (
+                  <span key={t.channelAccountId} className={`text-xs px-2 py-1 rounded-md border ${result?.status === "sent" ? "border-emerald-300 bg-emerald-50 text-emerald-800" : result?.status === "failed" ? "border-red-300 bg-red-50 text-red-800" : "border-slate-200 bg-slate-50 text-slate-600"}`}>
+                    {accountLabel(t.channelAccountId)}
+                    {result?.status === "sent" && ` ✓ ${result.externalPostId ?? ""}`}
+                    {result?.status === "failed" && ` ✗ ${result.error ?? "gagal"}`}
+                    {!result && " · menunggu"}
+                  </span>
+                );
+              })}
+            </div>
+            <div className="mt-3 flex gap-2">
+              {post.status !== "published" && post.status !== "cancelled" && (
+                <button onClick={() => void publishNow(post)} disabled={busy} className="rounded-md bg-slate-900 text-white text-xs px-3 py-1.5 disabled:opacity-50">
+                  Terbitkan sekarang
+                </button>
+              )}
+              <button onClick={() => void remove(post)} disabled={busy} className="rounded-md border border-slate-300 text-slate-600 text-xs px-3 py-1.5 disabled:opacity-50">
+                Hapus
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // --------------------------------------------------------------------- App
 
 function PlaceholderPage({ name }: { name: string }) {
@@ -382,9 +575,10 @@ function DashboardPage() {
         Bun + Hono di backend dan React + Vite di frontend.
       </p>
       <div className="mt-6 rounded-lg border border-sky-300 bg-sky-50 px-4 py-3 text-sm text-sky-900 max-w-xl">
-        <strong>Fase 1</strong> — Inbox, Contacts, dan Broadcast sudah terhubung ke API:
-        adapter WhatsApp (routing kategori template) dan Telegram asli, jendela balasan 24 jam,
-        estimasi biaya broadcast per rate card berversi.
+        <strong>Fase 2</strong> — Semua channel aktif: Instagram (dua mode login), Messenger,
+        Threads (publish + moderasi), email via Resend, dan webchat widget milik Botara.
+        Layar Publish menjadwalkan satu konten ke banyak channel dengan status per-target.
+        Fase 1: Inbox, Contacts, Broadcast (WhatsApp routing kategori + Telegram).
       </div>
       <div className="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4 max-w-3xl">
         {[
@@ -447,7 +641,8 @@ export function App() {
         {page === "Inbox" && <InboxPage />}
         {page === "Contacts" && <ContactsPage />}
         {page === "Broadcast" && <BroadcastPage />}
-        {!["Dashboard", "Inbox", "Contacts", "Broadcast"].includes(page) && <PlaceholderPage name={page} />}
+        {page === "Publish" && <PublishPage />}
+        {!["Dashboard", "Inbox", "Contacts", "Broadcast", "Publish"].includes(page) && <PlaceholderPage name={page} />}
       </main>
     </div>
   );

@@ -29,6 +29,14 @@ export const envSchema = z.object({
   // Resend
   RESEND_API_KEY: z.string().optional(),
   RESEND_FROM_EMAIL: z.string().email().optional(),
+  RESEND_WEBHOOK_SECRET: z.string().optional(),
+
+  // Fase 2 channels + AI
+  META_VERIFY_TOKEN: z.string().optional(),
+  THREADS_VERIFY_TOKEN: z.string().optional(),
+  AI_API_KEY: z.string().optional(),
+  AI_BASE_URL: z.string().url().optional(),
+  AI_MODEL: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;

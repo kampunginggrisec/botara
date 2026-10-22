@@ -114,6 +114,35 @@ export interface BroadcastEstimate {
   ratesEffectiveDate: string;
 }
 
+export interface ChannelAccount {
+  id: string;
+  channel: string;
+  externalId: string;
+  displayName: string | null;
+  authMode: string | null;
+  status: string;
+  hasCredential: boolean;
+  tokenExpiresAt: string | null;
+  createdAt: string;
+}
+
+export interface PostTargetResult {
+  status: "sent" | "failed";
+  externalPostId?: string;
+  error?: string;
+}
+
+export interface ScheduledPost {
+  id: string;
+  text: string | null;
+  mediaUrls: string[];
+  targets: Array<{ channelAccountId: string; channel: string }>;
+  scheduledAt: string | null;
+  status: string;
+  results: Record<string, PostTargetResult>;
+  createdAt: string;
+}
+
 export const api = {
   listConversations(params: { channel?: string; status?: string } = {}): Promise<{ conversations: Conversation[] }> {
     const qs = new URLSearchParams();
@@ -153,5 +182,26 @@ export const api = {
     tag?: string;
   }): Promise<{ broadcast: { id: string; status: string }; estimate: BroadcastEstimate }> {
     return request("/broadcasts", { method: "POST", body: JSON.stringify(body) });
+  },
+  listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
+    return request("/channels/accounts");
+  },
+  listPosts(status?: string): Promise<{ posts: ScheduledPost[] }> {
+    const suffix = status ? `?status=${encodeURIComponent(status)}` : "";
+    return request(`/posts${suffix}`);
+  },
+  createPost(body: {
+    text?: string;
+    mediaUrls?: string[];
+    targets: Array<{ channelAccountId: string }>;
+    scheduledAt?: string;
+  }): Promise<{ post: ScheduledPost }> {
+    return request("/posts", { method: "POST", body: JSON.stringify(body) });
+  },
+  publishPostNow(postId: string): Promise<{ post: ScheduledPost }> {
+    return request(`/posts/${postId}/publish-now`, { method: "POST", body: "{}" });
+  },
+  deletePost(postId: string): Promise<{ deleted: boolean }> {
+    return request(`/posts/${postId}`, { method: "DELETE" });
   },
 };
