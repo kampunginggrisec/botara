@@ -925,7 +925,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     let signedRequest: string | undefined;
     const contentType = c.req.header("content-type") ?? "";
     if (contentType.includes("application/json")) {
-      const body = await readJsonBody(c).catch(() => ({}));
+      const body = (await readJsonBody(c).catch(() => ({}))) as Record<string, unknown>;
       if (typeof body.signed_request === "string") signedRequest = body.signed_request;
     } else {
       const form = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>;
