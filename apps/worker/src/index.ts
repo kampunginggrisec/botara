@@ -5,6 +5,7 @@ import {
 } from "@botara/ai";
 import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
+  getFlowById, getContact,
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
   getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
@@ -19,8 +20,9 @@ import { getAdapter, EmailAdapter, InstagramAdapter, type ChannelKey } from "@bo
 import { putObject } from "@botara/media";
 import {
   processBroadcast, processFlowRun, processSendMessage,
-  type BroadcastSnapshot, type FlowRunJobData, type SendMessageJobData, type WorkerPorts,
+  type BroadcastSnapshot, type FlowRunJobData, type FlowRunRef, type SendMessageJobData, type WorkerPorts,
 } from "./processors";
+import { storedGraphSchema, toRunnableFlow } from "@botara/flow-engine";
 import {
   processTokenRefreshAccount, processTokenRefreshScan, tokenRefreshJobId,
   type DueTokenAccount, type TokenRefreshPorts,
@@ -81,6 +83,38 @@ function buildProdPorts(db: Database): WorkerPorts {
   return {
     async send(channel, input) {
       return getAdapter(channel as ChannelKey).send(input);
+    },
+    async loadFlowRun(ref) {
+      // Fase 4: resolve an id-based flow-run (webhook dispatch) into the
+      // full job: flow graph -> runnable Flow, contact fields -> variables.
+      const flowRow = await getFlowById(db, ref.flowId);
+      if (!flowRow || flowRow.workspaceId !== ref.workspaceId) return null;
+      const parsed = storedGraphSchema.safeParse(flowRow.graph);
+      if (!parsed.success) return null;
+      const contact = await getContact(db, ref.workspaceId, ref.contactId);
+      if (!contact) return null;
+      const account = await getChannelAccount(db, ref.workspaceId, ref.channelAccountId);
+      if (!account) return null;
+      const variables: Record<string, string> = {};
+      const fields = (contact.customFields ?? {}) as Record<string, unknown>;
+      for (const [key, value] of Object.entries(fields)) {
+        if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+          variables[key] = String(value);
+        }
+      }
+      return {
+        flow: toRunnableFlow(flowRow.id, parsed.data),
+        event: { type: "message.received", text: ref.triggerText, variables },
+        context: {
+          workspaceId: ref.workspaceId,
+          channelAccountId: account.id,
+          channel: account.channel,
+          accountExternalId: account.externalId,
+          tokenVaultRef: account.tokenVaultRef ?? undefined,
+          contactId: contact.id,
+          contactExternalId: contact.externalId,
+        },
+      };
     },
     async writeCost(entry) {
       await insertCostLedger(db, entry);
@@ -451,7 +485,7 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
     case "broadcast":
       return processBroadcast(buildProdPorts(db), job.data as { broadcastId: string });
     case "flow-run":
-      return processFlowRun(buildProdPorts(db), job.data as FlowRunJobData);
+      return processFlowRun(buildProdPorts(db), job.data as FlowRunJobData | FlowRunRef);
     case "token-refresh":
       return job.name === "scan"
         ? processTokenRefreshScan(buildTokenRefreshPorts(db), new Date())

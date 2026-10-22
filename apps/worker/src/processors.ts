@@ -68,6 +68,21 @@ export interface FlowRunJobData {
   context: FlowRunContext;
 }
 
+/**
+ * Id-based flow-run reference (Fase 4): webhook-triggered runs enqueue only
+ * ids; the worker resolves the full job via WorkerPorts.loadFlowRun. This is
+ * also the payload the API's flowEnqueuer writes to the queue.
+ */
+export interface FlowRunRef {
+  flowId: string;
+  workspaceId: string;
+  contactId: string;
+  conversationId: string;
+  channelAccountId: string;
+  triggerText?: string;
+  runId?: string;
+}
+
 export interface WorkerPorts {
   /** Resolve the channel adapter (registry) and send. */
   send(channel: string, input: SendInput): Promise<SendResult>;
@@ -98,6 +113,11 @@ export interface WorkerPorts {
    * then sends the node's configured fallback text.
    */
   aiReply?(input: { workspaceId: string; prompt: string; query: string }): Promise<string | null>;
+  /**
+   * Resolve an id-based flow-run reference into a full job (Fase 4).
+   * Optional: embedded-payload jobs (tests, delay resumes) do not need it.
+   */
+  loadFlowRun?(ref: FlowRunRef): Promise<FlowRunJobData | null>;
   /** Enqueue a send-message job; `data.idempotencyKey` is the stable job identity. */
   enqueueSendMessage(data: SendMessageJobData): Promise<void>;
   setContactField(workspaceId: string, contactId: string, field: string, value: string): Promise<void>;
@@ -193,8 +213,30 @@ export async function processBroadcast(
   return { enqueued: targets.length };
 }
 
+/** Type guard: id-based references carry flowId and no embedded flow. */
+export function isFlowRunRef(data: unknown): data is FlowRunRef {
+  if (!data || typeof data !== "object") return false;
+  const d = data as Record<string, unknown>;
+  return typeof d.flowId === "string" && !("flow" in d);
+}
+
 /** "flow-run": execute one flow-engine batch; actions go back out as jobs/calls via ports. */
-export async function processFlowRun(ports: WorkerPorts, data: FlowRunJobData): Promise<FlowRunResult> {
+export async function processFlowRun(
+  ports: WorkerPorts,
+  data: FlowRunJobData | FlowRunRef,
+): Promise<FlowRunResult> {
+  let job: FlowRunJobData;
+  if (isFlowRunRef(data)) {
+    if (!ports.loadFlowRun) {
+      throw new Error("flow-run job carries only ids but WorkerPorts.loadFlowRun is not wired");
+    }
+    const loaded = await ports.loadFlowRun(data);
+    if (!loaded) throw new Error(`flow-run reference could not be resolved (flow ${data.flowId})`);
+    job = loaded;
+  } else {
+    job = data;
+  }
+  data = job;
   const ctx = data.context;
   let sendSeq = 0;
   const flowPorts: FlowPorts = {
