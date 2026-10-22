@@ -368,10 +368,29 @@ for (const name of QUEUE_NAMES) {
   queueByName.set(name, queue);
   queues.push(queue);
   const worker = new Worker(name, (job: Job) => dispatch(name, job), { connection });
-  worker.on("error", (err) => console.error(`[worker] ${name} worker error: ${fmtErr(err)}`));
-  worker.on("failed", (job, err) =>
-    console.error(`[worker] ${name}: job ${job?.id} failed: ${err.message}`),
-  );
+  // Structured JSON lifecycle logs with job context fields (Fase 3
+  // observability): queue + job name + job id + attempt. Job DATA is never
+  // logged - it can contain message bodies and tokens.
+  worker.on("completed", (job) => {
+    console.log(JSON.stringify({
+      ts: new Date().toISOString(), level: "info", service: "worker",
+      queue: name, job: job.name, jobId: job.id, event: "completed",
+      attemptsMade: job.attemptsMade,
+    }));
+  });
+  worker.on("failed", (job, err) => {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(), level: "error", service: "worker",
+      queue: name, job: job?.name, jobId: job?.id, event: "failed",
+      attemptsMade: job?.attemptsMade, error: err.message,
+    }));
+  });
+  worker.on("error", (err) => {
+    console.error(JSON.stringify({
+      ts: new Date().toISOString(), level: "error", service: "worker",
+      queue: name, event: "worker-error", error: fmtErr(err),
+    }));
+  });
   workers.push(worker);
 }
 

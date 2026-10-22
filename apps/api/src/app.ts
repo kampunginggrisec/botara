@@ -509,6 +509,130 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json(errorBody(wrapped), 500);
   });
 
+  // ------------------------------------- observability + security (Fase 3)
+  // Registered FIRST so they wrap every route below. Single-process,
+  // dependency-light implementations on purpose (see docs/runbook.md for
+  // the multi-instance caveats).
+
+  /**
+   * Structured JSON request log: one line per request with a request id
+   * (also returned as x-request-id). NEVER logs bodies, headers, or tokens.
+   */
+  const requestLogger = async (c: Ctx, next: Next) => {
+    const requestId = crypto.randomUUID();
+    c.set("requestId", requestId);
+    c.header("x-request-id", requestId);
+    const started = performance.now();
+    let status = 500;
+    try {
+      await next();
+      status = c.res.status;
+    } catch (err) {
+      status = err instanceof AppError ? err.status : 500;
+      throw err;
+    } finally {
+      console.log(JSON.stringify({
+        ts: new Date().toISOString(),
+        level: "info",
+        service: "api",
+        requestId,
+        method: c.req.method,
+        path: c.req.path,
+        status,
+        ms: Math.round(performance.now() - started),
+      }));
+    }
+  };
+  app.use("*", requestLogger);
+
+  /** Baseline hardening headers on every response; HSTS only behind https. */
+  const securityHeaders = async (c: Ctx, next: Next) => {
+    c.header("x-content-type-options", "nosniff");
+    c.header("x-frame-options", "DENY");
+    c.header("referrer-policy", "no-referrer");
+    const proto = c.req.header("x-forwarded-proto")
+      ?? new URL(c.req.url).protocol.replace(":", "");
+    if (proto === "https") {
+      c.header("strict-transport-security", "max-age=31536000; includeSubDomains");
+    }
+    await next();
+  };
+  app.use("*", securityHeaders);
+
+  /**
+   * CORS: default DENY cross-origin. Dashboard origins opt in via
+   * CORS_ORIGINS (comma-separated, exact match, credentials allowed). The
+   * public webchat endpoints are the one permissive exception - the widget
+   * is embedded on arbitrary customer sites and authenticates with its own
+   * session-token header, never cookies.
+   */
+  const corsMiddleware = async (c: Ctx, next: Next) => {
+    const origin = c.req.header("origin");
+    let granted = false;
+    if (origin) {
+      if (c.req.path.startsWith("/public/webchat/")) {
+        c.header("access-control-allow-origin", "*");
+        c.header("access-control-allow-headers", "content-type, x-webchat-session");
+        granted = true;
+      } else {
+        const allowed = (deps.env.CORS_ORIGINS ?? "")
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean);
+        if (allowed.includes(origin)) {
+          c.header("access-control-allow-origin", origin);
+          c.header("access-control-allow-credentials", "true");
+          c.header("access-control-allow-headers", "content-type, authorization, x-workspace-id");
+          c.header("vary", "Origin");
+          granted = true;
+        }
+      }
+    }
+    if (c.req.method === "OPTIONS" && granted) {
+      c.header("access-control-allow-methods", "GET, POST, PATCH, DELETE, OPTIONS");
+      c.header("access-control-max-age", "600");
+      return c.body(null, 204);
+    }
+    await next();
+  };
+  app.use("*", corsMiddleware);
+
+  /**
+   * In-process fixed-window rate limiter for the abuse-prone surfaces
+   * (/auth/* credential guessing, /public/* widget spam). SINGLE-INSTANCE
+   * assumption: buckets live in this process's memory - behind multiple
+   * API replicas the effective limit multiplies by the replica count;
+   * move to Redis before scaling out (docs/runbook.md).
+   */
+  const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+  const createRateLimiter = (scope: string, limit: number) => async (c: Ctx, next: Next) => {
+    const ip = c.req.header("x-forwarded-for")?.split(",")[0]?.trim()
+      ?? c.req.header("x-real-ip")
+      ?? "unknown";
+    const key = `${scope}:${ip}`;
+    const now = Date.now();
+    if (rateBuckets.size > 10_000) {
+      for (const [k, b] of rateBuckets) if (b.resetAt <= now) rateBuckets.delete(k);
+    }
+    let bucket = rateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      bucket = { count: 0, resetAt: now + 60_000 };
+      rateBuckets.set(key, bucket);
+    }
+    bucket.count++;
+    if (bucket.count > limit) {
+      c.header("retry-after", String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+      throw new AppError(
+        "RATE_LIMITED",
+        "Too many requests - please slow down and retry shortly.",
+        { status: 429, details: { scope, limitPerMinute: limit } },
+      );
+    }
+    await next();
+  };
+  app.use("/auth/*", createRateLimiter("auth", deps.rateLimits?.authPerMinute ?? 20));
+  app.use("/public/*", createRateLimiter("public", deps.rateLimits?.publicPerMinute ?? 120));
+
   // ------------------------------------------------------------ auth helpers
   // Session token: Authorization Bearer wins, the httpOnly cookie is the
   // browser path. SESSION_SECRET missing => auth is unconfigured (503,
@@ -633,6 +757,25 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     responses: { 200: { description: "Service health", content: { "application/json": { schema: z.object({ status: z.literal("ok"), service: z.literal("api") }) } } } },
   });
   app.openapi(healthRoute, (c) => c.json({ status: "ok" as const, service: "api" as const }));
+
+  /**
+   * Readiness (Fase 3): /health says the process is up; /health/ready says
+   * it can actually serve - it pings Postgres (SELECT 1) and Redis (PING)
+   * through the injected probes and answers 503 with a per-dependency
+   * breakdown when either is down.
+   */
+  app.get("/health/ready", async (c) => {
+    const [database, redis] = await Promise.all([
+      deps.readiness.checkDatabase(),
+      deps.readiness.checkRedis(),
+    ]);
+    const ready = database.ok && redis.ok;
+    return c.json(
+      { status: ready ? "ready" : "not-ready", service: "api", dependencies: { database, redis } },
+      ready ? 200 : 503,
+    );
+  });
+
   app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 3" }));
 
   // ---------------------------------------------------------------- auth
