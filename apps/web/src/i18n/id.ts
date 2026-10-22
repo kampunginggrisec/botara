@@ -50,6 +50,8 @@ export const id: Dictionary = {
   "auth.workspacePlaceholder": "Nama workspace / bisnis (opsional)",
   "auth.emailPlaceholder": "email@bisnis.id",
   "auth.passwordPlaceholder": "Kata sandi (min. 8 karakter)",
+  "auth.showPassword": "Tampilkan kata sandi",
+  "auth.hidePassword": "Sembunyikan kata sandi",
   "auth.processing": "Memproses...",
   "auth.login": "Masuk",
   "auth.register": "Daftar",

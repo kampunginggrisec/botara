@@ -52,6 +52,8 @@ export const en = {
   "auth.workspacePlaceholder": "Workspace / business name (optional)",
   "auth.emailPlaceholder": "you@business.com",
   "auth.passwordPlaceholder": "Password (min. 8 characters)",
+  "auth.showPassword": "Show password",
+  "auth.hidePassword": "Hide password",
   "auth.processing": "Processing...",
   "auth.login": "Sign in",
   "auth.register": "Sign up",

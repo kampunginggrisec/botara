@@ -160,7 +160,17 @@ export interface WorkspaceSummary {
 export interface AuthResponse {
   token: string;
   user: AuthUser;
-  workspace: { id: string; name: string; slug: string };
+  /** The workspace the session starts in; null when the user has none. */
+  workspace: { id: string; name: string; slug: string } | null;
+}
+
+/** Raw POST /auth/login payload: plural `workspaces`, unlike register's
+ *  singular `workspace` - the two shapes MUST stay distinct here (typing
+ *  login as AuthResponse hid that difference and broke SPA sign-in). */
+interface LoginResponse {
+  token: string;
+  user: AuthUser;
+  workspaces: { id: string; name: string; slug: string; role: string }[];
 }
 
 export interface KbDocument {
@@ -406,11 +416,19 @@ export interface StatsOverview {
 
 export const api = {
   // ------------------------------------------------------------- auth
-  register(body: { email: string; password: string; name?: string; workspaceName?: string }): Promise<AuthResponse> {
-    return request("/auth/register", { method: "POST", body: JSON.stringify(body) });
+  async register(body: { email: string; password: string; name?: string; workspaceName?: string }): Promise<AuthResponse> {
+    const res = await request<{ token: string; user: AuthUser; workspace: { id: string; name: string; slug: string } }>(
+      "/auth/register", { method: "POST", body: JSON.stringify(body) },
+    );
+    return { token: res.token, user: res.user, workspace: res.workspace };
   },
-  login(body: { email: string; password: string }): Promise<AuthResponse> {
-    return request("/auth/login", { method: "POST", body: JSON.stringify(body) });
+  async login(body: { email: string; password: string }): Promise<AuthResponse> {
+    const res = await request<LoginResponse>("/auth/login", { method: "POST", body: JSON.stringify(body) });
+    // Normalize to the register shape: resume the previously selected
+    // workspace when the user is still a member, else their first one.
+    const stored = getWorkspaceId();
+    const start = res.workspaces.find((w) => w.id === stored) ?? res.workspaces[0] ?? null;
+    return { token: res.token, user: res.user, workspace: start ? { id: start.id, name: start.name, slug: start.slug } : null };
   },
   async logout(): Promise<void> {
     await request("/auth/logout", { method: "POST", body: "{}" }).catch(() => undefined);

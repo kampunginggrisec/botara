@@ -1523,7 +1523,7 @@ function ChannelsPage() {
           <div className="mt-3 space-y-2">
             <div>
               <label className={labelCls}>{t("channels.telegram.tokenLabel")}</label>
-              <input value={tgToken} onChange={(e) => setTgToken(e.target.value)} type="password" placeholder="123456:ABC-..." className={inputCls} />
+              <PasswordInput value={tgToken} onChange={setTgToken} placeholder="123456:ABC-..." />
             </div>
             <div>
               <label className={labelCls}>{t("channels.telegram.labelLabel")}</label>
@@ -1945,11 +1945,11 @@ function SettingsPage({ user, workspace, refreshSession }: {
           <div className="font-medium text-sm">{t("settings.passwordTitle")}</div>
           <div>
             <label className={labelCls}>{t("settings.currentPassword")}</label>
-            <input type="password" value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} className={inputCls} />
+            <PasswordInput value={currentPassword} onChange={setCurrentPassword} />
           </div>
           <div>
             <label className={labelCls}>{t("settings.newPassword")}</label>
-            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} className={inputCls} />
+            <PasswordInput value={newPassword} onChange={setNewPassword} />
           </div>
           <button onClick={() => void changePassword()} disabled={busy || !currentPassword || newPassword.length < 8} className={primaryBtn}>
             {t("settings.passwordTitle")}
@@ -2075,6 +2075,46 @@ function SettingsPage({ user, workspace, refreshSession }: {
   );
 }
 
+/** Password field with an eye toggle (show/hide) - used for the auth
+ *  form, the Settings change-password fields, and bot-token entry. */
+function PasswordInput({ value, onChange, placeholder }: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+}) {
+  const { t } = useI18n();
+  const [visible, setVisible] = useState(false);
+  return (
+    <div className="relative">
+      <input
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        type={visible ? "text" : "password"}
+        placeholder={placeholder}
+        className={`${inputCls} pr-10`}
+      />
+      <button
+        type="button"
+        onClick={() => setVisible((v) => !v)}
+        aria-label={visible ? t("auth.hidePassword") : t("auth.showPassword")}
+        title={visible ? t("auth.hidePassword") : t("auth.showPassword")}
+        className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+      >
+        {visible ? (
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="h-5 w-5">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3.98 8.223A10.477 10.477 0 001.934 12C3.226 16.338 7.244 19.5 12 19.5c.993 0 1.953-.138 2.863-.395M6.228 6.228A10.45 10.45 0 0112 4.5c4.756 0 8.773 3.162 10.065 7.498a10.523 10.523 0 01-4.293 5.774M6.228 6.228L3 3m3.228 3.228l3.65 3.65m7.894 7.894L21 21m-3.228-3.228l-3.65-3.65m0 0a3 3 0 10-4.243-4.243m4.242 4.242L9.88 9.88" />
+          </svg>
+        ) : (
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className="h-5 w-5">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 010-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178a1.012 1.012 0 010-.639z" />
+            <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+          </svg>
+        )}
+      </button>
+    </div>
+  );
+}
+
 // ------------------------------------------------------------ auth (Fase 3)
 
 function AuthPage({ onAuthenticated }: { onAuthenticated: () => void }) {
@@ -2099,7 +2139,7 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: () => void }) {
             workspaceName: workspaceName || undefined,
           });
       setToken(res.token);
-      setWorkspaceId(res.workspace.id);
+      if (res.workspace) setWorkspaceId(res.workspace.id);
       onAuthenticated();
     } catch (err) {
       setError(errText(err, t("auth.failed")));
@@ -2129,7 +2169,7 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: () => void }) {
               </>
             )}
             <input value={email} onChange={(e) => setEmail(e.target.value)} type="email" placeholder={t("auth.emailPlaceholder")} className={inputCls} />
-            <input value={password} onChange={(e) => setPassword(e.target.value)} type="password" placeholder={t("auth.passwordPlaceholder")} className={inputCls} />
+            <PasswordInput value={password} onChange={setPassword} placeholder={t("auth.passwordPlaceholder")} />
             <button
               onClick={() => void submit()}
               disabled={busy || !email || password.length < 8}
