@@ -1,13 +1,17 @@
 /**
- * Botara web API client (Fase 1).
- * Base URL from VITE_API_URL (default: local API). Workspace context is the
- * Fase 1 stand-in for auth: the workspace id is kept in localStorage and
- * sent as the X-Workspace-Id header on every DB-backed request.
+ * Botara web API client (Fase 3: real auth).
+ * Base URL from VITE_API_URL (default: local API). The session JWT from
+ * /auth/login|register is kept in localStorage and sent as a Bearer token;
+ * the selected workspace id rides along as X-Workspace-Id, which the API
+ * now treats purely as a workspace SELECTOR - membership and role are
+ * verified server-side from the token. (The API also sets an httpOnly
+ * session cookie; the Bearer token is what this SPA uses.)
  */
 
 const BASE_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 const WORKSPACE_KEY = "botara.workspaceId";
+const TOKEN_KEY = "botara.token";
 
 export function getWorkspaceId(): string {
   return localStorage.getItem(WORKSPACE_KEY) ?? "";
@@ -15,6 +19,24 @@ export function getWorkspaceId(): string {
 
 export function setWorkspaceId(id: string): void {
   localStorage.setItem(WORKSPACE_KEY, id);
+}
+
+export function getToken(): string {
+  return localStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+export function setToken(token: string): void {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+export function clearSession(): void {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+/** App-level hook: fired when the API answers 401 (session expired). */
+let unauthorizedHandler: (() => void) | null = null;
+export function onUnauthorized(handler: () => void): void {
+  unauthorizedHandler = handler;
 }
 
 export class ApiError extends Error {
@@ -30,12 +52,14 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const workspaceId = getWorkspaceId();
+  const token = getToken();
   let res: Response;
   try {
     res = await fetch(`${BASE_URL}${path}`, {
       ...init,
       headers: {
         "content-type": "application/json",
+        ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(workspaceId ? { "x-workspace-id": workspaceId } : {}),
         ...(init.headers ?? {}),
       },
@@ -47,6 +71,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     | (T & { error?: { code: string; message: string } })
     | null;
   if (!res.ok) {
+    if (res.status === 401 && !path.startsWith("/auth/")) {
+      // Session expired or revoked: drop the token and let the app shell
+      // route back to the login page.
+      clearSession();
+      unauthorizedHandler?.();
+    }
     throw new ApiError(
       body?.error?.code ?? "INTERNAL",
       res.status,
@@ -54,6 +84,34 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     );
   }
   return body as T;
+}
+
+export interface AuthUser {
+  id: string;
+  email: string;
+  name: string | null;
+}
+
+export interface WorkspaceSummary {
+  id: string;
+  name: string;
+  slug: string;
+  role: string;
+}
+
+export interface AuthResponse {
+  token: string;
+  user: AuthUser;
+  workspace: { id: string; name: string; slug: string };
+}
+
+export interface KbDocument {
+  id: string;
+  title: string;
+  status: string;
+  chunkCount: number;
+  error?: string;
+  createdAt: string;
 }
 
 export interface Conversation {
@@ -144,6 +202,37 @@ export interface ScheduledPost {
 }
 
 export const api = {
+  // ------------------------------------------------------------- auth
+  register(body: { email: string; password: string; name?: string; workspaceName?: string }): Promise<AuthResponse> {
+    return request("/auth/register", { method: "POST", body: JSON.stringify(body) });
+  },
+  login(body: { email: string; password: string }): Promise<AuthResponse> {
+    return request("/auth/login", { method: "POST", body: JSON.stringify(body) });
+  },
+  async logout(): Promise<void> {
+    await request("/auth/logout", { method: "POST", body: "{}" }).catch(() => undefined);
+    clearSession();
+  },
+  me(): Promise<{ user: AuthUser }> {
+    return request("/auth/me");
+  },
+  listWorkspaces(): Promise<{ workspaces: WorkspaceSummary[] }> {
+    return request("/workspaces");
+  },
+  createWorkspace(body: { name: string }): Promise<{ workspace: WorkspaceSummary }> {
+    return request("/workspaces", { method: "POST", body: JSON.stringify(body) });
+  },
+  // -------------------------------------------------------- knowledge base
+  listKbDocuments(): Promise<{ documents: KbDocument[] }> {
+    return request("/kb/documents");
+  },
+  createKbDocument(body: { title: string; content: string }): Promise<{ document: KbDocument }> {
+    return request("/kb/documents", { method: "POST", body: JSON.stringify(body) });
+  },
+  deleteKbDocument(id: string): Promise<{ deleted: boolean }> {
+    return request(`/kb/documents/${id}`, { method: "DELETE" });
+  },
+  // ------------------------------------------------------------- domain
   listConversations(params: { channel?: string; status?: string } = {}): Promise<{ conversations: Conversation[] }> {
     const qs = new URLSearchParams();
     if (params.channel) qs.set("channel", params.channel);
