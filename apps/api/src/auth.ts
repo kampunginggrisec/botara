@@ -3,7 +3,8 @@ import { AppError } from "@botara/shared";
 import {
   createUser, createWorkspace, getUserByEmail, getUserById, getWorkspaceBySlug,
   getWorkspaceMember, insertAuditLog, listWorkspaceMembers, listWorkspacesForUser,
-  removeWorkspaceMember, setUserPasswordHash, upsertWorkspaceMember,
+  removeWorkspaceMember, setUserPasswordHash, updateUserName, updateWorkspaceName,
+  upsertWorkspaceMember,
   type Database,
 } from "@botara/db";
 
@@ -66,6 +67,9 @@ export interface AuthStore {
   listWorkspaces(userId: string): Promise<AuthWorkspaceView[]>;
   listMembers(workspaceId: string): Promise<AuthMemberView[]>;
   removeMember(workspaceId: string, userId: string): Promise<boolean>;
+  /** Settings (Fase 4): profile display name + workspace rename. */
+  updateUserName(userId: string, name: string): Promise<void>;
+  renameWorkspace(workspaceId: string, name: string): Promise<void>;
   audit(entry: {
     workspaceId?: string;
     userId?: string;
@@ -127,6 +131,14 @@ export class DbAuthStore implements AuthStore {
 
   async removeMember(workspaceId: string, userId: string) {
     return removeWorkspaceMember(this.getDatabase(), workspaceId, userId);
+  }
+
+  async updateUserName(userId: string, name: string) {
+    await updateUserName(this.getDatabase(), userId, name);
+  }
+
+  async renameWorkspace(workspaceId: string, name: string) {
+    await updateWorkspaceName(this.getDatabase(), workspaceId, name);
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
@@ -208,6 +220,16 @@ export class InMemoryAuthStore implements AuthStore {
 
   async removeMember(workspaceId: string, userId: string) {
     return this.members.delete(this.memberKey(workspaceId, userId));
+  }
+
+  async updateUserName(userId: string, name: string) {
+    const user = this.users.get(userId);
+    if (user) user.name = name;
+  }
+
+  async renameWorkspace(workspaceId: string, name: string) {
+    const ws = this.workspaces.get(workspaceId);
+    if (ws) ws.name = name;
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {

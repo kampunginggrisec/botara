@@ -24,13 +24,24 @@ import {
   purgeExternalUserData,
   createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument,
   listKbChunks, listKbChunksByWorkspace,
-  type Database, type ScheduledPostTarget, type SequenceStep,
+  createFlow, listFlows, getFlow, updateFlow, deleteFlow,
+  deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
+  updateChannelAccountToken,
+  type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
 } from "@botara/db";
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
   WebchatAdapter, CHANNEL_CAPABILITIES,
-  type ChannelKey, type InboundEvent,
+  TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter,
+  StaticCredentialProvider, buildInstagramAuthorizeUrl, buildThreadsAuthorizeUrl,
+  buildMessengerAuthorizeUrl,
+  type ChannelKey, type InboundEvent, type FetchLike, type InstagramAuthMode,
 } from "@botara/channels";
+import { runFlow, storedGraphSchema, toRunnableFlow, type FlowAction } from "@botara/flow-engine";
+import {
+  createDbFlowDispatcher, noopFlowDispatcher,
+  type FlowRunEnqueuer, type InboundFlowDispatcher,
+} from "./flows-dispatch";
 import {
   ADMIN_ROLES, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
   DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
@@ -160,6 +171,13 @@ export interface ApiDeps {
   readiness: ReadinessChecker;
   /** Fase 3: in-process rate-limit overrides (tests use tiny limits). */
   rateLimits?: { authPerMinute?: number; publicPerMinute?: number };
+  /** Fase 4: flow-run enqueueing + inbound webhook dispatch (persist + match). */
+  flowEnqueuer: FlowRunEnqueuer;
+  flowDispatcher: InboundFlowDispatcher;
+  /** Fase 4: token vault for channel connect flows (telegram/OAuth). Store-only. */
+  vault: TokenVaultPort;
+  /** Fase 4: fetch used for provider OAuth/token calls (fakeable in tests). */
+  providerFetch: FetchLike;
   env: Record<string, string | undefined>;
 }
 
@@ -236,6 +254,17 @@ export function createBullMqEmailEnqueuer(redisUrl: string): EmailInboundEnqueue
   const inner = createBullMqEnqueuer(redisUrl, "email", "inbound");
   return {
     enqueueEmailInbound: (input) => inner.enqueue({ ...input }, `email-inbound:${input.emailId}`),
+  };
+}
+
+/** Production flow-run enqueuer: BullMQ "flow-run" queue, job "flow-run". */
+export function createBullMqFlowEnqueuer(redisUrl: string): FlowRunEnqueuer {
+  const inner = createBullMqEnqueuer(redisUrl, "flow-run", "flow-run");
+  return {
+    enqueueFlowRun: (job) => {
+      const runId = crypto.randomUUID();
+      return inner.enqueue({ ...job, runId }, `flowrun:${runId}`);
+    },
   };
 }
 
@@ -391,6 +420,10 @@ export function defaultDeps(): ApiDeps {
     emailRouter: createDbEmailRouter(defaultGetDatabase),
     dataDeletionStore: createDbDataDeletionStore(defaultGetDatabase),
     kbEnqueuer: createBullMqKbEnqueuer(redisUrl),
+    flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
+    flowDispatcher: createDbFlowDispatcher({ getDatabase: defaultGetDatabase, flowEnqueuer: createBullMqFlowEnqueuer(redisUrl) }),
+    vault,
+    providerFetch: (url, init) => fetch(url, init as RequestInit),
     readiness: createReadinessChecker(defaultGetDatabase, redisUrl),
     whatsappOnboarding: (workspaceId, input) =>
       exchangeEmbeddedSignup(
@@ -495,6 +528,134 @@ async function readJsonBody(c: Ctx): Promise<Record<string, unknown>> {
 }
 
 const iso = (d: Date | null | undefined): string | null => (d ? d.toISOString() : null);
+
+// ------------------------------------------------- Fase 4 helpers (flows/OAuth)
+
+/** Serialize a flows row for the API (jsonb fields pass through). */
+function serializeFlow(row: FlowRow) {
+  return {
+    id: row.id,
+    workspaceId: row.workspaceId,
+    name: row.name,
+    trigger: row.trigger,
+    graph: row.graph,
+    status: row.status,
+    createdAt: iso(row.createdAt) ?? "",
+    updatedAt: iso(row.updatedAt) ?? "",
+  };
+}
+
+/** Signed payload: base64url(JSON) + "." + base64url(HMAC-SHA256). */
+export function signPayload(secret: string, payload: unknown): string {
+  const part = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+  const sig = createHmac("sha256", secret).update(part).digest("base64url");
+  return `${part}.${sig}`;
+}
+
+export function verifyPayload<T extends { exp?: number }>(secret: string, signed: string): T | null {
+  const parts = signed.split(".");
+  if (parts.length !== 2) return null;
+  const [part, sig] = parts as [string, string];
+  const expected = createHmac("sha256", secret).update(part).digest();
+  const given = Buffer.from(sig, "base64url");
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(part, "base64url").toString("utf8")) as T;
+    if (typeof payload.exp === "number" && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+/** Signed OAuth state: { w: workspaceId, u: userId, ch: channel, m?: mode, exp }. */
+export interface OAuthStatePayload { w: string; u: string; ch: string; m?: string; exp: number }
+
+export function signOAuthState(secret: string, payload: OAuthStatePayload): string {
+  return signPayload(secret, payload);
+}
+
+export function verifyOAuthState(secret: string, state: string): OAuthStatePayload | null {
+  const payload = verifyPayload<OAuthStatePayload>(secret, state);
+  if (!payload || !payload.w || !payload.u || !payload.ch) return null;
+  return payload;
+}
+
+/** Public base URL of THIS API as registered with providers (no trailing /). */
+function publicApiBase(deps: ApiDeps, c: Ctx): string {
+  const fromEnv = deps.env.PUBLIC_WEBHOOK_BASE_URL ?? deps.env.APP_PUBLIC_URL;
+  if (fromEnv) return fromEnv.replace(/\/$/, "");
+  return new URL(c.req.url).origin;
+}
+
+function oauthRedirectUri(deps: ApiDeps, c: Ctx, channel: string): string {
+  return `${publicApiBase(deps, c)}/channels/${channel}/oauth/callback`;
+}
+
+/** Where OAuth callbacks send the browser back to (the SPA channels page). */
+function spaChannelsUrl(deps: ApiDeps, c: Ctx, params: Record<string, string>): string {
+  const base = (deps.env.APP_PUBLIC_URL ?? publicApiBase(deps, c)).replace(/\/$/, "");
+  const query = new URLSearchParams(params).toString();
+  return `${base}/#/channels?${query}`;
+}
+
+/** SESSION_SECRET or an honest 503 - OAuth state cannot be signed without it. */
+function oauthSecret(deps: ApiDeps): string {
+  const secret = deps.env.SESSION_SECRET;
+  if (!secret) {
+    throw new AppError(
+      "CONFIGURATION",
+      "SESSION_SECRET is not configured on this server; OAuth connect flows are unavailable.",
+      { status: 503 },
+    );
+  }
+  return secret;
+}
+
+const flowTriggerInputSchema = z.object({
+  type: z.enum(["keyword", "postback", "manual"]),
+  config: z.record(z.unknown()).default({}),
+}).openapi("FlowTriggerInput");
+
+const flowBodySchema = z.object({
+  name: z.string().min(1).max(200).optional(),
+  trigger: flowTriggerInputSchema.optional(),
+  graph: storedGraphSchema.optional(),
+}).openapi("FlowBody");
+
+const flowResponseSchema = z.object({
+  id: z.string(), workspaceId: z.string(), name: z.string(),
+  trigger: z.unknown(), graph: z.unknown(), status: z.string(),
+  createdAt: z.string(), updatedAt: z.string(),
+}).openapi("Flow");
+
+const flowTestRunBodySchema = z.object({
+  text: z.string().max(4000).optional(),
+  contactFields: z.record(z.string()).optional(),
+}).openapi("FlowTestRunBody");
+
+const telegramConnectBodySchema = z.object({
+  botToken: z.string().min(10).max(200),
+  label: z.string().min(1).max(120).optional(),
+}).openapi("TelegramConnectBody");
+
+const changePasswordBodySchema = z.object({
+  currentPassword: z.string().min(1).max(200),
+  newPassword: z.string().min(8).max(200),
+}).openapi("ChangePasswordBody");
+
+const patchMeBodySchema = z.object({ name: z.string().min(1).max(120) }).openapi("PatchMeBody");
+const renameWorkspaceBodySchema = z.object({ name: z.string().min(1).max(120) }).openapi("RenameWorkspaceBody");
+const memberRoleBodySchema = z.object({ role: z.enum(ROLES) }).openapi("MemberRoleBody");
+const messengerSelectPageBodySchema = z.object({ pageId: z.string().min(1) }).openapi("MessengerSelectPageBody");
+
+const MESSENGER_PENDING_COOKIE = "botara_msgr_pending";
+
+interface MessengerPendingPayload {
+  w: string;
+  pages: Array<{ id: string; name: string; t: string }>;
+  exp: number;
+}
 
 // --------------------------------------------------------------------- app
 
@@ -880,6 +1041,51 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     });
   });
 
+  // ------------------------------------------------- profile & password (Fase 4)
+  const patchMeRoute = createRoute({
+    method: "patch", path: "/auth/me",
+    request: { body: { content: { "application/json": { schema: patchMeBodySchema } }, required: true } },
+    responses: { 200: { description: "Updated user" } },
+  });
+  app.openapi(patchMeRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    const body = c.req.valid("json");
+    await deps.authStore.updateUserName(user.id, body.name.trim());
+    const updated = await deps.authStore.findUserById(user.id);
+    return c.json({ user: publicUser(updated ?? user) });
+  });
+
+  const changePasswordRoute = createRoute({
+    method: "post", path: "/auth/change-password",
+    request: { body: { content: { "application/json": { schema: changePasswordBodySchema } }, required: true } },
+    responses: { 200: { description: "Password changed" } },
+  });
+  app.openapi(changePasswordRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    const body = c.req.valid("json");
+    const ok = user.passwordHash
+      ? await verifyPassword(body.currentPassword, user.passwordHash)
+      : false;
+    if (!ok) {
+      throw new AppError("VALIDATION", "Current password is incorrect.", { status: 400 });
+    }
+    const passwordHash = await hashPassword(body.newPassword);
+    await deps.authStore.setPasswordHash(user.id, passwordHash);
+    await deps.authStore.audit({ userId: user.id, action: "auth.change_password", details: {} });
+    return c.json({ ok: true as const });
+  });
+
+  // --------------------------------------------------- public config (Fase 4)
+  // Non-secret client configuration for the web app (Embedded Signup ids and
+  // the public base URL). NEVER includes secrets - only public app ids.
+  app.get("/config/public", (c) => c.json({
+    metaAppId: deps.env.META_APP_ID ?? null,
+    whatsappEmbeddedConfigId: deps.env.WHATSAPP_EMBEDDED_CONFIG_ID ?? null,
+    instagramAppId: deps.env.INSTAGRAM_APP_ID ?? null,
+    threadsAppId: deps.env.THREADS_APP_ID ?? null,
+    publicWebhookBaseUrl: deps.env.PUBLIC_WEBHOOK_BASE_URL ?? deps.env.APP_PUBLIC_URL ?? null,
+  }));
+
 
   // ------------------------------------------------------------ webhooks
   // Webhooks are provider-facing: no workspace header, no DB. Auth is the
@@ -929,6 +1135,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       }
     }
     await deps.eventSink.handle(events);
+    // Fase 4: persist inbound messages + match flow triggers. The
+    // dispatcher never throws - the provider still gets its 200.
+    await deps.flowDispatcher.dispatch(events);
     return c.json({ received: true, events: events.length });
   });
 
@@ -940,6 +1149,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const payload = await readJsonBody(c);
     const events = await getAdapter("telegram").parseWebhook(payload);
     await deps.eventSink.handle(events);
+    await deps.flowDispatcher.dispatch(events);
     return c.json({ received: true, events: events.length });
   });
 
@@ -974,6 +1184,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       }
       const events = await getAdapter(channel).parseWebhook(payload);
       await deps.eventSink.handle(events);
+      await deps.flowDispatcher.dispatch(events);
       return c.json({ received: true, events: events.length });
     });
   }
@@ -1003,6 +1214,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     }
     const events = await getAdapter("threads").parseWebhook(payload);
     await deps.eventSink.handle(events);
+    await deps.flowDispatcher.dispatch(events);
     return c.json({ received: true, events: events.length });
   });
 
@@ -1155,6 +1367,198 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ ...estimate });
   });
 
+  // ------------------------------------- channel OAuth callbacks (Fase 4)
+  // Registered BEFORE the auth middleware: the provider's redirect carries
+  // no session header - authorization comes from the signed `state`
+  // (workspace + user ids, HMAC with SESSION_SECRET, expiring).
+
+  /** Persist (or re-connect) a channel account whose token lives in the vault. */
+  async function persistConnectedAccount(input: {
+    workspaceId: string; channel: string; externalId: string; displayName?: string;
+    authMode?: string; tokenVaultRef: string; tokenExpiresAt?: Date;
+    capabilities?: Record<string, unknown>; isCoexistence?: boolean;
+  }): Promise<{ id: string; created: boolean }> {
+    const db = deps.getDatabase();
+    const existing = (await listChannelAccounts(db, input.workspaceId))
+      .find((a) => a.channel === input.channel && a.externalId === input.externalId);
+    if (existing) {
+      await updateChannelAccountToken(db, existing.id, {
+        tokenVaultRef: input.tokenVaultRef,
+        tokenExpiresAt: input.tokenExpiresAt ?? null,
+        status: "connected",
+      });
+      return { id: existing.id, created: false };
+    }
+    const row = await createChannelAccount(db, input);
+    return { id: row.id, created: true };
+  }
+
+  const oauthFail = (c: Ctx, channel: string, reason: string) =>
+    c.redirect(spaChannelsUrl(deps, c, { error: reason, channel }), 302);
+
+  app.get("/channels/threads/oauth/callback", async (c) => {
+    const code = c.req.query("code");
+    const stateParam = c.req.query("state");
+    const appId = deps.env.THREADS_APP_ID;
+    const appSecret = deps.env.THREADS_APP_SECRET;
+    if (!code || !stateParam || !appId || !appSecret) return oauthFail(c, "threads", "oauth_config");
+    let state: OAuthStatePayload | null = null;
+    try { state = verifyOAuthState(oauthSecret(deps), stateParam); } catch { state = null; }
+    if (!state || state.ch !== "threads") return oauthFail(c, "threads", "invalid_state");
+    try {
+      const adapter = new ThreadsAdapter({
+        credentials: new StaticCredentialProvider({}),
+        fetchFn: deps.providerFetch,
+      });
+      const redirectUri = oauthRedirectUri(deps, c, "threads");
+      const short = await adapter.exchangeCode({ appId, appSecret, code, redirectUri });
+      const long = await adapter.exchangeShortLivedToken({ shortLivedToken: short.accessToken, appSecret });
+      let username: string | undefined;
+      try {
+        username = (await adapter.getProfile({ userId: short.userId, accessToken: long.accessToken })).username;
+      } catch { /* display name is best-effort only */ }
+      const ref = await deps.vault.store({
+        channel: "threads", workspaceId: state.w,
+        label: username ? `@${username}` : short.userId, secret: long.accessToken,
+      });
+      await persistConnectedAccount({
+        workspaceId: state.w, channel: "threads", externalId: short.userId,
+        displayName: username ? `@${username}` : short.userId, authMode: "threads-oauth",
+        tokenVaultRef: ref, tokenExpiresAt: new Date(long.expiresAt),
+      });
+      await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "threads" } })
+        .catch(() => undefined);
+      return c.redirect(spaChannelsUrl(deps, c, { connected: "threads" }), 302);
+    } catch (err) {
+      console.error(`[api] threads oauth callback failed: ${err instanceof Error ? err.message : String(err)}`);
+      return oauthFail(c, "threads", "oauth_failed");
+    }
+  });
+
+  app.get("/channels/instagram/oauth/callback", async (c) => {
+    const code = c.req.query("code");
+    const stateParam = c.req.query("state");
+    if (!code || !stateParam) return oauthFail(c, "instagram", "oauth_config");
+    let state: OAuthStatePayload | null = null;
+    try { state = verifyOAuthState(oauthSecret(deps), stateParam); } catch { state = null; }
+    if (!state || state.ch !== "instagram") return oauthFail(c, "instagram", "invalid_state");
+    const mode: InstagramAuthMode = state.m === "facebook-login" ? "facebook-login" : "instagram-login";
+    const appId = mode === "instagram-login"
+      ? (deps.env.INSTAGRAM_APP_ID ?? deps.env.META_APP_ID)
+      : deps.env.META_APP_ID;
+    const appSecret = mode === "instagram-login"
+      ? (deps.env.INSTAGRAM_APP_SECRET ?? deps.env.META_APP_SECRET)
+      : deps.env.META_APP_SECRET;
+    if (!appId || !appSecret) return oauthFail(c, "instagram", "oauth_config");
+    try {
+      const adapter = new InstagramAdapter({
+        credentials: new StaticCredentialProvider({}), fetchFn: deps.providerFetch,
+      });
+      const redirectUri = oauthRedirectUri(deps, c, "instagram");
+      const exchanged = await adapter.exchangeCode({ mode, appId, appSecret, code, redirectUri });
+      if (mode === "instagram-login") {
+        if (!exchanged.externalUserId) return oauthFail(c, "instagram", "oauth_failed");
+        let username: string | undefined;
+        try {
+          const res = await deps.providerFetch(
+            `https://graph.instagram.com/${adapter.apiVersion}/me?fields=username&access_token=${encodeURIComponent(exchanged.accessToken)}`,
+          );
+          const json = (await res.json().catch(() => ({}))) as { username?: string };
+          username = json.username;
+        } catch { /* best-effort */ }
+        const ref = await deps.vault.store({
+          channel: "instagram", workspaceId: state.w,
+          label: username ? `@${username}` : exchanged.externalUserId, secret: exchanged.accessToken,
+        });
+        await persistConnectedAccount({
+          workspaceId: state.w, channel: "instagram", externalId: exchanged.externalUserId,
+          displayName: username ? `@${username}` : exchanged.externalUserId,
+          authMode: "instagram-login", tokenVaultRef: ref,
+          tokenExpiresAt: exchanged.expiresAt ? new Date(exchanged.expiresAt) : undefined,
+        });
+      } else {
+        // Facebook Login: the user token must reach a Page that has an
+        // Instagram business account linked; the PAGE token is what sends.
+        const pagesRes = await deps.providerFetch(
+          `https://graph.facebook.com/${adapter.apiVersion}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(exchanged.accessToken)}`,
+        );
+        const pagesJson = (await pagesRes.json().catch(() => ({}))) as {
+          data?: Array<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }>;
+          error?: unknown;
+        };
+        if (!pagesRes.ok || pagesJson.error) return oauthFail(c, "instagram", "oauth_failed");
+        const page = (pagesJson.data ?? []).find((p) => p.instagram_business_account?.id);
+        if (!page?.instagram_business_account) return oauthFail(c, "instagram", "no_instagram_account");
+        const ig = page.instagram_business_account;
+        const ref = await deps.vault.store({
+          channel: "instagram", workspaceId: state.w,
+          label: ig.username ? `@${ig.username}` : ig.id, secret: page.access_token,
+        });
+        await persistConnectedAccount({
+          workspaceId: state.w, channel: "instagram", externalId: ig.id,
+          displayName: ig.username ? `@${ig.username}` : page.name,
+          authMode: "facebook-login", tokenVaultRef: ref,
+        });
+      }
+      await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "instagram", mode } })
+        .catch(() => undefined);
+      return c.redirect(spaChannelsUrl(deps, c, { connected: "instagram" }), 302);
+    } catch (err) {
+      console.error(`[api] instagram oauth callback failed: ${err instanceof Error ? err.message : String(err)}`);
+      return oauthFail(c, "instagram", "oauth_failed");
+    }
+  });
+
+  app.get("/channels/messenger/oauth/callback", async (c) => {
+    const code = c.req.query("code");
+    const stateParam = c.req.query("state");
+    const appId = deps.env.META_APP_ID;
+    const appSecret = deps.env.META_APP_SECRET;
+    if (!code || !stateParam || !appId || !appSecret) return oauthFail(c, "messenger", "oauth_config");
+    let state: OAuthStatePayload | null = null;
+    try { state = verifyOAuthState(oauthSecret(deps), stateParam); } catch { state = null; }
+    if (!state || state.ch !== "messenger") return oauthFail(c, "messenger", "invalid_state");
+    try {
+      const adapter = new MessengerAdapter({
+        credentials: new StaticCredentialProvider({}), fetchFn: deps.providerFetch,
+      });
+      const redirectUri = oauthRedirectUri(deps, c, "messenger");
+      const { userAccessToken } = await adapter.exchangeCode({ appId, appSecret, code, redirectUri });
+      const pages = await adapter.listPages(userAccessToken);
+      if (pages.length === 0) return oauthFail(c, "messenger", "no_page");
+      if (pages.length === 1) {
+        const page = pages[0]!;
+        const ref = await deps.vault.store({
+          channel: "messenger", workspaceId: state.w, label: page.name, secret: page.accessToken,
+        });
+        await persistConnectedAccount({
+          workspaceId: state.w, channel: "messenger", externalId: page.id,
+          displayName: page.name, authMode: "facebook-login", tokenVaultRef: ref,
+        });
+        await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "messenger" } })
+          .catch(() => undefined);
+        return c.redirect(spaChannelsUrl(deps, c, { connected: "messenger" }), 302);
+      }
+      // Multiple Pages: stash the selection (page ids + tokens) in a
+      // short-lived SIGNED httpOnly cookie; the SPA picker posts the choice
+      // to /channels/messenger/select-page, which vaults the picked token.
+      const secret = oauthSecret(deps);
+      const pending: MessengerPendingPayload = {
+        w: state.w,
+        pages: pages.map((p) => ({ id: p.id, name: p.name, t: p.accessToken })),
+        exp: Math.floor(Date.now() / 1000) + 600,
+      };
+      setCookie(c, MESSENGER_PENDING_COOKIE, signPayload(secret, pending), {
+        httpOnly: true, path: "/", sameSite: "Lax", maxAge: 600,
+        secure: c.req.header("x-forwarded-proto") === "https",
+      });
+      return c.redirect(spaChannelsUrl(deps, c, { messenger: "select" }), 302);
+    } catch (err) {
+      console.error(`[api] messenger oauth callback failed: ${err instanceof Error ? err.message : String(err)}`);
+      return oauthFail(c, "messenger", "oauth_failed");
+    }
+  });
+
   // ------------------------------------------- auth context middleware
   // Fase 3: every workspace-scoped route runs behind session auth +
   // verified workspace membership (see resolveAuthContext). Registered
@@ -1168,7 +1572,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats"]) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
@@ -1271,6 +1675,230 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     });
     return c.json({ removed: true });
   });
+
+  // ----------------------------------------------------- settings (Fase 4)
+  const renameWorkspaceRoute = createRoute({
+    method: "patch", path: "/workspaces/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: renameWorkspaceBodySchema } }, required: true },
+    },
+    responses: { 200: { description: "Workspace renamed" } },
+  });
+  app.openapi(renameWorkspaceRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    await deps.authStore.renameWorkspace(id, c.req.valid("json").name.trim());
+    await deps.authStore.audit({
+      workspaceId: id, userId: auth.user.id,
+      action: "workspace.rename", details: { name: c.req.valid("json").name },
+    });
+    const workspaces = await deps.authStore.listWorkspaces(auth.user.id);
+    return c.json({ workspace: workspaces.find((w) => w.id === id) ?? null });
+  });
+
+  const memberRoleRoute = createRoute({
+    method: "patch", path: "/workspaces/{id}/members/{userId}",
+    request: {
+      params: z.object({ id: z.string(), userId: z.string() }),
+      body: { content: { "application/json": { schema: memberRoleBodySchema } }, required: true },
+    },
+    responses: { 200: { description: "Member role updated" } },
+  });
+  app.openapi(memberRoleRoute, async (c) => {
+    const { id, userId } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const members = await deps.authStore.listMembers(id);
+    const target = members.find((m) => m.userId === userId);
+    if (!target) throw new AppError("NOT_FOUND", "Workspace member not found.", { status: 404 });
+    const role = c.req.valid("json").role;
+    if (target.role === "owner" && role !== "owner" && members.filter((m) => m.role === "owner").length <= 1) {
+      throw new AppError("CONFLICT", "Cannot demote the workspace's only owner.", { status: 409 });
+    }
+    await deps.authStore.addMember({ workspaceId: id, userId, role });
+    await deps.authStore.audit({
+      workspaceId: id, userId: auth.user.id,
+      action: "workspace.member.role", details: { memberUserId: userId, from: target.role, to: role },
+    });
+    return c.json({ member: { ...target, role } });
+  });
+
+  // ------------------------------------------------------------- flows (Fase 4)
+  // CRUD + activation + test-run for automation flows. Graphs are validated
+  // against the flow-engine node schemas (storedGraphSchema) on write; a
+  // test-run executes the graph with recording fake ports and NEVER sends.
+
+  const listFlowsRoute = createRoute({
+    method: "get", path: "/flows",
+    responses: { 200: { description: "Flows in the workspace" } },
+  });
+  app.openapi(listFlowsRoute, async (c) => {
+    const wsId = workspaceId(c);
+    const rows = await listFlows(deps.getDatabase(), wsId);
+    return c.json({ flows: rows.map(serializeFlow) });
+  });
+
+  const createFlowRoute = createRoute({
+    method: "post", path: "/flows",
+    request: { body: { content: { "application/json": { schema: flowBodySchema } }, required: true } },
+    responses: { 201: { description: "Flow created (draft)" } },
+  });
+  app.openapi(createFlowRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const body = c.req.valid("json");
+    if (!body.name || !body.graph) {
+      throw new AppError("VALIDATION", "A flow needs a name and a graph.", { status: 400 });
+    }
+    const row = await createFlow(deps.getDatabase(), {
+      workspaceId: wsId,
+      name: body.name,
+      trigger: body.trigger ?? { type: "manual", config: {} },
+      graph: body.graph,
+    });
+    return c.json({ flow: serializeFlow(row) }, 201);
+  });
+
+  const getFlowRoute = createRoute({
+    method: "get", path: "/flows/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One flow" } },
+  });
+  app.openapi(getFlowRoute, async (c) => {
+    const wsId = workspaceId(c);
+    const row = await getFlow(deps.getDatabase(), wsId, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Flow not found.", { status: 404 });
+    return c.json({ flow: serializeFlow(row) });
+  });
+
+  const patchFlowRoute = createRoute({
+    method: "patch", path: "/flows/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: flowBodySchema } }, required: true },
+    },
+    responses: { 200: { description: "Flow updated" } },
+  });
+  app.openapi(patchFlowRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const body = c.req.valid("json");
+    const row = await updateFlow(deps.getDatabase(), wsId, c.req.valid("param").id, {
+      name: body.name,
+      trigger: body.trigger,
+      graph: body.graph,
+    });
+    if (!row) throw new AppError("NOT_FOUND", "Flow not found.", { status: 404 });
+    return c.json({ flow: serializeFlow(row) });
+  });
+
+  const deleteFlowRoute = createRoute({
+    method: "delete", path: "/flows/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Flow deleted" } },
+  });
+  app.openapi(deleteFlowRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const removed = await deleteFlow(deps.getDatabase(), wsId, c.req.valid("param").id);
+    if (!removed) throw new AppError("NOT_FOUND", "Flow not found.", { status: 404 });
+    return c.json({ deleted: true });
+  });
+
+  for (const action of ["activate", "deactivate"] as const) {
+    const route = createRoute({
+      method: "post", path: `/flows/{id}/${action}`,
+      request: { params: z.object({ id: z.string() }) },
+      responses: { 200: { description: `Flow ${action}d` } },
+    });
+    app.openapi(route, async (c) => {
+      guardMutator(c);
+      const wsId = workspaceId(c);
+      const row = await updateFlow(deps.getDatabase(), wsId, c.req.valid("param").id, {
+        status: action === "activate" ? "active" : "draft",
+      });
+      if (!row) throw new AppError("NOT_FOUND", "Flow not found.", { status: 404 });
+      return c.json({ flow: serializeFlow(row) });
+    });
+  }
+
+  const flowTestRunRoute = createRoute({
+    method: "post", path: "/flows/{id}/test-run",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: flowTestRunBodySchema } }, required: true },
+    },
+    responses: { 200: { description: "Recorded actions from a dry run (nothing sent)" } },
+  });
+  app.openapi(flowTestRunRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const row = await getFlow(deps.getDatabase(), wsId, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Flow not found.", { status: 404 });
+    const parsed = storedGraphSchema.safeParse(row.graph);
+    if (!parsed.success) {
+      throw new AppError("VALIDATION", "The stored flow graph is invalid and cannot run.", {
+        status: 400, details: parsed.error.issues,
+      });
+    }
+    const body = c.req.valid("json");
+    const variables: Record<string, string> = { ...(body.contactFields ?? {}) };
+    // Recording fake ports: the run's observable effects ARE the response.
+    const ports = {
+      async sendMessage() { /* recorded via the returned action list */ },
+      async scheduleDelay() { /* recorded */ },
+      async httpWebhook() { /* recorded */ },
+      async setContactField() { /* recorded */ },
+      async aiReply(input: { prompt: string }) {
+        return `[test-run AI reply] ${input.prompt}`.trim();
+      },
+    };
+    const flow = toRunnableFlow(row.id, parsed.data);
+    const result = await runFlow(ports, flow, undefined, {
+      type: "message.received",
+      text: body.text ?? "",
+      variables,
+    });
+    const actions: FlowAction[] = result.executed;
+    return c.json({
+      status: result.state.status,
+      paused: result.paused,
+      actions,
+      variables: result.state.variables,
+    });
+  });
+
+  // ------------------------------------------------------------- stats (Fase 4)
+  const statsOverviewRoute = createRoute({
+    method: "get", path: "/stats/overview",
+    responses: { 200: { description: "Dashboard overview aggregations" } },
+  });
+  app.openapi(statsOverviewRoute, async (c) => {
+    const wsId = workspaceId(c);
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 3600 * 1000);
+    const stats = await getWorkspaceStats(deps.getDatabase(), wsId, monthStart, thirtyDaysAgo);
+    const conversations = await listConversations(deps.getDatabase(), wsId);
+    return c.json({
+      contacts: { total: stats.contactsTotal },
+      conversations: { open: stats.conversationsOpen, total: stats.conversationsTotal },
+      messagesLast30d: stats.messagesLast30d,
+      broadcastsThisMonth: stats.broadcastsThisMonth,
+      costThisMonth: stats.costThisMonth,
+      scheduledPostsPending: stats.scheduledPostsPending,
+      activeFlows: stats.activeFlows,
+      recentConversations: conversations.slice(0, 5).map((row) => ({
+        id: row.id,
+        channel: row.channel,
+        status: row.status,
+        contactDisplayName: row.contactDisplayName,
+        contactExternalId: row.contactExternalId,
+        updatedAt: iso(row.lastUserMessageAt) ?? iso(row.createdAt) ?? "",
+      })),
+    });
+  });
+
   // --------------------------------------------------------- conversations
   const listConversationsRoute = createRoute({
     method: "get", path: "/conversations",
@@ -1760,6 +2388,153 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         };
       }),
     });
+  });
+
+  // ------------------------------------- channel connect flows (Fase 4)
+  // Real onboarding: Telegram bot-token connect, and OAuth start endpoints
+  // for instagram / threads / messenger (callbacks live above the auth
+  // middleware). Tokens ONLY ever pass through the vault port.
+
+  const telegramConnectRoute = createRoute({
+    method: "post", path: "/channels/telegram/connect",
+    request: { body: { content: { "application/json": { schema: telegramConnectBodySchema } }, required: true } },
+    responses: { 201: { description: "Telegram bot connected" } },
+  });
+  app.openapi(telegramConnectRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const { botToken, label } = c.req.valid("json");
+    const adapter = new TelegramAdapter({
+      credentials: new StaticCredentialProvider({ botToken }),
+      fetchFn: deps.providerFetch,
+    });
+    let bot: { id: number; username?: string; firstName?: string };
+    try {
+      bot = await adapter.describeBot();
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      if (status === 401 || status === 404) {
+        throw new AppError("VALIDATION", "Telegram rejected this bot token (getMe failed). Check the token and try again.", { status: 400 });
+      }
+      throw new AppError("PROVIDER_ERROR", `Telegram validation failed: ${err instanceof Error ? err.message : String(err)}`, { status: 502 });
+    }
+    const displayName = bot.username ? `@${bot.username}` : (label ?? `Telegram bot ${bot.id}`);
+    const ref = await deps.vault.store({
+      channel: "telegram", workspaceId: wsId,
+      label: label ?? displayName, secret: botToken,
+    });
+    const persisted = await persistConnectedAccount({
+      workspaceId: wsId, channel: "telegram", externalId: String(bot.id),
+      displayName, authMode: "bot-token", tokenVaultRef: ref,
+    });
+    // Point Telegram at our webhook when a public base is configured.
+    let webhookSet = false;
+    const publicBase = deps.env.PUBLIC_WEBHOOK_BASE_URL ?? deps.env.APP_PUBLIC_URL;
+    if (publicBase) {
+      try {
+        await adapter.setWebhookWithToken({
+          url: `${publicBase.replace(/\/$/, "")}/webhooks/telegram`,
+          ...(deps.env.TELEGRAM_WEBHOOK_SECRET ? { secretToken: deps.env.TELEGRAM_WEBHOOK_SECRET } : {}),
+        });
+        webhookSet = true;
+      } catch (err) {
+        console.error(`[api] telegram setWebhook failed for bot ${bot.id}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    await deps.authStore.audit({
+      workspaceId: wsId, userId: authContext(c).user.id,
+      action: "channel.connected", details: { channel: "telegram", botId: bot.id, webhookSet },
+    }).catch(() => undefined);
+    return c.json({
+      account: {
+        id: persisted.id, channel: "telegram", externalId: String(bot.id),
+        displayName, status: "connected", hasCredential: true, webhookSet,
+      },
+    }, 201);
+  });
+
+  // OAuth start: 302 to the provider authorize URL with a signed state.
+  const oauthStart = (channel: "instagram" | "threads" | "messenger") =>
+    async (c: Ctx) => {
+      const auth = authContext(c);
+      const wsId = workspaceId(c);
+      const secret = oauthSecret(deps);
+      const redirectUri = oauthRedirectUri(deps, c, channel);
+      const exp = Math.floor(Date.now() / 1000) + 600;
+      if (channel === "threads") {
+        const appId = deps.env.THREADS_APP_ID;
+        if (!appId) {
+          throw new AppError("CONFIGURATION", "THREADS_APP_ID is not configured on this server; Threads connect is unavailable.", { status: 503 });
+        }
+        const state = signOAuthState(secret, { w: wsId, u: auth.user.id, ch: "threads", exp });
+        return c.redirect(buildThreadsAuthorizeUrl({ appId, redirectUri, state }), 302);
+      }
+      if (channel === "instagram") {
+        const mode: InstagramAuthMode = c.req.query("mode") === "facebook-login" ? "facebook-login" : "instagram-login";
+        const appId = mode === "instagram-login"
+          ? (deps.env.INSTAGRAM_APP_ID ?? deps.env.META_APP_ID)
+          : deps.env.META_APP_ID;
+        if (!appId) {
+          throw new AppError("CONFIGURATION", "No Instagram/Meta app id is configured on this server; Instagram connect is unavailable.", { status: 503 });
+        }
+        const state = signOAuthState(secret, { w: wsId, u: auth.user.id, ch: "instagram", m: mode, exp });
+        return c.redirect(buildInstagramAuthorizeUrl({ mode, appId, redirectUri, state }), 302);
+      }
+      const appId = deps.env.META_APP_ID;
+      if (!appId) {
+        throw new AppError("CONFIGURATION", "META_APP_ID is not configured on this server; Messenger connect is unavailable.", { status: 503 });
+      }
+      const state = signOAuthState(secret, { w: wsId, u: auth.user.id, ch: "messenger", exp });
+      return c.redirect(buildMessengerAuthorizeUrl({ appId, redirectUri, state }), 302);
+    };
+  app.get("/channels/instagram/oauth/start", oauthStart("instagram"));
+  app.get("/channels/threads/oauth/start", oauthStart("threads"));
+  app.get("/channels/messenger/oauth/start", oauthStart("messenger"));
+
+  // Messenger multi-Page picker: list (from the signed pending cookie) and
+  // confirm. Tokens never leave the server except into the vault.
+  app.get("/channels/messenger/pending-pages", (c) => {
+    const wsId = workspaceId(c);
+    const raw = getCookie(c, MESSENGER_PENDING_COOKIE);
+    if (!raw) return c.json({ pages: [] });
+    const pending = verifyPayload<MessengerPendingPayload>(oauthSecret(deps), raw);
+    if (!pending || pending.w !== wsId) return c.json({ pages: [] });
+    return c.json({ pages: pending.pages.map((p) => ({ id: p.id, name: p.name })) });
+  });
+
+  const messengerSelectPageRoute = createRoute({
+    method: "post", path: "/channels/messenger/select-page",
+    request: { body: { content: { "application/json": { schema: messengerSelectPageBodySchema } }, required: true } },
+    responses: { 201: { description: "Messenger Page connected" } },
+  });
+  app.openapi(messengerSelectPageRoute, async (c) => {
+    guardMutator(c);
+    const wsId = workspaceId(c);
+    const raw = getCookie(c, MESSENGER_PENDING_COOKIE);
+    const pending = raw ? verifyPayload<MessengerPendingPayload>(oauthSecret(deps), raw) : null;
+    if (!pending || pending.w !== wsId) {
+      throw new AppError("VALIDATION", "No pending Messenger Page selection (it expires after 10 minutes - restart the connect flow).", { status: 400 });
+    }
+    const page = pending.pages.find((p) => p.id === c.req.valid("json").pageId);
+    if (!page) throw new AppError("NOT_FOUND", "That Page is not part of the pending selection.", { status: 404 });
+    const ref = await deps.vault.store({
+      channel: "messenger", workspaceId: wsId, label: page.name, secret: page.t,
+    });
+    const persisted = await persistConnectedAccount({
+      workspaceId: wsId, channel: "messenger", externalId: page.id,
+      displayName: page.name, authMode: "facebook-login", tokenVaultRef: ref,
+    });
+    deleteCookie(c, MESSENGER_PENDING_COOKIE, { path: "/" });
+    await deps.authStore.audit({
+      workspaceId: wsId, userId: authContext(c).user.id,
+      action: "channel.connected", details: { channel: "messenger", pageId: page.id },
+    }).catch(() => undefined);
+    return c.json({
+      account: {
+        id: persisted.id, channel: "messenger", externalId: page.id,
+        displayName: page.name, status: "connected", hasCredential: true,
+      },
+    }, 201);
   });
 
   // ------------------------------------------- email domains (Fase 3)
@@ -2268,7 +3043,15 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const rows = await listSequences(db, ws);
-    return c.json({ sequences: rows.map((r) => ({ ...r, createdAt: iso(r.createdAt) })) });
+    const enrollmentCounts = await countEnrollmentsBySequence(db, ws);
+    return c.json({
+      sequences: rows.map((r) => ({
+        ...r,
+        createdAt: iso(r.createdAt),
+        stepCount: Array.isArray(r.steps) ? r.steps.length : 0,
+        enrollmentCount: enrollmentCounts.get(r.id) ?? 0,
+      })),
+    });
   });
 
   const getSequenceRoute = createRoute({
@@ -2353,6 +3136,19 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       if (row) enrolled++;
     }
     return c.json({ enrolled, skipped: targets.length - enrolled, total: targets.length }, 201);
+  });
+
+  const deleteSequenceRoute = createRoute({
+    method: "delete", path: "/sequences/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Sequence deleted (with its enrollments)" } },
+  });
+  app.openapi(deleteSequenceRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const removed = await deleteSequence(deps.getDatabase(), ws, c.req.valid("param").id);
+    if (!removed) throw new AppError("NOT_FOUND", "Sequence not found.", { status: 404 });
+    return c.json({ deleted: true });
   });
 
   app.doc("/doc", {

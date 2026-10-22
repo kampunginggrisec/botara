@@ -2,6 +2,7 @@ import { expect } from "bun:test";
 import { AppError } from "@botara/shared";
 import { createApp, type ApiDeps } from "./app";
 import { InMemoryAuthStore } from "./auth";
+import { InMemoryVault } from "./whatsapp-onboarding";
 
 /**
  * Shared fake deps for API tests: every port is an in-memory fake, the DB
@@ -31,6 +32,10 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
       async purge() { return { contacts: 0 }; },
     },
     kbEnqueuer: { async enqueueKbIngest() {} },
+    flowEnqueuer: { async enqueueFlowRun() {} },
+    flowDispatcher: { async dispatch() {} },
+    vault: new InMemoryVault(),
+    providerFetch: async () => new Response(JSON.stringify({}), { status: 200 }),
     readiness: {
       async checkDatabase() { return { ok: false, detail: "not configured (test)" }; },
       async checkRedis() { return { ok: false, detail: "not configured (test)" }; },
