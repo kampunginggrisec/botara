@@ -68,7 +68,7 @@ export const envSchema = z.object({
   WHATSAPP_EMBEDDED_CONFIG_ID: z.string().optional(),
   /** Instagram Login app credentials (Business Login for Instagram). */
   INSTAGRAM_APP_ID: z.string().optional(),
-INSTAGRAM_APP_SECRET: <redacted>
+  INSTAGRAM_APP_SECRET: z.string().optional(),
 });
 
 export type Env = z.infer<typeof envSchema>;
