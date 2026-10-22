@@ -8,10 +8,26 @@
  * session cookie; the Bearer token is what this SPA uses.)
  */
 
-const BASE_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
+export const BASE_URL: string = import.meta.env.VITE_API_URL ?? "http://localhost:3000";
 
 const WORKSPACE_KEY = "botara.workspaceId";
 const TOKEN_KEY = "botara.token";
+
+/** UI language for client-side error strings (set by the i18n provider). */
+let apiLanguage: "en" | "id" = "en";
+export function setApiLanguage(lang: "en" | "id"): void {
+  apiLanguage = lang;
+}
+const API_STRINGS = {
+  en: {
+    unreachable: "Cannot reach the API. Make sure the API server is running.",
+    requestFailed: "Request failed (HTTP {status}).",
+  },
+  id: {
+    unreachable: "API tidak dapat dihubungi. Pastikan server API berjalan.",
+    requestFailed: "Request gagal (HTTP {status}).",
+  },
+} as const;
 
 export function getWorkspaceId(): string {
   return localStorage.getItem(WORKSPACE_KEY) ?? "";
@@ -65,7 +81,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       },
     });
   } catch {
-    throw new ApiError("NETWORK", 0, "API tidak dapat dihubungi. Pastikan server API berjalan.");
+    throw new ApiError("NETWORK", 0, API_STRINGS[apiLanguage].unreachable);
   }
   const body = (await res.json().catch(() => null)) as
     | (T & { error?: { code: string; message: string } })
@@ -80,7 +96,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     throw new ApiError(
       body?.error?.code ?? "INTERNAL",
       res.status,
-      body?.error?.message ?? `Request gagal (HTTP ${res.status}).`,
+      body?.error?.message ?? API_STRINGS[apiLanguage].requestFailed.replace("{status}", String(res.status)),
     );
   }
   return body as T;
@@ -201,6 +217,91 @@ export interface ScheduledPost {
   createdAt: string;
 }
 
+export interface Member {
+  userId: string;
+  email: string;
+  name: string | null;
+  role: string;
+}
+
+export interface PublicConfig {
+  metaAppId: string | null;
+  whatsappEmbeddedConfigId: string | null;
+  instagramAppId: string | null;
+  threadsAppId: string | null;
+  publicWebhookBaseUrl: string | null;
+}
+
+export interface FlowTrigger {
+  type: "keyword" | "postback" | "manual";
+  config: Record<string, unknown>;
+}
+
+export interface FlowGraphNode {
+  id: string;
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface FlowGraph {
+  startNodeId: string;
+  nodes: Array<Record<string, unknown>>;
+  edges: Array<{ id: string; source: string; target: string; sourceHandle?: string | null }>;
+}
+
+export interface Flow {
+  id: string;
+  workspaceId: string;
+  name: string;
+  trigger: FlowTrigger;
+  graph: FlowGraph;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface FlowTestRunResult {
+  status: string;
+  paused: boolean;
+  actions: Array<Record<string, unknown>>;
+  variables: Record<string, string>;
+}
+
+export interface SequenceStep {
+  delaySeconds: number;
+  text?: string;
+  template?: { name: string; language: string; latestCategory: string };
+}
+
+export interface Sequence {
+  id: string;
+  channelAccountId: string;
+  name: string;
+  steps: SequenceStep[];
+  status: string;
+  stepCount: number;
+  enrollmentCount: number;
+  createdAt: string;
+}
+
+export interface StatsOverview {
+  contacts: { total: number };
+  conversations: { open: number; total: number };
+  messagesLast30d: { in: number; out: number };
+  broadcastsThisMonth: { sent: number; failed: number };
+  costThisMonth: Array<{ currency: string; amount: number }>;
+  scheduledPostsPending: number;
+  activeFlows: number;
+  recentConversations: Array<{
+    id: string;
+    channel: string;
+    status: string;
+    contactDisplayName: string | null;
+    contactExternalId: string;
+    updatedAt: string;
+  }>;
+}
+
 export const api = {
   // ------------------------------------------------------------- auth
   register(body: { email: string; password: string; name?: string; workspaceName?: string }): Promise<AuthResponse> {
@@ -292,5 +393,95 @@ export const api = {
   },
   deletePost(postId: string): Promise<{ deleted: boolean }> {
     return request(`/posts/${postId}`, { method: "DELETE" });
+  },
+  // ------------------------------------------------- settings (Fase 4)
+  patchMe(body: { name: string }): Promise<{ user: AuthUser }> {
+    return request("/auth/me", { method: "PATCH", body: JSON.stringify(body) });
+  },
+  changePassword(body: { currentPassword: string; newPassword: string }): Promise<{ ok: boolean }> {
+    return request("/auth/change-password", { method: "POST", body: JSON.stringify(body) });
+  },
+  renameWorkspace(workspaceDbId: string, body: { name: string }): Promise<{ workspace: WorkspaceSummary | null }> {
+    return request(`/workspaces/${workspaceDbId}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  listMembers(workspaceDbId: string): Promise<{ members: Member[] }> {
+    return request(`/workspaces/${workspaceDbId}/members`);
+  },
+  inviteMember(workspaceDbId: string, body: { email: string; role: string }): Promise<{ member: Member }> {
+    return request(`/workspaces/${workspaceDbId}/members`, { method: "POST", body: JSON.stringify(body) });
+  },
+  patchMemberRole(workspaceDbId: string, userId: string, role: string): Promise<{ member: Member }> {
+    return request(`/workspaces/${workspaceDbId}/members/${userId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ role }),
+    });
+  },
+  removeMember(workspaceDbId: string, userId: string): Promise<{ removed: boolean }> {
+    return request(`/workspaces/${workspaceDbId}/members/${userId}`, { method: "DELETE" });
+  },
+  // ---------------------------------------------------- flows (Fase 4)
+  listFlows(): Promise<{ flows: Flow[] }> {
+    return request("/flows");
+  },
+  createFlow(body: { name: string; trigger: FlowTrigger; graph: FlowGraph }): Promise<{ flow: Flow }> {
+    return request("/flows", { method: "POST", body: JSON.stringify(body) });
+  },
+  updateFlow(id: string, body: { name?: string; trigger?: FlowTrigger; graph?: FlowGraph }): Promise<{ flow: Flow }> {
+    return request(`/flows/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deleteFlow(id: string): Promise<{ deleted: boolean }> {
+    return request(`/flows/${id}`, { method: "DELETE" });
+  },
+  activateFlow(id: string): Promise<{ flow: Flow }> {
+    return request(`/flows/${id}/activate`, { method: "POST", body: "{}" });
+  },
+  deactivateFlow(id: string): Promise<{ flow: Flow }> {
+    return request(`/flows/${id}/deactivate`, { method: "POST", body: "{}" });
+  },
+  testRunFlow(id: string, body: { text?: string; contactFields?: Record<string, string> }): Promise<FlowTestRunResult> {
+    return request(`/flows/${id}/test-run`, { method: "POST", body: JSON.stringify(body) });
+  },
+  // ------------------------------------------------ sequences (Fase 4 UI)
+  listSequences(): Promise<{ sequences: Sequence[] }> {
+    return request("/sequences");
+  },
+  createSequence(body: { channelAccountId: string; name: string; steps: SequenceStep[] }): Promise<{ sequence: Sequence }> {
+    return request("/sequences", { method: "POST", body: JSON.stringify(body) });
+  },
+  updateSequence(id: string, body: { name?: string; steps?: SequenceStep[]; status?: string }): Promise<{ sequence: Sequence }> {
+    return request(`/sequences/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deleteSequence(id: string): Promise<{ deleted: boolean }> {
+    return request(`/sequences/${id}`, { method: "DELETE" });
+  },
+  enrollSequence(id: string, tag: string): Promise<{ enrolled: number; skipped: number; total: number }> {
+    return request(`/sequences/${id}/enroll`, { method: "POST", body: JSON.stringify({ tag }) });
+  },
+  // -------------------------------------------------- stats + channels
+  getStatsOverview(): Promise<StatsOverview> {
+    return request("/stats/overview");
+  },
+  getPublicConfig(): Promise<PublicConfig> {
+    return request("/config/public");
+  },
+  connectTelegram(body: { botToken: string; label?: string }): Promise<{
+    account: { id: string; channel: string; externalId: string; displayName: string; status: string; webhookSet: boolean };
+  }> {
+    return request("/channels/telegram/connect", { method: "POST", body: JSON.stringify(body) });
+  },
+  getMessengerPendingPages(): Promise<{ pages: Array<{ id: string; name: string }> }> {
+    return request("/channels/messenger/pending-pages");
+  },
+  selectMessengerPage(pageId: string): Promise<{ account: { id: string; externalId: string; displayName: string } }> {
+    return request("/channels/messenger/select-page", { method: "POST", body: JSON.stringify({ pageId }) });
+  },
+  exchangeWhatsAppSignup(body: {
+    code: string;
+    sessionInfo?: { wabaId?: string; phoneNumberId?: string; isCoexistence?: boolean };
+  }): Promise<unknown> {
+    return request("/channels/whatsapp/embedded-signup/exchange", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
   },
 };

@@ -1,9 +1,26 @@
 <!doctype html>
-<html lang="id">
+<html lang="en">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f8fafc" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#020617" />
     <title>Botara — Omnichannel Chatbot Platform</title>
+    <script>
+      // Pre-paint bootstrap: apply the persisted theme class + language
+      // before first render to avoid a light flash for dark-mode users.
+      (function () {
+        try {
+          var theme = localStorage.getItem("botara.theme");
+          if (!theme) {
+            theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+          }
+          if (theme === "dark") document.documentElement.classList.add("dark");
+          var lang = localStorage.getItem("botara.lang");
+          if (lang === "en" || lang === "id") document.documentElement.lang = lang;
+        } catch (e) { /* storage unavailable - defaults apply */ }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>

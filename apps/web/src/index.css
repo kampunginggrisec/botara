@@ -1,1 +1,11 @@
 @import "tailwindcss";
+
+/* Tailwind v4 (CSS-first): class-based dark mode. The `dark` class on
+   <html> is managed by src/theme.tsx (+ the pre-paint script in
+   index.html), NOT by the OS media query alone. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* The React Flow builder canvas inherits the app background in both modes. */
+.react-flow {
+  background: transparent;
+}

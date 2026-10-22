@@ -1,17 +1,25 @@
 /**
- * Botara webchat widget (Fase 2) - the embeddable website chat.
+ * Botara webchat widget (Fase 2; i18n + theming Fase 4) - the embeddable
+ * website chat.
  *
  * Plain TypeScript, no framework: it is built into a standalone IIFE bundle
  * (dist/widget.js) that a site owner pastes into any page:
  *
  *   <script src="https://DOMAIN/widget.js"
  *           data-workspace-id="YOUR_WORKSPACE_ID"
- *           data-api-url="https://DOMAIN/api" async></script>
+ *           data-api-url="https://DOMAIN/api"
+ *           data-title="Chat with us"        (optional)
+ *           data-lang="en"                   (optional: en | id, default en)
+ *           data-theme="auto"                (optional: light | dark | auto)
+ *           async></script>
  *
  * Flow: renders a chat bubble; on first open it creates a visitor session
  * (POST /public/webchat/:workspaceId/session), stores the session token in
  * localStorage, sends visitor messages, and polls for agent replies every
  * few seconds. The agent side is the normal Botara inbox (channel: webchat).
+ *
+ * `data-theme="auto"` (the default) follows the HOST page visitor's
+ * prefers-color-scheme; "light" / "dark" pin the palette.
  *
  * This widget exists because Meta's Customer Chat Plugin retired
  * 2024-05-09 with no replacement - Botara ships its own.
@@ -24,12 +32,44 @@ interface WidgetMessage {
   createdAt: string;
 }
 
+type WidgetLang = "en" | "id";
+
+const WIDGET_STRINGS: Record<WidgetLang, { title: string; placeholder: string; send: string }> = {
+  en: { title: "Chat with us", placeholder: "Type a message...", send: "Send" },
+  id: { title: "Chat dengan kami", placeholder: "Tulis pesan...", send: "Kirim" },
+};
+
 const scriptEl = (document.currentScript as HTMLScriptElement | null)
   ?? document.querySelector<HTMLScriptElement>("script[data-workspace-id][src*='widget']");
 
 const workspaceId = scriptEl?.dataset.workspaceId ?? "";
 const apiUrl = (scriptEl?.dataset.apiUrl ?? "").replace(/\/$/, "");
-const widgetTitle = scriptEl?.dataset.title ?? "Chat dengan kami";
+const widgetLang: WidgetLang = scriptEl?.dataset.lang === "id" ? "id" : "en";
+const strings = WIDGET_STRINGS[widgetLang];
+const widgetTitle = scriptEl?.dataset.title ?? strings.title;
+
+const themeAttr = scriptEl?.dataset.theme;
+const darkMode = themeAttr === "dark"
+  || (themeAttr !== "light"
+    && typeof window !== "undefined"
+    && typeof window.matchMedia === "function"
+    && window.matchMedia("(prefers-color-scheme: dark)").matches);
+
+const palette = darkMode ? {
+  panelBg: "#0f172a", headerBg: "#1e293b", headerText: "#f1f5f9",
+  messagesBg: "#020617", mineBg: "#f1f5f9", mineText: "#0f172a",
+  theirsBg: "#1e293b", theirsText: "#e2e8f0",
+  inputRowBg: "#0f172a", inputRowBorder: "#1e293b", inputBorder: "#334155",
+  inputBg: "#020617", inputText: "#f1f5f9",
+  bubbleBg: "#f1f5f9", bubbleText: "#0f172a", sendBg: "#f1f5f9", sendText: "#0f172a",
+} : {
+  panelBg: "#ffffff", headerBg: "#0f172a", headerText: "#ffffff",
+  messagesBg: "#f8fafc", mineBg: "#0f172a", mineText: "#ffffff",
+  theirsBg: "#e2e8f0", theirsText: "#0f172a",
+  inputRowBg: "#ffffff", inputRowBorder: "#e2e8f0", inputBorder: "#cbd5e1",
+  inputBg: "#ffffff", inputText: "#0f172a",
+  bubbleBg: "#0f172a", bubbleText: "#ffffff", sendBg: "#0f172a", sendText: "#ffffff",
+};
 
 const TOKEN_KEY = `botara.webchat.${workspaceId}`;
 const POLL_MS = 3000;
@@ -54,7 +94,7 @@ function init(): void {
   const bubble = el("button", {
     position: "fixed", right: "20px", bottom: "20px", zIndex: "2147483000",
     width: "56px", height: "56px", borderRadius: "9999px", border: "none",
-    background: "#0f172a", color: "#fff", fontSize: "24px", cursor: "pointer",
+    background: palette.bubbleBg, color: palette.bubbleText, fontSize: "24px", cursor: "pointer",
     boxShadow: "0 8px 24px rgba(0,0,0,.25)",
   }, "💬");
   bubble.setAttribute("aria-label", widgetTitle);
@@ -62,35 +102,37 @@ function init(): void {
   const panel = el("div", {
     position: "fixed", right: "20px", bottom: "88px", zIndex: "2147483000",
     width: "340px", maxWidth: "calc(100vw - 32px)", height: "460px", maxHeight: "calc(100vh - 120px)",
-    background: "#fff", borderRadius: "14px", overflow: "hidden", display: "none",
+    background: palette.panelBg, borderRadius: "14px", overflow: "hidden", display: "none",
     flexDirection: "column", boxShadow: "0 16px 48px rgba(0,0,0,.28)",
     fontFamily: "system-ui, -apple-system, sans-serif",
   });
 
   const header = el("div", {
-    background: "#0f172a", color: "#fff", padding: "12px 16px",
+    background: palette.headerBg, color: palette.headerText, padding: "12px 16px",
     fontSize: "14px", fontWeight: "600",
   }, widgetTitle);
 
   const messagesBox = el("div", {
     flex: "1", overflowY: "auto", padding: "12px", display: "flex",
-    flexDirection: "column", gap: "8px", background: "#f8fafc",
+    flexDirection: "column", gap: "8px", background: palette.messagesBg,
   });
 
   const inputRow = el("div", {
-    display: "flex", gap: "8px", padding: "10px", borderTop: "1px solid #e2e8f0", background: "#fff",
+    display: "flex", gap: "8px", padding: "10px",
+    borderTop: `1px solid ${palette.inputRowBorder}`, background: palette.inputRowBg,
   });
   const input = el("input", {
-    flex: "1", border: "1px solid #cbd5e1", borderRadius: "8px",
+    flex: "1", border: `1px solid ${palette.inputBorder}`, borderRadius: "8px",
     padding: "8px 10px", fontSize: "14px", outline: "none",
+    background: palette.inputBg, color: palette.inputText,
   });
   input.type = "text";
-  input.placeholder = "Tulis pesan...";
+  input.placeholder = strings.placeholder;
   input.maxLength = 2000;
   const sendBtn = el("button", {
-    background: "#0f172a", color: "#fff", border: "none", borderRadius: "8px",
+    background: palette.sendBg, color: palette.sendText, border: "none", borderRadius: "8px",
     padding: "8px 14px", fontSize: "14px", cursor: "pointer",
-  }, "Kirim");
+  }, strings.send);
   inputRow.append(input, sendBtn);
   panel.append(header, messagesBox, inputRow);
   document.body.append(bubble, panel);
@@ -107,7 +149,8 @@ function init(): void {
     const row = el("div", { display: "flex", justifyContent: mine ? "flex-end" : "flex-start" });
     const chip = el("div", {
       maxWidth: "80%", borderRadius: "10px", padding: "8px 10px", fontSize: "14px",
-      background: mine ? "#0f172a" : "#e2e8f0", color: mine ? "#fff" : "#0f172a",
+      background: mine ? palette.mineBg : palette.theirsBg,
+      color: mine ? palette.mineText : palette.theirsText,
       whiteSpace: "pre-wrap", wordBreak: "break-word",
     }, m.body);
     row.append(chip);
