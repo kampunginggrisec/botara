@@ -4,8 +4,10 @@
  * Resend's `email.received` webhook carries metadata only. For each inbound
  * job this processor: fetches the full message (Receiving API), copies every
  * attachment out of its TEMPORARY Resend download URL into permanent R2
- * storage (via packages/media in the production wiring), and persists the
- * message into the sender's conversation so it lands in the shared inbox.
+ * storage (via packages/media in the production wiring), persists the
+ * message into the sender's conversation so it lands in the shared inbox,
+ * and publishes exactly one inbox.message realtime event so the open inbox
+ * refreshes live (the last pre-completion gap in the Fase 4 realtime work).
  */
 
 export interface EmailInboundJobData {
@@ -37,6 +39,18 @@ export interface StoredAttachment {
   contentType?: string;
 }
 
+/**
+ * Live-inbox event. Matches the `inbox.message` payload published by the API
+ * (apps/api/src/realtime-publish.ts) on the `botara:realtime` Redis channel -
+ * the worker cannot import that module, so this mirrors its shape here.
+ */
+export interface EmailInboxMessageEvent {
+  workspaceId: string;
+  conversationId: string;
+  direction: "in" | "out";
+  messageId?: string;
+}
+
 export interface EmailInboundPorts {
   /** Fetch full content via the email adapter (Receiving + Attachments APIs). */
   fetchInbound(job: EmailInboundJobData): Promise<FetchedInboundEmail>;
@@ -52,14 +66,22 @@ export interface EmailInboundPorts {
     channelAccountId: string;
     from: string;
   }): Promise<{ conversationId: string; contactId: string }>;
+  /** Persist the inbound message; returns its row id for the realtime event. */
   persistMessage(input: {
     conversationId: string;
     externalId: string;
     subject?: string;
     body?: string;
     attachments: StoredAttachment[];
-  }): Promise<void>;
+  }): Promise<{ id: string }>;
   touchLastUserMessage(conversationId: string, at: Date): Promise<void>;
+  /**
+   * Live inbox: publish exactly one inbox.message event per persisted inbound
+   * message. Fire-and-forget - implementations must swallow their own errors
+   * so a realtime outage never fails the job. Optional for tests and
+   * deployments without the realtime bus.
+   */
+  publishInboxMessage?: (event: EmailInboxMessageEvent) => Promise<void>;
 }
 
 export async function processEmailInbound(
@@ -83,7 +105,7 @@ export async function processEmailInbound(
     channelAccountId: job.channelAccountId,
     from: content.from,
   });
-  await ports.persistMessage({
+  const message = await ports.persistMessage({
     conversationId: conversation.conversationId,
     externalId: job.emailId,
     subject: content.subject,
@@ -91,5 +113,13 @@ export async function processEmailInbound(
     attachments: stored,
   });
   await ports.touchLastUserMessage(conversation.conversationId, new Date());
+  // Live inbox: exactly one event per persisted inbound message, never a
+  // failure path (mirrors the API dispatcher's contract).
+  await ports.publishInboxMessage?.({
+    workspaceId: job.workspaceId,
+    conversationId: conversation.conversationId,
+    direction: "in",
+    messageId: message.id,
+  }).catch(() => undefined);
   return { attachmentsStored: stored.length };
 }

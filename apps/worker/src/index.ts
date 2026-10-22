@@ -437,8 +437,41 @@ function buildSequencePorts(db: Database): SequencePorts {
 
 // ---------------------------------------------------------- email-inbound ports
 
-function buildEmailPorts(db: Database): EmailInboundPorts {
+/**
+ * Realtime publisher for the worker (live inbox events).
+ *
+ * Mirrors apps/api/src/realtime-publish.ts's contract - the worker cannot
+ * import from apps/api, so this duplicates the fire-and-forget shape here:
+ * publishes `inbox.message` events on the `botara:realtime` channel and
+ * swallows all errors so a realtime outage never fails a job.
+ */
+function createWorkerRealtimePublisher(redisUrl: string) {
+  let connection: IORedis | null = null;
+  const getConnection = (): IORedis => {
+    if (!connection) {
+      connection = new IORedis(redisUrl, {
+        maxRetriesPerRequest: 1,
+        connectTimeout: 2000,
+        enableOfflineQueue: false,
+        retryStrategy: () => null,
+      });
+      connection.on("error", () => { /* surfaced nowhere - fire-and-forget */ });
+    }
+    return connection;
+  };
+  return async (event: { workspaceId: string; conversationId: string; direction: "in" | "out"; messageId?: string }) => {
+    try {
+      await getConnection().publish("botara:realtime", JSON.stringify({ type: "inbox.message", ...event }));
+    } catch {
+      // Fire-and-forget: realtime is a hint channel, never a dependency.
+    }
+  };
+}
+
+function buildEmailPorts(db: Database, redisUrl: string): EmailInboundPorts {
+  const publishRealtime = createWorkerRealtimePublisher(redisUrl);
   return {
+    publishInboxMessage: publishRealtime,
     async fetchInbound(job) {
       const account = await getChannelAccountById(db, job.channelAccountId);
       if (!account) throw new Error(`email account ${job.channelAccountId} not found`);
@@ -490,7 +523,7 @@ function buildEmailPorts(db: Database): EmailInboundPorts {
       const fullBody = [subject ? `Subject: ${subject}` : null, body ?? null, ...attachmentLines]
         .filter((part): part is string => Boolean(part))
         .join("\n\n");
-      await createMessage(db, {
+      const message = await createMessage(db, {
         conversationId,
         direction: "in",
         type: "email",
@@ -498,6 +531,7 @@ function buildEmailPorts(db: Database): EmailInboundPorts {
         externalId,
         status: "delivered",
       });
+      return { id: message.id };
     },
     async touchLastUserMessage(conversationId, at) {
       await touchConversationLastUserMessage(db, conversationId, at);
@@ -632,7 +666,7 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
     case "sequence":
       return processSequenceAdvance(buildSequencePorts(db), { now: new Date() });
     case "email":
-      return processEmailInbound(buildEmailPorts(db), job.data as EmailInboundJobData);
+      return processEmailInbound(buildEmailPorts(db, redisUrl), job.data as EmailInboundJobData);
     case "kb":
       return processKbIngest(buildKbPorts(db), job.data as KbIngestJobData);
     case "comment-action":

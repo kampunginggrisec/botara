@@ -231,6 +231,7 @@ describe("email-inbound processor (fake ports)", () => {
   test("fetches content, copies attachments to R2 keys, and persists into the conversation", async () => {
     const storedFor: string[] = [];
     let persisted: Parameters<EmailInboundPorts["persistMessage"]>[0] | null = null;
+    const published: Array<{ workspaceId: string; conversationId: string; direction: "in" | "out"; messageId?: string }> = [];
     const ports: EmailInboundPorts = {
       async fetchInbound() {
         return {
@@ -245,8 +246,9 @@ describe("email-inbound processor (fake ports)", () => {
         return { key: `email/${input.workspaceId}/${input.emailId}/foto.jpg`, publicUrl: "https://media.example.com/foto.jpg" };
       },
       async findOrCreateConversation() { return { conversationId: "conv-1", contactId: "c-1" }; },
-      async persistMessage(input) { persisted = input; },
+      async persistMessage(input) { persisted = input; return { id: "msg-1" }; },
       async touchLastUserMessage() {},
+      async publishInboxMessage(event) { published.push(event); },
     };
     const res = await processEmailInbound(ports, { workspaceId: "ws-1", channelAccountId: "acc-1", emailId: "in-1" });
     expect(res.attachmentsStored).toBe(1);
@@ -258,5 +260,35 @@ describe("email-inbound processor (fake ports)", () => {
       body: "Berapa harganya?",
       attachments: [{ key: "email/ws-1/in-1/foto.jpg", filename: "foto.jpg" }],
     });
+    // Live inbox: exactly one inbox.message event for the persisted message.
+    expect(published).toEqual([
+      { workspaceId: "ws-1", conversationId: "conv-1", direction: "in", messageId: "msg-1" },
+    ]);
+  });
+
+  test("still persists the message when the publisher is missing or throws (fire-and-forget)", async () => {
+    let persisted: Parameters<EmailInboundPorts["persistMessage"]>[0] | null = null;
+    const noPublisher: EmailInboundPorts = {
+      async fetchInbound() {
+        return { from: "pelanggan@mail.com", attachments: [] };
+      },
+      async storeAttachment(input) { return { key: `email/${input.workspaceId}/${input.emailId}/x` }; },
+      async findOrCreateConversation() { return { conversationId: "conv-2", contactId: "c-2" }; },
+      async persistMessage(input) { persisted = input; return { id: "msg-2" }; },
+      async touchLastUserMessage() {},
+    };
+    await expect(processEmailInbound(noPublisher, { workspaceId: "ws-1", channelAccountId: "acc-1", emailId: "in-2" }))
+      .resolves.toMatchObject({ attachmentsStored: 0 });
+    expect(persisted).not.toBeNull();
+    expect(persisted!.conversationId).toBe("conv-2");
+
+    const throwingPublisher: EmailInboundPorts = {
+      ...noPublisher,
+      async persistMessage(input) { persisted = input; return { id: "msg-3" }; },
+      async publishInboxMessage() { throw new Error("redis down"); },
+    };
+    await expect(processEmailInbound(throwingPublisher, { workspaceId: "ws-1", channelAccountId: "acc-1", emailId: "in-3" }))
+      .resolves.toMatchObject({ attachmentsStored: 0 });
+    expect(persisted!.externalId).toBe("in-3");
   });
 });
