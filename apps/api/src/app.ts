@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { OpenAPIHono, createRoute, z } from "@hono/zod-openapi";
 import type { Context, Next } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
@@ -401,6 +401,33 @@ export function defaultDeps(): ApiDeps {
     getAiProvider: () => createAIProviderFromEnv(process.env),
     env: process.env,
   };
+}
+
+/**
+ * Parse + verify a Meta `signed_request` (data-deletion callbacks and
+ * other app-level posts). Format: base64url(HMAC-SHA256) "." base64url(JSON)
+ * where the HMAC is computed over the payload PART STRING with the app
+ * secret. Returns the payload, or null on any verification failure.
+ */
+export function parseMetaSignedRequest(
+  signedRequest: string,
+  appSecret: string,
+): { user_id?: string; algorithm?: string; issued_at?: number } | null {
+  const parts = signedRequest.split(".");
+  if (parts.length !== 2) return null;
+  const [signature, payloadPart] = parts as [string, string];
+  const expected = createHmac("sha256", appSecret).update(payloadPart).digest();
+  const given = Buffer.from(signature, "base64url");
+  if (given.length !== expected.length || !timingSafeEqual(given, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(payloadPart, "base64url").toString("utf8")) as {
+      user_id?: string; algorithm?: string; issued_at?: number;
+    };
+    if (payload.algorithm && payload.algorithm !== "HMAC-SHA256") return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
 
 // ------------------------------------------------------------------- types
@@ -878,6 +905,70 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       }
     }
     return c.json({ received: true, events: events.length, enqueued });
+  });
+
+  // --------------------------------- Meta data deletion (Fase 3, App Review)
+  // Meta REQUIRES this callback for app approval: a user asking Meta to
+  // delete their data triggers a POST with a signed_request; we answer
+  // with a public status URL + confirmation code, record the request, and
+  // purge the provider user's contact data best-effort.
+
+  app.post("/webhooks/meta/data-deletion", async (c) => {
+    const appSecret = deps.env.META_APP_SECRET;
+    if (!appSecret) {
+      throw new AppError(
+        "CONFIGURATION",
+        "META_APP_SECRET is not configured; data-deletion requests cannot be verified.",
+        { status: 503 },
+      );
+    }
+    let signedRequest: string | undefined;
+    const contentType = c.req.header("content-type") ?? "";
+    if (contentType.includes("application/json")) {
+      const body = await readJsonBody(c).catch(() => ({}));
+      if (typeof body.signed_request === "string") signedRequest = body.signed_request;
+    } else {
+      const form = await c.req.parseBody().catch(() => ({} as Record<string, unknown>));
+      if (typeof form.signed_request === "string") signedRequest = form.signed_request;
+    }
+    if (!signedRequest) {
+      throw new AppError("VALIDATION", "Missing signed_request in data-deletion callback.", { status: 400 });
+    }
+    const payload = parseMetaSignedRequest(signedRequest, appSecret);
+    if (!payload?.user_id) {
+      throw new AppError("UNAUTHORIZED", "Invalid signed_request signature.", { status: 401 });
+    }
+    const confirmationCode = randomBytes(16).toString("hex");
+    await deps.dataDeletionStore.create({ confirmationCode, providerUserId: payload.user_id });
+    try {
+      await deps.dataDeletionStore.purge(payload.user_id);
+      await deps.dataDeletionStore.complete(confirmationCode);
+    } catch (err) {
+      // Recorded but not yet completed - the status page keeps saying
+      // "received" and ops can re-run the purge; Meta still gets its
+      // required URL + code response.
+      console.error(
+        `[api] data-deletion purge failed for request ${confirmationCode}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    const base = (deps.env.APP_PUBLIC_URL ?? new URL(c.req.url).origin).replace(/\/$/, "");
+    return c.json({
+      url: `${base}/data-deletion/status/${confirmationCode}`,
+      confirmation_code: confirmationCode,
+    });
+  });
+
+  // Public status page for a data-deletion request (Meta links users here).
+  app.get("/data-deletion/status/:code", async (c) => {
+    const record = await deps.dataDeletionStore.getByCode(c.req.param("code"));
+    if (!record) {
+      throw new AppError("NOT_FOUND", "Unknown data-deletion confirmation code.", { status: 404 });
+    }
+    return c.json({
+      confirmation_code: record.confirmationCode,
+      status: record.status,
+      requested_at: record.createdAt,
+    });
   });
 
   // ------------------------------------------- broadcasts: estimate (pure)
