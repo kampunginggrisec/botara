@@ -29,7 +29,7 @@ import {
   updateChannelAccountToken,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
-  updateConversationAssignment,
+  updateConversationAssignment, updateConversationStatus, CONVERSATION_STATUSES,
   upsertCatalogProduct, listCatalogProducts, listCatalogProductKeys, deleteCatalogProduct,
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
   type GrowthLinkRow, type ConversationListItem,
@@ -2089,7 +2089,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     request: {
       query: z.object({
         channel: z.string().optional(),
-        status: z.string().optional(),
+        /** Invalid values fail validation (400), like any bad enum. */
+        status: z.enum(CONVERSATION_STATUSES).optional(),
         /** "me" = the caller, "unassigned", or a member user id; absent = all. */
         assignee: z.string().optional(),
       }),
@@ -2284,6 +2285,51 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const memberById = await memberMapOf(ws);
     return c.json({
       conversation: serializeConversation({ ...conversation, assignedUserId: updated.assignedUserId }, memberById),
+    });
+  });
+
+  const conversationStatusRoute = createRoute({
+    method: "patch", path: "/conversations/{id}/status",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            // Enum at the schema edge: anything outside the three
+            // statuses fails validation -> 400 VALIDATION (defaultHook),
+            // never a silent write.
+            schema: z.object({ status: z.enum(CONVERSATION_STATUSES) }),
+          },
+        },
+        required: true,
+      },
+    },
+    responses: { 200: { description: "Conversation status updated" } },
+  });
+  app.openapi(conversationStatusRoute, async (c) => {
+    // Same role set that may reply in the inbox / assign conversations.
+    requireRole(c.get("auth"), ROLES);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const { status } = c.req.valid("json");
+
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    // Any transition is allowed (open/pending/resolved in any order -
+    // resolved -> open is how a thread gets reopened).
+    const updated = await updateConversationStatus(db, ws, id, status);
+    if (!updated) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+
+    // Other open inboxes refresh their list + thread header; the new
+    // status rides along as a hint (clients still refetch for truth).
+    await deps.realtimePublisher
+      .publishInboxUpdate({ workspaceId: ws, conversationId: id, status })
+      .catch(() => undefined);
+
+    const memberById = await memberMapOf(ws);
+    return c.json({
+      conversation: serializeConversation({ ...conversation, status: updated.status }, memberById),
     });
   });
 

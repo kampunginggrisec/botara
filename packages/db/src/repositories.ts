@@ -180,6 +180,30 @@ export async function updateConversationAssignment(
   return row ?? null;
 }
 
+/** Legal conversation statuses (schema default "open"). */
+export const CONVERSATION_STATUSES = ["open", "pending", "resolved"] as const;
+export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
+
+/**
+ * Set a conversation's status. Workspace-scoped: returns null when the
+ * conversation does not belong to the workspace. Any transition is legal
+ * (including resolved -> open, i.e. reopening); status validation is the
+ * CALLER's job (route restricts the body to CONVERSATION_STATUSES).
+ */
+export async function updateConversationStatus(
+  db: Database,
+  workspaceId: string,
+  conversationId: string,
+  status: ConversationStatus,
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .update(conversations)
+    .set({ status })
+    .where(and(eq(conversations.id, conversationId), eq(conversations.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
+}
+
 export async function getConversation(
   db: Database,
   workspaceId: string,

@@ -24,16 +24,19 @@ export interface InboxMessageEvent {
 }
 
 /**
- * A conversation's metadata changed without a new message (today:
- * assignment). Same fan-out contract as inbox.message - ids only, and
+ * A conversation's metadata changed without a new message (assignment,
+ * status). Same fan-out contract as inbox.message - ids only, and
  * clients refetch the conversation list (and the open thread's header
  * state) through REST. Deliberately a distinct type so consumers that
- * only care about messages can ignore it.
+ * only care about messages can ignore it. `status` rides along on
+ * status changes only, as a hint for consumers that render it; clients
+ * still refetch for the authoritative row.
  */
 export interface InboxUpdateEvent {
   type: "inbox.update";
   workspaceId: string;
   conversationId: string;
+  status?: string;
 }
 
 export interface RealtimePublisher {
@@ -46,6 +49,7 @@ export interface RealtimePublisher {
   publishInboxUpdate(event: {
     workspaceId: string;
     conversationId: string;
+    status?: string;
   }): Promise<void>;
 }
 
