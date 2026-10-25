@@ -66,12 +66,12 @@ not started; *Not planned* = deliberately out of scope for now.
 
 | Feature | ChatbotX | Botara | Botara location / notes |
 |---|---|---|---|
-| Unified omnichannel live-chat inbox (human takeover, assignment) | All plans | **Partial** | Inbox with all channels, 24h window enforcement (fail closed), Messenger handover protocol; the conversation-assignment UI is planned |
+| Unified omnichannel live-chat inbox (human takeover, assignment) | All plans | **Implemented** | Inbox with all channels, 24h window enforcement (fail closed), Messenger handover protocol; conversation assignment end-to-end: `PATCH /conversations/{id}/assign` (member-validated, inbox role set) + `GET /conversations?assignee=me|unassigned|<userId>` filter, assignee serialized with member name/email, an `inbox.update` realtime event on every change, and inbox UI (assignee chip per conversation, All / Assigned to me / Unassigned / per-member filters, thread-header assignee select) |
 | Contacts CRM (tags, custom fields, segmentation) | Claimed (contacts unlimited in all plans) | **Implemented** | Contacts API + page; tags + custom fields; segment counts API |
 | Contact import / export | Claimed (docs API overview) | **Implemented** | `POST /contacts/import` (CSV with a hand-written parser / JSON, per-row validation, (channel, externalId) dedupe, skip/update conflict modes, 5000-row cap) + `GET /contacts/export` (CSV/JSON download); Contacts page Import dialog + Export buttons |
 | Coupons (batches, redemption tracking) | Claimed (docs API overview) | **Not planned** | — |
-| Product catalogs / Meta Catalog sync | Claimed (docs API overview) | **Planned** | Not started |
-| E-commerce connectors (Shopify / WooCommerce named) | Not mentioned in fetched public material (e-commerce appears as catalogs/coupons + homepage marketing claims) | **Not planned** | Botara takes no position until catalogs land |
+| Product catalogs / Meta Catalog sync | Claimed (docs API overview) | **Implemented** | WhatsApp catalog sync: `POST /channels/{id}/catalog/sync` discovers the account's catalogs (WABA resolved from the phone-number id via Graph, or an explicit `catalogId`), pages `/{catalog-id}/products` (Graph v26.0, capped at 1000 products / 20 pages per catalog) and mirrors them into `catalog_products` (stale rows deleted only after a fully-paged sync); the token resolves through the vault (no token → typed 503). Synced products power pickers in the FlowBuilder rich product/catalog editor and the inbox product composer — manual catalog/retailer ids still work. Mock-verified end-to-end; a live sync needs a real Meta token |
+| E-commerce connectors (Shopify / WooCommerce named) | Not mentioned in fetched public material (e-commerce appears as catalogs/coupons + homepage marketing claims) | **Not planned** | Meta catalogs have landed (row above); store-platform connectors remain unplanned |
 | Content publishing + scheduling | Not itemized separately in the README list (covered by campaigns) | **Implemented** | Publish page + worker: IG/Threads/Messenger/Telegram, per-target partial status |
 | Analytics (performance, engagement, campaign results) | Claimed (thinly specified publicly) | **Partial** | Dashboard stats (contacts, conversations, messages 30d, broadcasts + monthly cost, active flows) implemented; per-channel provider insights are adapter-level, no insights UI yet |
 
@@ -117,9 +117,9 @@ not started; *Not planned* = deliberately out of scope for now.
   linked IG business account get an honest error redirect.
 - **TikTok and Zalo** are ChatbotX channels Botara does not offer; the
   table marks them Not planned rather than pretending coverage.
-- Items marked Partial above (inbox assignment UI, analytics depth,
-  flow export/import UI, API-as-channel) are real subsets — nothing in
-  this table claims more than the code does.
+- Items marked Partial above (analytics depth, flow export/import UI,
+  API-as-channel) are real subsets — nothing in this table claims more
+  than the code does.
 - **WhatsApp growth attribution:** wa.me links cannot carry a ref, and
   ctwa referrals carry only the ad's `ctwa_clid` — the dispatcher
   attributes a WhatsApp referral to a growth link only when the account
