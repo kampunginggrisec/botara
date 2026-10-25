@@ -3,7 +3,7 @@ import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type InboundEvent, type SendInput, type SendResult,
 } from "./types";
-import { richToPlainText } from "./rich";
+import { richToPlainText, type RichBlock } from "./rich";
 
 /**
  * Webchat adapter (Fase 2 - real, self-built).
@@ -30,6 +30,12 @@ export interface WebchatStore {
     toExternalId: string;
     text: string;
     idempotencyKey: string;
+    /**
+     * Rich block to persist WITH the message (the widget renders buttons
+     * and lists from it). Only set for block kinds the widget renders
+     * natively (buttons/list) - degraded kinds persist text only.
+     */
+    payload?: RichBlock;
   }): Promise<{ messageId: string }>;
 }
 
@@ -79,9 +85,22 @@ export class WebchatAdapter implements ChannelAdapter {
   }
 
   async send(input: SendInput): Promise<SendResult> {
-    // The widget renders plain text: rich blocks degrade to their
-    // formatted text rendering with a typed warning (never silently).
     if (input.rich) {
+      // Buttons and lists render NATIVELY in the widget as clickable
+      // buttons: the block is delivered intact as the message payload
+      // (the persisted body still carries the formatted plain-text
+      // rendering, so the inbox thread stays readable). All other kinds
+      // (carousel/product/catalog) degrade to that same text rendering
+      // with a typed warning - never silently.
+      if (input.rich.kind === "buttons" || input.rich.kind === "list") {
+        const { messageId } = await this.store.deliverOutbound({
+          toExternalId: input.toExternalId,
+          text: richToPlainText(input.rich),
+          idempotencyKey: input.idempotencyKey,
+          payload: input.rich,
+        });
+        return { externalMessageId: messageId, status: "sent" };
+      }
       const { messageId } = await this.store.deliverOutbound({
         toExternalId: input.toExternalId,
         text: richToPlainText(input.rich),

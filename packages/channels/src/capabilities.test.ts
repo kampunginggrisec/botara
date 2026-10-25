@@ -31,6 +31,12 @@ describe("capability matrix", () => {
   test("webchat is Botara's own channel (no external API)", () => {
     expect(CHANNEL_CAPABILITIES.webchat.canDM).toBe(true);
     expect(CHANNEL_CAPABILITIES.webchat.canPublish).toBe(false);
+    // Buttons/lists render natively (clickable) in the widget; carousel
+    // and catalog stay text-degraded.
+    expect(CHANNEL_CAPABILITIES.webchat.richButtons).toBe(true);
+    expect(CHANNEL_CAPABILITIES.webchat.richLists).toBe(true);
+    expect(CHANNEL_CAPABILITIES.webchat.carousel).toBe(false);
+    expect(CHANNEL_CAPABILITIES.webchat.catalog).toBe(false);
   });
 
   test("threads resolves to the REAL adapter in Fase 2, and it still cannot DM", async () => {

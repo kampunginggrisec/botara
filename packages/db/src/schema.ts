@@ -85,6 +85,14 @@ export const messages = pgTable("messages", {
   direction: varchar("direction", { length: 10 }).notNull(), // in|out
   type: varchar("type", { length: 40 }).notNull().default("text"),
   body: text("body"),
+  /**
+   * Structured payload riding with the message (jsonb, nullable):
+   * for outbound rich sends, the RichBlock exactly as authored (the
+   * webchat widget renders buttons/lists from it; the inbox thread shows
+   * read-only chips); for inbound webchat button clicks, { buttonPayload }
+   * - the code the visitor's tap sent back. Null for plain messages.
+   */
+  payload: jsonb("payload"),
   externalId: varchar("external_id", { length: 200 }),
   status: varchar("status", { length: 40 }).notNull().default("queued"), // queued|sent|delivered|read|failed
   /** Idempotency key used on the provider send call; safe retries depend on it. */

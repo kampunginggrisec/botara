@@ -208,6 +208,8 @@ export async function createMessage(
     direction: "in" | "out";
     type?: string;
     body?: string;
+    /** Rich block (outbound sends) or { buttonPayload } (webchat clicks). */
+    payload?: unknown;
     externalId?: string;
     status?: string;
     idempotencyKey?: string;
@@ -220,6 +222,7 @@ export async function createMessage(
       direction: input.direction,
       type: input.type ?? "text",
       body: input.body,
+      payload: input.payload ?? null,
       externalId: input.externalId,
       status: input.status ?? "queued",
       idempotencyKey: input.idempotencyKey,

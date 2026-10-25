@@ -82,8 +82,8 @@ export const CHANNEL_CAPABILITIES: Record<ChannelKey, CapabilitySet> = {
   webchat: {
     canDM: true, canPublish: false, canReplyToComments: false, canHideComments: false,
     canLike: false, canFetchInsights: false, canBroadcast: false, canScheduleNatively: false,
-    richButtons: false, richLists: false, carousel: false, catalog: false,
-    notes: "Botara's own website widget (Meta's Customer Chat Plugin retired 2024-05-09, no replacement). Messages persist in Botara's DB via a store port - there is no external API. Rich blocks degrade to formatted plain text (typed warning).",
+    richButtons: true, richLists: true, carousel: false, catalog: false,
+    notes: "Botara's own website widget (Meta's Customer Chat Plugin retired 2024-05-09, no replacement). Messages persist in Botara's DB via a store port - there is no external API. Rich buttons and lists render natively in the widget as clickable buttons (a tap posts the button payload back, where flow postback/keyword triggers match it); carousel/product/catalog blocks degrade to formatted plain text (typed warning).",
   },
 };
 
