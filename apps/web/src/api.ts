@@ -182,15 +182,54 @@ export interface KbDocument {
   createdAt: string;
 }
 
+export interface ConversationAssignee {
+  userId: string;
+  name: string | null;
+  email: string | null;
+}
+
 export interface Conversation {
   id: string;
   channel: string;
+  channelAccountId: string;
   status: string;
   contactExternalId: string;
   contactDisplayName: string | null;
   lastUserMessageAt: string | null;
   windowOpen: boolean;
+  assignedUserId: string | null;
+  assignee: ConversationAssignee | null;
   createdAt: string;
+}
+
+/** One synced Meta catalog product (picker + summary reads). */
+export interface CatalogProduct {
+  id: string;
+  workspaceId: string;
+  channelAccountId: string;
+  catalogId: string;
+  retailerId: string;
+  name: string;
+  description: string | null;
+  priceAmount: string | null;
+  currency: string | null;
+  imageUrl: string | null;
+  availability: string | null;
+  link: string | null;
+  syncedAt: string;
+}
+
+export interface CatalogSyncResult {
+  catalogs: number;
+  products: number;
+  syncedAt: string;
+}
+
+export interface CatalogSummary {
+  accountId: string;
+  productCount: number;
+  catalogs: string[];
+  lastSyncedAt: string | null;
 }
 
 export interface Message {
@@ -464,12 +503,25 @@ export const api = {
     return request(`/kb/documents/${id}`, { method: "DELETE" });
   },
   // ------------------------------------------------------------- domain
-  listConversations(params: { channel?: string; status?: string } = {}): Promise<{ conversations: Conversation[] }> {
+  listConversations(
+    params: { channel?: string; status?: string; assignee?: string } = {},
+  ): Promise<{ conversations: Conversation[] }> {
     const qs = new URLSearchParams();
     if (params.channel) qs.set("channel", params.channel);
     if (params.status) qs.set("status", params.status);
+    if (params.assignee) qs.set("assignee", params.assignee);
     const suffix = qs.toString() ? `?${qs}` : "";
     return request(`/conversations${suffix}`);
+  },
+  /** Set (userId) or clear (null) a conversation's assignee. */
+  assignConversation(
+    conversationId: string,
+    userId: string | null,
+  ): Promise<{ conversation: Conversation }> {
+    return request(`/conversations/${conversationId}/assign`, {
+      method: "PATCH",
+      body: JSON.stringify({ userId }),
+    });
   },
   listMessages(conversationId: string): Promise<{ messages: Message[] }> {
     return request(`/conversations/${conversationId}/messages`);
@@ -540,6 +592,26 @@ export const api = {
   },
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
     return request("/channels/accounts");
+  },
+  // ------------------------------------------------- Meta catalog sync
+  listCatalogProducts(
+    params: { accountId?: string; q?: string; limit?: number } = {},
+  ): Promise<{ products: CatalogProduct[] }> {
+    const qs = new URLSearchParams();
+    if (params.accountId) qs.set("accountId", params.accountId);
+    if (params.q) qs.set("q", params.q);
+    if (params.limit) qs.set("limit", String(params.limit));
+    const suffix = qs.toString() ? `?${qs}` : "";
+    return request(`/catalog-products${suffix}`);
+  },
+  getCatalogSummary(accountId: string): Promise<CatalogSummary> {
+    return request(`/channels/${accountId}/catalog`);
+  },
+  syncCatalog(accountId: string, catalogId?: string): Promise<CatalogSyncResult> {
+    return request(`/channels/${accountId}/catalog/sync`, {
+      method: "POST",
+      body: JSON.stringify(catalogId ? { catalogId } : {}),
+    });
   },
   listPosts(status?: string): Promise<{ posts: ScheduledPost[] }> {
     const suffix = status ? `?status=${encodeURIComponent(status)}` : "";

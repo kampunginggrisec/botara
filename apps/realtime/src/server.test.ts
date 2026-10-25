@@ -123,6 +123,21 @@ describe("workspace-scoped fan-out", () => {
     expect(b.socket.frames().filter((f) => f.type === "inbox.message")).toHaveLength(1);
   });
 
+  test("inbox.update events (assignment changes) fan out to subscribers too", async () => {
+    const hub = setup();
+    const a = await authedSocket(hub);
+    const b = await authedSocket(hub);
+    await hub.handleMessage(a.state, JSON.stringify({ type: "subscribe", workspaceId: "ws-1" }));
+    await hub.handleMessage(b.state, JSON.stringify({ type: "subscribe", workspaceId: "ws-2" }));
+    hub.handleBusMessage(JSON.stringify({
+      type: "inbox.update", workspaceId: "ws-1", conversationId: "conv-1",
+    }));
+    const updates = a.socket.frames().filter((f) => f.type === "inbox.update");
+    expect(updates).toHaveLength(1);
+    expect(updates[0]).toEqual({ type: "inbox.update", workspaceId: "ws-1", conversationId: "conv-1" });
+    expect(b.socket.frames().filter((f) => f.type === "inbox.update")).toHaveLength(0);
+  });
+
   test("subscribing to a workspace outside the verified set is refused", async () => {
     const hub = setup();
     const { socket, state } = await authedSocket(hub);

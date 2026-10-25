@@ -11,9 +11,10 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  *                     { "type": "unsubscribe", "workspaceId": "<id>" }
  *   server -> client: { "type": "subscribed" | "unsubscribed", "workspaceId" }
  *                     { "type": "error", "code", "message" }
- *                     inbox.message events from the `botara:realtime` bus,
- *                     forwarded verbatim, ONLY for subscribed workspaces
- *                     that are in the socket's verified workspace set.
+ *                     inbox.message / inbox.update events from the
+ *                     `botara:realtime` bus, forwarded verbatim, ONLY for
+ *                     subscribed workspaces that are in the socket's
+ *                     verified workspace set.
  *
  * Security model: the JWT is verified locally (HS256, SESSION_SECRET -
  * the same scheme the API signs with, mirrored below), and workspace
@@ -108,7 +109,7 @@ export class RealtimeHub {
     this.conns.delete(state);
   }
 
-  /** Redis bus fan-in: forward inbox.message payloads to subscribers. */
+  /** Redis bus fan-in: forward inbox.message / inbox.update payloads to subscribers. */
   handleBusMessage(payload: string): void {
     let event: { type?: string; workspaceId?: string };
     try {
@@ -116,7 +117,7 @@ export class RealtimeHub {
     } catch {
       return; // Not ours / not JSON - the bus is shared, stay silent.
     }
-    if (event.type !== "inbox.message" || !event.workspaceId) return;
+    if ((event.type !== "inbox.message" && event.type !== "inbox.update") || !event.workspaceId) return;
     for (const conn of this.conns) {
       if (conn.authed && conn.subscriptions.has(event.workspaceId)) {
         try { conn.socket.send(payload); } catch { /* a dying socket must not break fan-out */ }

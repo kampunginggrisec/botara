@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, Handle, Position,
   addEdge, useEdgesState, useNodesState,
@@ -7,7 +7,8 @@ import {
 import "@xyflow/react/dist/style.css";
 import {
   api, ApiError,
-  type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger, type RichBlock, type RichButton,
+  type CatalogProduct, type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger,
+  type RichBlock, type RichButton,
 } from "../api";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
@@ -235,10 +236,12 @@ function defaultRichBlock(kind: RichBlock["kind"]): RichBlock {
  * Channels render what they support and degrade the rest to text with a
  * typed warning - the editor therefore allows every combination.
  */
-function RichBlockEditor({ node, patch, t }: {
+function RichBlockEditor({ node, patch, t, products }: {
   node: EngineNode;
   patch: (patch: Record<string, unknown>) => void;
   t: ReturnType<typeof useI18n>["t"];
+  /** Synced catalog products for the product/catalog pickers (may be empty). */
+  products: CatalogProduct[];
 }) {
   const rich = (node.rich && typeof node.rich === "object" ? (node.rich as RichBlock) : null);
   const setRich = (next: RichBlock | undefined) => patch({ rich: next });
@@ -423,6 +426,44 @@ function RichBlockEditor({ node, patch, t }: {
         </div>
       )}
 
+      {(rich.kind === "product" || rich.kind === "catalog") && products.length > 0 && (
+        <div>
+          <label className={richLabelCls}>{t("flows.rich.productPicker")}</label>
+          <select
+            value={rich.kind === "product" && products.some((p) => p.catalogId === rich.catalogId && p.retailerId === rich.productId)
+              ? `${rich.catalogId}::${rich.productId}`
+              : ""}
+            onChange={(e) => {
+              const [catalogId, retailerId] = e.target.value.split("::");
+              if (!catalogId || !retailerId) return;
+              if (rich.kind === "product") {
+                setRich({ ...rich, catalogId, productId: retailerId });
+              } else if (rich.kind === "catalog") {
+                const sections = rich.sections ?? [];
+                const included = sections.some((s) => s.productIds.includes(retailerId));
+                const nextSections = included
+                  ? sections
+                  : sections.length > 0
+                    ? sections.map((s, i) => (i === 0 ? { ...s, productIds: [...s.productIds, retailerId] } : s))
+                    : [{ title: "Products", productIds: [retailerId] }];
+                setRich({ ...rich, catalogId, sections: nextSections });
+              }
+            }}
+            className={richInputCls}
+          >
+            <option value="">{t("flows.rich.productPicker")}</option>
+            {[...new Set(products.map((p) => p.catalogId))].map((catalogId) => (
+              <optgroup key={catalogId} label={catalogId}>
+                {products.filter((p) => p.catalogId === catalogId).map((p) => (
+                  <option key={p.id} value={`${p.catalogId}::${p.retailerId}`}>
+                    {p.name} ({p.retailerId})
+                  </option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        </div>
+      )}
       {(rich.kind === "product" || rich.kind === "catalog") && (
         <div>
           <label className={richLabelCls}>{t("flows.rich.catalogId")}</label>
@@ -467,6 +508,18 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
   const [testText, setTestText] = useState("");
   const [testActions, setTestActions] = useState<Array<Record<string, unknown>> | null>(null);
   const [testStatus, setTestStatus] = useState<string | null>(null);
+  // Synced catalog products feed the rich product/catalog pickers.
+  const [catalogProducts, setCatalogProducts] = useState<CatalogProduct[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await api.listCatalogProducts({ limit: 200 });
+        if (!cancelled) setCatalogProducts(data.products);
+      } catch { /* pickers are an enhancement; manual ids still work */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   const selected = useMemo(
     () => nodes.find((n) => n.id === selectedId)?.data.engine ?? null,
@@ -708,7 +761,7 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                       <label className={labelCls}>{t("flows.field.text")}</label>
                       <textarea value={str(selected, "text")} onChange={(e) => patchSelected({ text: e.target.value })} rows={3} className={inputCls} />
                     </div>
-                    <RichBlockEditor node={selected} patch={patchSelected} t={t} />
+                    <RichBlockEditor node={selected} patch={patchSelected} t={t} products={catalogProducts} />
                     <div>
                       <label className={labelCls}>{t("flows.field.channelAccount")}</label>
                       <select

@@ -3,8 +3,9 @@ import { getToken } from "./api";
 /**
  * Dashboard realtime client: keeps one WebSocket to the realtime
  * service (same-origin /ws, proxied to apps/realtime) and surfaces
- * inbox.message events so the Inbox refreshes itself - no more manual
- * page reloads to see a new message.
+ * inbox events (inbox.message, inbox.update) so the Inbox refreshes
+ * itself - no more manual page reloads to see a new message or an
+ * assignment change.
  *
  * Protocol (see apps/realtime/src/server.ts): after connect, send
  * { type: "auth", token } with the session JWT; on { type: "ready" },
@@ -26,41 +27,72 @@ export interface InboxMessageEvent {
   messageId?: string;
 }
 
+/**
+ * Conversation metadata changed without a new message (today:
+ * assignment). Same ids-only contract; the Inbox refetches the list and
+ * the open thread's header state.
+ */
+export interface InboxUpdateEvent {
+  type: "inbox.update";
+  workspaceId: string;
+  conversationId: string;
+}
+
+export type InboxRealtimeEvent = InboxMessageEvent | InboxUpdateEvent;
+
 /** Same-origin WS URL for the realtime service. */
 export function realtimeUrl(loc: { protocol: string; host: string }): string {
   return `${loc.protocol === "https:" ? "wss:" : "ws:"}//${loc.host}/ws`;
 }
 
-/** Parse one raw frame; returns the event or null for anything else. */
+/** Parse one raw frame; returns the message event or null for anything else. */
 export function parseInboxMessageEvent(raw: string): InboxMessageEvent | null {
-  let doc: unknown;
+  const doc = parseFrame(raw);
+  if (!doc) return null;
+  if (doc.type !== "inbox.message") return null;
+  if (typeof doc.workspaceId !== "string" || typeof doc.conversationId !== "string") return null;
+  if (doc.direction !== "in" && doc.direction !== "out") return null;
+  return {
+    type: "inbox.message",
+    workspaceId: doc.workspaceId,
+    conversationId: doc.conversationId,
+    direction: doc.direction,
+    ...(typeof doc.messageId === "string" ? { messageId: doc.messageId } : {}),
+  };
+}
+
+function parseFrame(raw: string): Record<string, unknown> | null {
   try {
-    doc = JSON.parse(raw);
+    const doc: unknown = JSON.parse(raw);
+    if (typeof doc !== "object" || doc === null) return null;
+    return doc as Record<string, unknown>;
   } catch {
     return null;
   }
-  if (typeof doc !== "object" || doc === null) return null;
-  const e = doc as Record<string, unknown>;
-  if (e.type !== "inbox.message") return null;
-  if (typeof e.workspaceId !== "string" || typeof e.conversationId !== "string") return null;
-  if (e.direction !== "in" && e.direction !== "out") return null;
-  return {
-    type: "inbox.message",
-    workspaceId: e.workspaceId,
-    conversationId: e.conversationId,
-    direction: e.direction,
-    ...(typeof e.messageId === "string" ? { messageId: e.messageId } : {}),
-  };
+}
+
+/** Parse one raw frame into either inbox event kind; null for anything else. */
+export function parseInboxEvent(raw: string): InboxRealtimeEvent | null {
+  const message = parseInboxMessageEvent(raw);
+  if (message) return message;
+  const doc = parseFrame(raw);
+  if (!doc || doc.type !== "inbox.update") return null;
+  if (typeof doc.workspaceId !== "string" || typeof doc.conversationId !== "string") return null;
+  return { type: "inbox.update", workspaceId: doc.workspaceId, conversationId: doc.conversationId };
 }
 
 /**
  * Pure refresh decision for one event (unit-tested): an event for the
  * CURRENT workspace refreshes the conversation list; when it targets
- * the open conversation its messages refetch too. Anything else (stale
- * workspace after a switch, other workspaces) is ignored.
+ * the open conversation its messages refetch too. inbox.update events
+ * (assignment) refresh the list AND the open thread's header state -
+ * the Inbox keys its header refresh off the messages flag, and an
+ * update carries no message, so both flags go up for the open thread.
+ * Anything else (stale workspace after a switch, other workspaces) is
+ * ignored.
  */
 export function decideInboxRefresh(
-  event: InboxMessageEvent,
+  event: InboxRealtimeEvent,
   current: { workspaceId: string; openConversationId: string | null },
 ): { refreshList: boolean; refreshMessages: boolean } {
   if (event.workspaceId !== current.workspaceId) {
@@ -90,7 +122,7 @@ const DEGRADED_AFTER_ATTEMPTS = 3;
 
 export function connectRealtime(options: {
   workspaceId: string;
-  onInboxMessage: (event: InboxMessageEvent) => void;
+  onInboxMessage: (event: InboxRealtimeEvent) => void;
 }): RealtimeHandle {
   let socket: WebSocket | null = null;
   let currentWorkspace = options.workspaceId;
@@ -137,7 +169,7 @@ export function connectRealtime(options: {
     };
     ws.onmessage = (frame) => {
       const raw = typeof frame.data === "string" ? frame.data : "";
-      const event = parseInboxMessageEvent(raw);
+      const event = parseInboxEvent(raw);
       if (event) {
         options.onInboxMessage(event);
         return;

@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
-  type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type ChannelAccount, type Contact,
+  type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type CatalogProduct, type CatalogSummary,
+  type ChannelAccount, type Contact,
   type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
   type Member, type Message, type PublicConfig, type RichBlock, type ScheduledPost, type Sequence,
   type SequenceStep, type StatsOverview, type Template, type WorkspaceSummary,
@@ -9,7 +10,7 @@ import {
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
 import {
   connectRealtime, decideInboxRefresh, isRealtimeDegraded,
-  type InboxMessageEvent, type RealtimeHandle,
+  type InboxRealtimeEvent, type RealtimeHandle,
 } from "./realtime";
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
@@ -75,9 +76,13 @@ function PageTitle({ title, subtitle }: { title: string; subtitle?: string }) {
 const errText = (err: unknown, fallback: string): string =>
   err instanceof ApiError ? err.message : fallback;
 
+/** Up-to-two-letter initials for an assignee chip (from a name or email). */
+const initialsOf = (label: string): string =>
+  label.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((p) => p[0]!.toUpperCase()).join("") || "?";
+
 // ------------------------------------------------------------------- Inbox
 
-function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
+function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const { t } = useI18n();
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [selected, setSelected] = useState<Conversation | null>(null);
@@ -86,27 +91,85 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
   const [error, setError] = useState<string | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
   const [sending, setSending] = useState(false);
-  // Rich buttons builder (adopted features): reply/url buttons attached
-  // to the reply as a rich block; channels render or degrade them.
-  const [showButtons, setShowButtons] = useState(false);
+  // Assignment: workspace members for the filter + header select, and
+  // the list filter itself ("" = all, "me", "unassigned", or a user id).
+  const [members, setMembers] = useState<Member[]>([]);
+  const [assigneeFilter, setAssigneeFilter] = useState("");
+  // Rich composer (adopted features): reply/url buttons OR a catalog
+  // product attached to the reply as a rich block; channels render or
+  // degrade them. Synced products for the open conversation's account
+  // feed the product picker.
+  const [richKind, setRichKind] = useState<"none" | "buttons" | "product">("none");
   const [richButtons, setRichButtons] = useState<Array<{ type: "reply" | "url"; title: string; payload: string; url: string }>>([]);
   const [richWarning, setRichWarning] = useState<string | null>(null);
+  const [accountProducts, setAccountProducts] = useState<CatalogProduct[]>([]);
+  const [productCatalogId, setProductCatalogId] = useState("");
+  const [productRetailerId, setProductRetailerId] = useState("");
 
-  const loadConversations = useCallback(async () => {
+  const showButtons = richKind === "buttons";
+
+  const loadConversations = useCallback(async (): Promise<Conversation[]> => {
     try {
-      const data = await api.listConversations();
+      const data = await api.listConversations(assigneeFilter ? { assignee: assigneeFilter } : {});
       setConversations(data.conversations);
       setError(null);
+      return data.conversations;
     } catch (err) {
       setError(errText(err, t("inbox.loadFailed")));
+      return [];
     }
-  }, [t]);
+  }, [t, assigneeFilter]);
 
   useEffect(() => { void loadConversations(); }, [loadConversations]);
 
+  // Workspace members for assignment (same endpoint Settings uses).
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await api.listMembers(getWorkspaceId());
+        if (!cancelled) setMembers(data.members);
+      } catch { /* assignment UI degrades to Unassigned-only; inbox still works */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // Synced catalog products for the open conversation's WhatsApp account.
+  const selectedId = selected?.id;
+  const selectedChannel = selected?.channel;
+  const selectedAccountId = selected?.channelAccountId;
+  useEffect(() => {
+    if (!selectedId || selectedChannel !== "whatsapp" || !selectedAccountId) {
+      setAccountProducts([]);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await api.listCatalogProducts({ accountId: selectedAccountId, limit: 200 });
+        if (!cancelled) setAccountProducts(data.products);
+      } catch {
+        if (!cancelled) setAccountProducts([]);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [selectedId, selectedChannel, selectedAccountId]);
+
+  const changeAssignee = async (conv: Conversation, userId: string | null) => {
+    try {
+      const res = await api.assignConversation(conv.id, userId);
+      setConversations((prev) => prev.map((c) => (c.id === conv.id ? res.conversation : c)));
+      if (selectedRef.current?.id === conv.id) setSelected(res.conversation);
+    } catch (err) {
+      setError(errText(err, t("inbox.assignFailed")));
+    }
+  };
+
   // Live updates (realtime socket owned by AuthedApp): an event for the
   // current workspace refreshes the list; an event for the OPEN
-  // conversation refetches its messages too - no manual refresh.
+  // conversation refetches its messages too - no manual refresh. An
+  // inbox.update (assignment) also re-syncs the open thread's header
+  // from the fresh list row.
   const selectedRef = useRef<Conversation | null>(null);
   selectedRef.current = selected;
   useEffect(() => {
@@ -115,8 +178,14 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
       workspaceId: getWorkspaceId(),
       openConversationId: selectedRef.current?.id ?? null,
     });
-    if (decision.refreshList) void loadConversations();
-    if (decision.refreshMessages && selectedRef.current) void openConversation(selectedRef.current);
+    if (!decision.refreshList && !decision.refreshMessages) return;
+    void (async () => {
+      const fresh = decision.refreshList ? await loadConversations() : null;
+      const open = selectedRef.current;
+      if (decision.refreshMessages && open) {
+        await openConversation(fresh?.find((c) => c.id === open.id) ?? open);
+      }
+    })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveEvent]);
 
@@ -126,8 +195,11 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
   useEffect(() => {
     const timer = setInterval(() => {
       if (!isRealtimeDegraded()) return;
-      void loadConversations();
-      if (selectedRef.current) void openConversation(selectedRef.current);
+      void (async () => {
+        const fresh = await loadConversations();
+        const open = selectedRef.current;
+        if (open) await openConversation(fresh.find((c) => c.id === open.id) ?? open);
+      })();
     }, 30_000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -150,7 +222,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
     setRichWarning(null);
     try {
       const validButtons = richButtons.filter((b) => b.title.trim());
-      const rich: RichBlock | undefined = showButtons && validButtons.length > 0
+      const rich: RichBlock | undefined = richKind === "buttons" && validButtons.length > 0
         ? {
             kind: "buttons",
             text: replyText.trim(),
@@ -158,14 +230,23 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
               ? { type: "url" as const, title: b.title.trim(), url: b.url.trim() }
               : { type: "reply" as const, title: b.title.trim(), payload: b.payload.trim() || b.title.trim() })),
           }
-        : undefined;
+        : richKind === "product" && productCatalogId.trim() && productRetailerId.trim()
+          ? {
+              kind: "product",
+              catalogId: productCatalogId.trim(),
+              productId: productRetailerId.trim(),
+              text: replyText.trim(),
+            }
+          : undefined;
       const res = await api.reply(selected.id, { kind: "free_form", text: replyText.trim(), ...(rich ? { rich } : {}) });
       if (res.warnings && res.warnings.length > 0) {
         setRichWarning(t("inbox.richDegraded", { warnings: res.warnings.join(", ") }));
       }
       setReplyText("");
       setRichButtons([]);
-      setShowButtons(false);
+      setRichKind("none");
+      setProductCatalogId("");
+      setProductRetailerId("");
       setWindowClosed(false);
       await openConversation(selected);
     } catch (err) {
@@ -185,6 +266,31 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
       {error && <div className="mt-4"><ErrorBox error={error} /></div>}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="space-y-2">
+          <div className="flex flex-wrap gap-2">
+            <select
+              value={["", "me", "unassigned"].includes(assigneeFilter) ? assigneeFilter : ""}
+              onChange={(e) => setAssigneeFilter(e.target.value)}
+              aria-label={t("inbox.assigneeLabel")}
+              className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              <option value="">{t("inbox.assignFilterAll")}</option>
+              <option value="me">{t("inbox.assignFilterMe")}</option>
+              <option value="unassigned">{t("inbox.assignFilterUnassigned")}</option>
+            </select>
+            {members.length > 1 && (
+              <select
+                value={members.some((m) => m.userId === assigneeFilter) ? assigneeFilter : ""}
+                onChange={(e) => setAssigneeFilter(e.target.value)}
+                aria-label={t("inbox.assigneeLabel")}
+                className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+              >
+                <option value="">{t("inbox.assigneeLabel")}</option>
+                {members.map((m) => (
+                  <option key={m.userId} value={m.userId}>{m.name ?? m.email}</option>
+                ))}
+              </select>
+            )}
+          </div>
           {conversations.length === 0 && !error && <EmptyState>{t("inbox.empty")}</EmptyState>}
           {conversations.map((conv) => (
             <button
@@ -203,6 +309,18 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
                   ? <span className="text-emerald-600 dark:text-emerald-400 font-medium">{t("inbox.windowOpen")}</span>
                   : <span className="text-red-600 dark:text-red-400 font-medium">{t("inbox.windowClosed")}</span>}
               </div>
+              <div className="mt-1.5 flex items-center gap-1.5 text-xs">
+                {conv.assignee ? (
+                  <>
+                    <span className="flex h-5 w-5 items-center justify-center rounded-full bg-slate-200 text-[10px] font-semibold text-slate-700 dark:bg-slate-700 dark:text-slate-100">
+                      {initialsOf(conv.assignee.name ?? conv.assignee.email ?? "?")}
+                    </span>
+                    <span className="text-slate-600 dark:text-slate-300">{conv.assignee.name ?? conv.assignee.email}</span>
+                  </>
+                ) : (
+                  <span className="text-slate-400 dark:text-slate-500">{t("inbox.unassigned")}</span>
+                )}
+              </div>
             </button>
           ))}
         </div>
@@ -211,8 +329,23 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
             <div className="p-6 text-sm text-slate-500 dark:text-slate-400">{t("inbox.selectPrompt")}</div>
           ) : (
             <>
-              <div className="border-b border-slate-100 dark:border-slate-800 px-4 py-3 font-medium text-sm">
-                {selected.contactDisplayName ?? selected.contactExternalId} · {selected.channel}
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 px-4 py-3">
+                <span className="font-medium text-sm">
+                  {selected.contactDisplayName ?? selected.contactExternalId} · {selected.channel}
+                </span>
+                <label className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                  {t("inbox.assigneeLabel")}
+                  <select
+                    value={selected.assignedUserId ?? ""}
+                    onChange={(e) => void changeAssignee(selected, e.target.value || null)}
+                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  >
+                    <option value="">{t("inbox.unassigned")}</option>
+                    {members.map((m) => (
+                      <option key={m.userId} value={m.userId}>{m.name ?? m.email} ({m.role})</option>
+                    ))}
+                  </select>
+                </label>
               </div>
               <div className="flex-1 p-4 space-y-2 overflow-y-auto">
                 {messages.length === 0 && <div className="text-sm text-slate-400 dark:text-slate-500">{t("inbox.noMessages")}</div>}
@@ -250,12 +383,21 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
                     {sending ? t("common.sending") : t("common.send")}
                   </button>
                 </div>
-                <button
-                  onClick={() => setShowButtons((v) => !v)}
-                  className="mt-2 text-xs text-slate-600 underline dark:text-slate-300"
-                >
-                  {showButtons ? t("inbox.hideButtons") : t("inbox.addButtons")}
-                </button>
+                <div className="mt-2 flex items-center gap-2">
+                  <label className="text-xs text-slate-500 dark:text-slate-400" htmlFor="inbox-rich-kind">
+                    {t("inbox.richKind")}
+                  </label>
+                  <select
+                    id="inbox-rich-kind"
+                    value={richKind}
+                    onChange={(e) => setRichKind(e.target.value as "none" | "buttons" | "product")}
+                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  >
+                    <option value="none">{t("inbox.richNone")}</option>
+                    <option value="buttons">{t("inbox.richButtons")}</option>
+                    <option value="product">{t("inbox.richProduct")}</option>
+                  </select>
+                </div>
                 {showButtons && (
                   <div className="mt-2 space-y-2 rounded-md border border-slate-200 p-2 dark:border-slate-700">
                     <p className="text-xs text-slate-500 dark:text-slate-400">{t("inbox.buttonsHint")}</p>
@@ -304,6 +446,46 @@ function InboxPage({ liveEvent }: { liveEvent: InboxMessageEvent | null }) {
                     >
                       {t("inbox.addButtonRow")}
                     </button>
+                  </div>
+                )}
+                {richKind === "product" && (
+                  <div className="mt-2 space-y-2 rounded-md border border-slate-200 p-2 dark:border-slate-700">
+                    {accountProducts.length > 0 && (
+                      <select
+                        value={productCatalogId && productRetailerId ? `${productCatalogId}::${productRetailerId}` : ""}
+                        onChange={(e) => {
+                          const [catalogId, retailerId] = e.target.value.split("::");
+                          setProductCatalogId(catalogId ?? "");
+                          setProductRetailerId(retailerId ?? "");
+                        }}
+                        className="w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      >
+                        <option value="">{t("inbox.productPicker")}</option>
+                        {[...new Set(accountProducts.map((p) => p.catalogId))].map((catalogId) => (
+                          <optgroup key={catalogId} label={catalogId}>
+                            {accountProducts.filter((p) => p.catalogId === catalogId).map((p) => (
+                              <option key={p.id} value={`${p.catalogId}::${p.retailerId}`}>
+                                {p.name} ({p.retailerId})
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                      </select>
+                    )}
+                    <div className="flex flex-wrap gap-2">
+                      <input
+                        value={productCatalogId}
+                        onChange={(e) => setProductCatalogId(e.target.value)}
+                        placeholder={t("flows.rich.catalogId")}
+                        className="w-44 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      />
+                      <input
+                        value={productRetailerId}
+                        onChange={(e) => setProductRetailerId(e.target.value)}
+                        placeholder={t("flows.rich.productId")}
+                        className="w-44 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      />
+                    </div>
                   </div>
                 )}
               </div>
@@ -1347,6 +1529,78 @@ function loadFacebookSdk(appId: string): Promise<void> {
   });
 }
 
+/**
+ * Meta Catalog sync block on a WhatsApp account card: mirrors the
+ * account's product catalogs so the FlowBuilder / Inbox pickers can
+ * offer real products. The 503 CONFIGURATION case gets its own honest
+ * message - the account needs a valid vault token first.
+ */
+function CatalogSyncSection({ accountId }: { accountId: string }) {
+  const { t } = useI18n();
+  const [summary, setSummary] = useState<CatalogSummary | null>(null);
+  const [catalogIdInput, setCatalogIdInput] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+  const [errorText, setErrorText] = useState<string | null>(null);
+
+  const loadSummary = useCallback(async () => {
+    try {
+      setSummary(await api.getCatalogSummary(accountId));
+    } catch { /* the summary line is informational only */ }
+  }, [accountId]);
+  useEffect(() => { void loadSummary(); }, [loadSummary]);
+
+  const runSync = async () => {
+    setSyncing(true);
+    setMessage(null);
+    setErrorText(null);
+    try {
+      const res = await api.syncCatalog(accountId, catalogIdInput.trim() || undefined);
+      setMessage(t("channels.catalog.synced", { products: res.products, catalogs: res.catalogs }));
+      await loadSummary();
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "CONFIGURATION") {
+        setErrorText(t("channels.catalog.needToken"));
+      } else {
+        setErrorText(errText(err, t("channels.catalog.failed")));
+      }
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium text-slate-600 dark:text-slate-300">{t("channels.catalog.title")}</span>
+        <span className="text-xs text-slate-400 dark:text-slate-500">
+          {summary && summary.productCount > 0 && summary.lastSyncedAt
+            ? `${t("channels.catalog.products", { count: summary.productCount })} · ${t("channels.catalog.lastSync", { date: new Date(summary.lastSyncedAt).toLocaleString() })}`
+            : t("channels.catalog.never")}
+        </span>
+      </div>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        <input
+          value={catalogIdInput}
+          onChange={(e) => setCatalogIdInput(e.target.value)}
+          placeholder={t("channels.catalog.catalogIdPlaceholder")}
+          aria-label={t("channels.catalog.catalogIdLabel")}
+          className="w-64 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-900 placeholder:text-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100 dark:placeholder:text-slate-500"
+        />
+        <button
+          onClick={() => void runSync()}
+          disabled={syncing}
+          className="rounded-md border border-slate-900 px-3 py-1.5 text-xs text-slate-900 disabled:opacity-50 dark:border-slate-100 dark:text-slate-100"
+        >
+          {syncing ? t("channels.catalog.syncing") : t("channels.catalog.sync")}
+        </button>
+      </div>
+      {message && <p className="mt-2 text-xs text-emerald-700 dark:text-emerald-400">{message}</p>}
+      {errorText && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{errorText}</p>}
+    </div>
+  );
+}
+
 function ChannelsPage() {
   const { t } = useI18n();
   const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
@@ -1504,17 +1758,20 @@ function ChannelsPage() {
       <div className="mt-3 space-y-2 max-w-3xl">
         {accounts.length === 0 && !error && <EmptyState>{t("channels.connectedEmpty")}</EmptyState>}
         {accounts.map((a) => (
-          <div key={a.id} className={`${cardCls} p-3 flex flex-wrap items-center gap-2`}>
-            <span className={chipCls}>{a.channel}</span>
-            <span className="font-medium text-sm">{a.displayName ?? a.externalId}</span>
-            <span className="text-xs text-slate-500 dark:text-slate-400">{a.status}</span>
-            {a.channel === "whatsapp" && (a as ChannelAccount & { isCoexistence?: boolean }).isCoexistence && (
-              <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{t("channels.coexistence")}</span>
-            )}
-            <span className="text-xs text-slate-400 dark:text-slate-500">
-              {a.hasCredential ? t("channels.hasCredential") : t("channels.noCredential")}
-              {a.tokenExpiresAt ? ` · ${t("channels.expires", { date: new Date(a.tokenExpiresAt).toLocaleDateString() })}` : ""}
-            </span>
+          <div key={a.id} className={`${cardCls} p-3`}>
+            <div className="flex flex-wrap items-center gap-2">
+              <span className={chipCls}>{a.channel}</span>
+              <span className="font-medium text-sm">{a.displayName ?? a.externalId}</span>
+              <span className="text-xs text-slate-500 dark:text-slate-400">{a.status}</span>
+              {a.channel === "whatsapp" && (a as ChannelAccount & { isCoexistence?: boolean }).isCoexistence && (
+                <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{t("channels.coexistence")}</span>
+              )}
+              <span className="text-xs text-slate-400 dark:text-slate-500">
+                {a.hasCredential ? t("channels.hasCredential") : t("channels.noCredential")}
+                {a.tokenExpiresAt ? ` · ${t("channels.expires", { date: new Date(a.tokenExpiresAt).toLocaleDateString() })}` : ""}
+              </span>
+            </div>
+            {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
           </div>
         ))}
       </div>
@@ -2362,7 +2619,7 @@ function AuthedApp() {
   // re-subscribed on workspace switches, torn down on logout (the
   // cleanup runs when `user` clears). Events land in state and the
   // Inbox page decides what to refresh.
-  const [liveEvent, setLiveEvent] = useState<InboxMessageEvent | null>(null);
+  const [liveEvent, setLiveEvent] = useState<InboxRealtimeEvent | null>(null);
   const realtimeRef = useRef<RealtimeHandle | null>(null);
   useEffect(() => {
     if (!user) return;

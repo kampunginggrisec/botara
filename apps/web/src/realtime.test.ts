@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  decideInboxRefresh, parseInboxMessageEvent, realtimeUrl, type InboxMessageEvent,
+  decideInboxRefresh, parseInboxEvent, parseInboxMessageEvent, realtimeUrl,
+  type InboxMessageEvent, type InboxUpdateEvent,
 } from "./realtime";
 
 /**
@@ -39,10 +40,38 @@ describe("parseInboxMessageEvent", () => {
   });
 });
 
+describe("parseInboxEvent (union)", () => {
+  const update: InboxUpdateEvent = { type: "inbox.update", workspaceId: "ws-1", conversationId: "conv-1" };
+
+  test("message and update events both parse", () => {
+    expect(parseInboxEvent(JSON.stringify(event()))).toEqual(event());
+    expect(parseInboxEvent(JSON.stringify(update))).toEqual(update);
+  });
+
+  test("incomplete update events and foreign frames are ignored", () => {
+    expect(parseInboxEvent(JSON.stringify({ type: "inbox.update", workspaceId: "ws-1" }))).toBeNull();
+    expect(parseInboxEvent(JSON.stringify({ type: "ready" }))).toBeNull();
+    expect(parseInboxEvent("junk")).toBeNull();
+    // The message-only parser still ignores update frames (back-compat).
+    expect(parseInboxMessageEvent(JSON.stringify(update))).toBeNull();
+  });
+});
+
 describe("decideInboxRefresh", () => {
+  const update: InboxUpdateEvent = { type: "inbox.update", workspaceId: "ws-1", conversationId: "conv-1" };
+
   test("an event for another workspace changes nothing", () => {
     expect(decideInboxRefresh(event({ workspaceId: "ws-2" }), { workspaceId: "ws-1", openConversationId: "conv-1" }))
       .toEqual({ refreshList: false, refreshMessages: false });
+    expect(decideInboxRefresh({ ...update, workspaceId: "ws-2" }, { workspaceId: "ws-1", openConversationId: "conv-1" }))
+      .toEqual({ refreshList: false, refreshMessages: false });
+  });
+
+  test("an inbox.update refreshes the list, and the open thread's state when it targets it", () => {
+    expect(decideInboxRefresh(update, { workspaceId: "ws-1", openConversationId: "conv-1" }))
+      .toEqual({ refreshList: true, refreshMessages: true });
+    expect(decideInboxRefresh(update, { workspaceId: "ws-1", openConversationId: "conv-9" }))
+      .toEqual({ refreshList: true, refreshMessages: false });
   });
 
   test("an event for the current workspace refreshes the list only when another conversation is open", () => {
