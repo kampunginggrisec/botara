@@ -5,6 +5,7 @@ export {
   webchatSessions, scheduledPosts, sequences, sequenceEnrollments,
   tokenVault, workspaceDomains, auditLog, kbDocuments, kbChunks,
   dataDeletionRequests, flows, apiTokens, processedComments, growthLinks,
+  catalogProducts,
 } from "./schema";
 export { getDb, closeDb, type Database } from "./client";
 export * from "./repositories";

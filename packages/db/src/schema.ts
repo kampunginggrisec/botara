@@ -409,6 +409,39 @@ export const growthLinks = pgTable("growth_links", {
   index("growth_links_ws_idx").on(t.workspaceId),
 ]);
 
+/**
+ * Synced Meta (WhatsApp) catalog products. The catalog sync pulls a
+ * WhatsApp account's product catalogs from the Graph API and mirrors the
+ * products here so the FlowBuilder / Inbox pickers can offer real
+ * (catalog_id, retailer_id) pairs instead of hand-typed ids - the rich
+ * product/catalog sends consume exactly those two ids. `raw` keeps the
+ * full Graph product object for fields the mirror does not model.
+ * Uniqueness is per (channel account, catalog, retailer id): retailer_id
+ * is only unique inside one catalog.
+ */
+export const catalogProducts = pgTable("catalog_products", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  catalogId: varchar("catalog_id", { length: 200 }).notNull(),
+  /** The product's retailer id - the id WhatsApp sends reference. */
+  retailerId: varchar("retailer_id", { length: 200 }).notNull(),
+  name: varchar("name", { length: 500 }).notNull(),
+  description: text("description"),
+  priceAmount: numeric("price_amount", { precision: 14, scale: 2 }),
+  currency: varchar("currency", { length: 8 }),
+  imageUrl: text("image_url"),
+  availability: varchar("availability", { length: 60 }),
+  link: text("link"),
+  raw: jsonb("raw"),
+  syncedAt: timestamp("synced_at", { withTimezone: true }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("catalog_products_account_catalog_retailer_idx").on(t.channelAccountId, t.catalogId, t.retailerId),
+  index("catalog_products_ws_idx").on(t.workspaceId),
+]);
+
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),

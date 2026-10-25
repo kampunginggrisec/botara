@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
-  apiTokens, auditLog, broadcasts, channelAccounts, contacts, conversations, costLedger,
+  apiTokens, auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
   dataDeletionRequests, flows, growthLinks, kbChunks, kbDocuments, messages,
   processedComments,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
@@ -125,7 +125,7 @@ export interface ConversationListItem extends ConversationRow {
 export async function listConversations(
   db: Database,
   workspaceId: string,
-  filter: { channel?: string; status?: string } = {},
+  filter: { channel?: string; status?: string; assignedTo?: string | null } = {},
 ): Promise<ConversationListItem[]> {
   const rows = await db
     .select({
@@ -146,13 +146,38 @@ export async function listConversations(
       ),
     )
     .orderBy(desc(conversations.createdAt));
-  return rows.map((r) => ({
+  const mapped = rows.map((r) => ({
     ...r.conversation,
     channel: r.channel,
     channelAccountExternalId: r.channelAccountExternalId,
     contactExternalId: r.contactExternalId,
     contactDisplayName: r.contactDisplayName,
   }));
+  // Assignee filter in JS (same precedent as the contacts tag filter):
+  // `assignedTo: null` means unassigned-only, a string means that member,
+  // undefined means all. Keeps the filter identical across SQL backends.
+  if (filter.assignedTo === undefined) return mapped;
+  return mapped.filter((r) => (r.assignedUserId ?? null) === filter.assignedTo);
+}
+
+/**
+ * Set (or clear, with null) a conversation's assignee. Workspace-scoped:
+ * returns null when the conversation does not belong to the workspace.
+ * Membership of the assignee is the CALLER's job (route validates it
+ * against the workspace member list before writing).
+ */
+export async function updateConversationAssignment(
+  db: Database,
+  workspaceId: string,
+  conversationId: string,
+  assignedUserId: string | null,
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .update(conversations)
+    .set({ assignedUserId })
+    .where(and(eq(conversations.id, conversationId), eq(conversations.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
 }
 
 export async function getConversation(
@@ -1876,6 +1901,122 @@ export async function addContactTag(
   if (tags.includes(tag)) return false;
   await updateContact(db, workspaceId, contactId, { tags: [...tags, tag] });
   return true;
+}
+
+// ------------------------------------------------------- catalog products
+
+export type CatalogProductRow = typeof catalogProducts.$inferSelect;
+
+export interface CatalogProductInput {
+  workspaceId: string;
+  channelAccountId: string;
+  catalogId: string;
+  retailerId: string;
+  name: string;
+  description?: string | null;
+  priceAmount?: string | null;
+  currency?: string | null;
+  imageUrl?: string | null;
+  availability?: string | null;
+  link?: string | null;
+  raw?: Record<string, unknown> | null;
+  syncedAt: Date;
+}
+
+/**
+ * Insert or update one synced product, keyed by
+ * (channelAccountId, catalogId, retailerId). Lookup-then-write keeps the
+ * upsert portable across SQL backends (and the in-memory test fake).
+ */
+export async function upsertCatalogProduct(
+  db: Database,
+  input: CatalogProductInput,
+): Promise<CatalogProductRow> {
+  const [existing] = await db
+    .select()
+    .from(catalogProducts)
+    .where(
+      and(
+        eq(catalogProducts.channelAccountId, input.channelAccountId),
+        eq(catalogProducts.catalogId, input.catalogId),
+        eq(catalogProducts.retailerId, input.retailerId),
+      ),
+    )
+    .limit(1);
+  const values = {
+    name: input.name,
+    description: input.description ?? null,
+    priceAmount: input.priceAmount ?? null,
+    currency: input.currency ?? null,
+    imageUrl: input.imageUrl ?? null,
+    availability: input.availability ?? null,
+    link: input.link ?? null,
+    raw: input.raw ?? null,
+    syncedAt: input.syncedAt,
+    updatedAt: new Date(),
+  };
+  if (existing) {
+    const [row] = await db
+      .update(catalogProducts)
+      .set(values)
+      .where(eq(catalogProducts.id, existing.id))
+      .returning();
+    return row!;
+  }
+  const [row] = await db
+    .insert(catalogProducts)
+    .values({ ...input, ...values })
+    .returning();
+  return row!;
+}
+
+/**
+ * List a workspace's synced catalog products (picker + summary reads).
+ * `q` matches name or retailer id, case-insensitively (JS filter, same
+ * precedent as the contacts tag filter).
+ */
+export async function listCatalogProducts(
+  db: Database,
+  workspaceId: string,
+  filter: { accountId?: string; q?: string; limit?: number } = {},
+): Promise<CatalogProductRow[]> {
+  const rows = await db
+    .select()
+    .from(catalogProducts)
+    .where(
+      and(
+        eq(catalogProducts.workspaceId, workspaceId),
+        filter.accountId ? eq(catalogProducts.channelAccountId, filter.accountId) : undefined,
+      ),
+    )
+    .orderBy(asc(catalogProducts.name));
+  const q = filter.q?.trim().toLowerCase();
+  const filtered = q
+    ? rows.filter((r) => r.name.toLowerCase().includes(q) || r.retailerId.toLowerCase().includes(q))
+    : rows;
+  return filter.limit ? filtered.slice(0, filter.limit) : filtered;
+}
+
+/** (id, retailerId) pairs currently mirrored for one account + catalog - the stale-deletion baseline. */
+export async function listCatalogProductKeys(
+  db: Database,
+  channelAccountId: string,
+  catalogId: string,
+): Promise<Array<{ id: string; retailerId: string }>> {
+  const rows = await db
+    .select({ id: catalogProducts.id, retailerId: catalogProducts.retailerId })
+    .from(catalogProducts)
+    .where(
+      and(
+        eq(catalogProducts.channelAccountId, channelAccountId),
+        eq(catalogProducts.catalogId, catalogId),
+      ),
+    );
+  return rows;
+}
+
+export async function deleteCatalogProduct(db: Database, id: string): Promise<void> {
+  await db.delete(catalogProducts).where(eq(catalogProducts.id, id));
 }
 
 /**
