@@ -229,6 +229,9 @@ The placeholder screens the owner found on the trial deployment are gone —
   member list/invite/role/remove.
 - **Feature parity:** `docs/feature-parity.md` maps ChatbotX's public
   feature list against Botara, item by item, honestly.
+- **Rich messages:** `docs/rich-messages.md` is the worked guide to
+  tappable buttons/lists - title vs payload vs URL, per-channel
+  rendering, and the click round-trip into flow triggers.
 
 ## Adopted-features package status
 
