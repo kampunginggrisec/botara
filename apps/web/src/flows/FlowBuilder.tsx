@@ -12,6 +12,7 @@ import {
 } from "../api";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
+import { RICH_BUTTONS_EXAMPLE } from "../rich-example";
 
 /**
  * Visual flow builder (Fase 4) on @xyflow/react.
@@ -314,7 +315,13 @@ function RichBlockEditor({ node, patch, t, products }: {
       {(rich.kind === "buttons" || rich.kind === "list" || rich.kind === "product" || rich.kind === "catalog") && (
         <div>
           <label className={richLabelCls}>{t("flows.field.text")}</label>
-          <textarea value={rich.text ?? ""} onChange={(e) => setRich({ ...rich, text: e.target.value } as RichBlock)} rows={2} className={richInputCls} />
+          <textarea
+            value={rich.text ?? ""}
+            onChange={(e) => setRich({ ...rich, text: e.target.value } as RichBlock)}
+            rows={2}
+            className={richInputCls}
+            placeholder={rich.kind === "buttons" && RICH_BUTTONS_EXAMPLE.kind === "buttons" ? RICH_BUTTONS_EXAMPLE.text : undefined}
+          />
         </div>
       )}
 
@@ -338,21 +345,21 @@ function RichBlockEditor({ node, patch, t, products }: {
               <input
                 value={b.title}
                 onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, title: e.target.value } : x)) })}
-                placeholder={t("flows.rich.buttonTitle")}
+                placeholder={RICH_BUTTONS_EXAMPLE.kind === "buttons" ? (RICH_BUTTONS_EXAMPLE.buttons[i]?.title ?? t("flows.rich.buttonTitle")) : t("flows.rich.buttonTitle")}
                 className="w-28 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
               />
               {b.type === "url" ? (
                 <input
                   value={b.url ?? ""}
                   onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)) })}
-                  placeholder="https://..."
+                  placeholder={RICH_BUTTONS_EXAMPLE.kind === "buttons" ? (RICH_BUTTONS_EXAMPLE.buttons[i]?.url ?? "https://example.com") : "https://example.com"}
                   className="w-40 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 />
               ) : (
                 <input
                   value={b.payload ?? ""}
                   onChange={(e) => setRich({ ...rich, buttons: rich.buttons.map((x, j) => (j === i ? { ...x, payload: e.target.value } : x)) })}
-                  placeholder="payload"
+                  placeholder={RICH_BUTTONS_EXAMPLE.kind === "buttons" ? (RICH_BUTTONS_EXAMPLE.buttons[i]?.payload ?? "HARGA") : "HARGA"}
                   className="w-40 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                 />
               )}
@@ -369,6 +376,13 @@ function RichBlockEditor({ node, patch, t, products }: {
             className="text-xs text-slate-600 underline dark:text-slate-300"
           >
             {t("flows.rich.addButton")}
+          </button>
+          <p className="text-xs text-slate-500 dark:text-slate-400">{t("flows.rich.payloadHint")}</p>
+          <button
+            onClick={() => setRich(RICH_BUTTONS_EXAMPLE)}
+            className="text-xs text-slate-600 underline dark:text-slate-300"
+          >
+            {t("flows.rich.useExample")}
           </button>
         </div>
       )}

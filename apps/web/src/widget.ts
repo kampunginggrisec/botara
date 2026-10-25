@@ -23,12 +23,23 @@
  *
  * This widget exists because Meta's Customer Chat Plugin retired
  * 2024-05-09 with no replacement - Botara ships its own.
+ *
+ * Rich messages: an outbound message whose persisted payload is a
+ * buttons/list block renders clickable buttons under the bubble (the
+ * view-model lives in widget-model.ts, unit-tested). A tap posts the
+ * button title + payload back as a visitor message - the API matches
+ * flow postback triggers on the payload and keyword triggers on the
+ * title. Button sets are one-shot: after a tap the whole set disables.
  */
+
+import { buttonClickBody, widgetRichView, type WidgetRichButton } from "./widget-model";
 
 interface WidgetMessage {
   id: string;
   direction: "in" | "out";
   body: string | null;
+  /** RichBlock for outbound rich messages (buttons/list render natively). */
+  payload?: unknown;
   createdAt: string;
 }
 
@@ -62,6 +73,7 @@ const palette = darkMode ? {
   inputRowBg: "#0f172a", inputRowBorder: "#1e293b", inputBorder: "#334155",
   inputBg: "#020617", inputText: "#f1f5f9",
   bubbleBg: "#f1f5f9", bubbleText: "#0f172a", sendBg: "#f1f5f9", sendText: "#0f172a",
+  btnBg: "#1e293b", btnBorder: "#475569", btnText: "#e2e8f0", sectionText: "#94a3b8",
 } : {
   panelBg: "#ffffff", headerBg: "#0f172a", headerText: "#ffffff",
   messagesBg: "#f8fafc", mineBg: "#0f172a", mineText: "#ffffff",
@@ -69,6 +81,7 @@ const palette = darkMode ? {
   inputRowBg: "#ffffff", inputRowBorder: "#e2e8f0", inputBorder: "#cbd5e1",
   inputBg: "#ffffff", inputText: "#0f172a",
   bubbleBg: "#0f172a", bubbleText: "#ffffff", sendBg: "#0f172a", sendText: "#ffffff",
+  btnBg: "#ffffff", btnBorder: "#cbd5e1", btnText: "#0f172a", sectionText: "#64748b",
 };
 
 const TOKEN_KEY = `botara.webchat.${workspaceId}`;
@@ -141,21 +154,91 @@ function init(): void {
   let open = false;
   let polling = false;
   const rendered = new Set<string>();
+  /** Live button elements per rich message id, for one-shot disabling. */
+  const buttonSets = new Map<string, HTMLButtonElement[]>();
 
   function renderMessage(m: WidgetMessage): void {
     if (rendered.has(m.id) || !m.body) return;
     rendered.add(m.id);
     const mine = m.direction === "in"; // "in" = written by the visitor
+    // Outbound rich messages (buttons/list payload) render their block's
+    // own text in the bubble and clickable buttons underneath.
+    const rich = mine ? null : widgetRichView(m.payload);
     const row = el("div", { display: "flex", justifyContent: mine ? "flex-end" : "flex-start" });
     const chip = el("div", {
       maxWidth: "80%", borderRadius: "10px", padding: "8px 10px", fontSize: "14px",
       background: mine ? palette.mineBg : palette.theirsBg,
       color: mine ? palette.mineText : palette.theirsText,
       whiteSpace: "pre-wrap", wordBreak: "break-word",
-    }, m.body);
-    row.append(chip);
+    }, rich ? rich.text : m.body);
+    if (!rich) {
+      row.append(chip);
+    } else {
+      const stack = el("div", {
+        display: "flex", flexDirection: "column", gap: "6px",
+        maxWidth: "85%", width: "85%",
+      });
+      chip.style.maxWidth = "100%";
+      stack.append(chip);
+      const set: HTMLButtonElement[] = [];
+      for (const group of rich.groups) {
+        if (group.title) {
+          stack.append(el("div", {
+            fontSize: "11px", fontWeight: "600", color: palette.sectionText, padding: "2px 2px 0",
+          }, group.title));
+        }
+        for (const b of group.buttons) {
+          const btn = el("button", {
+            width: "100%", textAlign: "left", padding: "8px 10px", fontSize: "13px",
+            borderRadius: "8px", border: `1px solid ${palette.btnBorder}`,
+            background: palette.btnBg, color: palette.btnText, cursor: "pointer",
+          });
+          btn.append(el("span", { display: "block", fontWeight: "600" }, b.title));
+          if (b.description) {
+            btn.append(el("span", {
+              display: "block", fontSize: "12px", opacity: "0.75", marginTop: "2px",
+            }, b.description));
+          }
+          btn.addEventListener("click", () => void onRichButton(m.id, b));
+          set.push(btn);
+          stack.append(btn);
+        }
+      }
+      buttonSets.set(m.id, set);
+      row.append(stack);
+    }
     messagesBox.append(row);
     messagesBox.scrollTop = messagesBox.scrollHeight;
+  }
+
+  async function onRichButton(messageId: string, button: WidgetRichButton): Promise<void> {
+    if (button.action.type === "url") {
+      window.open(button.action.url, "_blank", "noopener");
+      return;
+    }
+    const body = buttonClickBody(button);
+    if (!body) return;
+    // One-shot semantics: the whole set goes muted the moment one button
+    // is tapped (a second tap would double-fire the follow-up flow).
+    const set = buttonSets.get(messageId) ?? [];
+    const setUsed = (used: boolean) => {
+      for (const b of set) {
+        b.disabled = used;
+        b.style.opacity = used ? "0.55" : "";
+        b.style.cursor = used ? "default" : "pointer";
+      }
+    };
+    setUsed(true);
+    try {
+      await ensureSession();
+      const data = await api(`/public/webchat/${encodeURIComponent(workspaceId)}/messages`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      renderMessage(data.message as WidgetMessage);
+    } catch {
+      setUsed(false); // the tap never landed - let the visitor retry
+    }
   }
 
   async function api(path: string, init: RequestInit = {}): Promise<any> {

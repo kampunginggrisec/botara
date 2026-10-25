@@ -237,6 +237,12 @@ export interface Message {
   direction: "in" | "out";
   type: string;
   body: string | null;
+  /**
+   * Structured payload: the RichBlock for outbound rich sends (the
+   * inbox thread renders read-only chips from it), or { buttonPayload }
+   * for an inbound webchat button click. Null for plain messages.
+   */
+  payload?: RichBlock | { buttonPayload: string } | null;
   status: string;
   createdAt: string;
 }

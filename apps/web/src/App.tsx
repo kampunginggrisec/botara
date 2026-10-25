@@ -14,6 +14,7 @@ import {
 } from "./realtime";
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
+import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 
 type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings";
 
@@ -81,6 +82,45 @@ const initialsOf = (label: string): string =>
   label.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((p) => p[0]!.toUpperCase()).join("") || "?";
 
 // ------------------------------------------------------------------- Inbox
+
+/**
+ * Read-only rendering of a rich message's buttons under its thread
+ * bubble, so agents see exactly the choices the visitor was offered.
+ * Reply/postback buttons are inert chips; URL buttons stay links.
+ * Non-block payloads (webchat click echoes) render nothing.
+ */
+function RichPayloadChips({ payload }: { payload: Message["payload"] }) {
+  if (!payload || typeof payload !== "object" || !("kind" in payload)) return null;
+  const chipCls = "rounded-full border border-slate-300 px-2.5 py-0.5 text-xs text-slate-500 dark:border-slate-600 dark:text-slate-400";
+  if (payload.kind === "buttons") {
+    return (
+      <div className="flex flex-wrap gap-1">
+        {payload.buttons.map((b, i) => (b.type === "url" && b.url ? (
+          <a key={i} href={b.url} target="_blank" rel="noreferrer" className={`${chipCls} underline`}>
+            {b.title}
+          </a>
+        ) : (
+          <button key={i} type="button" disabled className={chipCls}>{b.title}</button>
+        )))}
+      </div>
+    );
+  }
+  if (payload.kind === "list") {
+    return (
+      <div className="flex flex-col gap-1">
+        {payload.sections.map((s, si) => (
+          <div key={si} className="flex flex-wrap items-center gap-1">
+            {s.title && <span className="text-[11px] font-medium text-slate-400 dark:text-slate-500">{s.title}</span>}
+            {s.rows.map((r) => (
+              <button key={r.id} type="button" disabled className={chipCls}>{r.title}</button>
+            ))}
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return null;
+}
 
 function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const { t } = useI18n();
@@ -351,11 +391,14 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                 {messages.length === 0 && <div className="text-sm text-slate-400 dark:text-slate-500">{t("inbox.noMessages")}</div>}
                 {messages.map((m) => (
                   <div key={m.id} className={`flex ${m.direction === "out" ? "justify-end" : "justify-start"}`}>
-                    <div className={`max-w-md rounded-lg px-3 py-2 text-sm ${m.direction === "out"
-                      ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
-                      : "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-100"}`}>
-                      <div>{m.body ?? <em>({m.type})</em>}</div>
-                      <div className={`mt-1 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>{m.status}</div>
+                    <div className="flex max-w-md flex-col gap-1">
+                      <div className={`rounded-lg px-3 py-2 text-sm ${m.direction === "out"
+                        ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+                        : "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-100"}`}>
+                        <div>{m.body ?? <em>({m.type})</em>}</div>
+                        <div className={`mt-1 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>{m.status}</div>
+                      </div>
+                      {m.direction === "out" && <RichPayloadChips payload={m.payload} />}
                     </div>
                   </div>
                 ))}
@@ -401,6 +444,16 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                 {showButtons && (
                   <div className="mt-2 space-y-2 rounded-md border border-slate-200 p-2 dark:border-slate-700">
                     <p className="text-xs text-slate-500 dark:text-slate-400">{t("inbox.buttonsHint")}</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{t("inbox.payloadHint")}</p>
+                    <button
+                      onClick={() => {
+                        if (RICH_BUTTONS_EXAMPLE.kind === "buttons") setReplyText(RICH_BUTTONS_EXAMPLE.text);
+                        setRichButtons(RICH_BUTTONS_EXAMPLE_COMPOSER.map((b) => ({ ...b })));
+                      }}
+                      className="text-xs text-slate-600 underline dark:text-slate-300"
+                    >
+                      {t("inbox.useExample")}
+                    </button>
                     {richButtons.map((b, i) => (
                       <div key={i} className="flex flex-wrap gap-2">
                         <select
@@ -414,21 +467,21 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                         <input
                           value={b.title}
                           onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, title: e.target.value } : x)))}
-                          placeholder={t("inbox.buttonTitle")}
+                          placeholder={RICH_BUTTONS_EXAMPLE_COMPOSER[i]?.title ?? t("inbox.buttonTitle")}
                           className="w-36 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                         />
                         {b.type === "url" ? (
                           <input
                             value={b.url}
                             onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, url: e.target.value } : x)))}
-                            placeholder="https://..."
+                            placeholder={RICH_BUTTONS_EXAMPLE_COMPOSER[i]?.url || "https://example.com"}
                             className="w-52 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                           />
                         ) : (
                           <input
                             value={b.payload}
                             onChange={(e) => setRichButtons((prev) => prev.map((x, j) => (j === i ? { ...x, payload: e.target.value } : x)))}
-                            placeholder={t("inbox.buttonPayload")}
+                            placeholder={RICH_BUTTONS_EXAMPLE_COMPOSER[i]?.payload || "HARGA"}
                             className="w-52 rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
                           />
                         )}
