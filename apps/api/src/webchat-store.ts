@@ -37,8 +37,11 @@ export function createDbWebchatStore(db: Database): WebchatStore {
       const message = await createMessage(db, {
         conversationId: session.conversationId,
         direction: "out",
-        type: "text",
+        // A payload-carrying send is a rich message; the widget renders
+        // buttons/lists from the payload, the body stays plain text.
+        type: input.payload ? "rich" : "text",
         body: input.text,
+        payload: input.payload,
         status: "sent",
         idempotencyKey: input.idempotencyKey,
       });

@@ -34,6 +34,13 @@ import type { RealtimePublisher } from "./realtime-publish";
  * webhooks still answer 200 fast. Duplicate comments are suppressed here
  * (cheap check) AND in the worker (atomic claim).
  *
+ * Webchat is the one channel NOT routed through dispatch(): the public
+ * widget route persists visitor messages itself, then calls
+ * dispatchPersistedWebchat() for trigger evaluation only (no double
+ * persistence) - typed text matches keyword triggers; widget button
+ * clicks match postback triggers by payload and keyword triggers by the
+ * button's title.
+ *
  * Persistence goes through the DispatchStore port: production wires the
  * Drizzle repositories, tests wire the in-memory store below.
  *
@@ -76,8 +83,25 @@ export interface CommentActionEnqueuer {
   enqueueCommentAction(job: CommentActionJobPayload): Promise<unknown>;
 }
 
+/**
+ * A webchat visitor message that the public widget route has ALREADY
+ * persisted (typed message or button click). The dispatcher must NOT
+ * persist it again - it only evaluates flow triggers and enqueues runs.
+ */
+export interface PersistedWebchatInput {
+  workspaceId: string;
+  channelAccountId: string;
+  contactId: string;
+  conversationId: string;
+  /** Message text (typed messages) or the tapped button's title (clicks). */
+  text?: string;
+  /** The tapped button's payload code (clicks only). */
+  buttonPayload?: string;
+}
+
 export interface InboundFlowDispatcher {
   dispatch(events: InboundEvent[]): Promise<void>;
+  dispatchPersistedWebchat(input: PersistedWebchatInput): Promise<void>;
 }
 
 // ------------------------------------------------------------ store port
@@ -506,6 +530,50 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     }
   }
 
+  /**
+   * Trigger evaluation for a PRE-PERSISTED webchat message (the public
+   * widget route owns persistence + the realtime publish; this dispatcher
+   * deliberately has no store writes on this path). Matching mirrors the
+   * webhook channels: keyword triggers test the text; postback triggers
+   * test the button payload. A button CLICK carries both, so it is tested
+   * against postback triggers by payload AND keyword triggers by its
+   * title text - one enqueue per flow at most (a flow has a single
+   * trigger type, so the two tests can never both fire for it).
+   */
+  async function dispatchPersistedWebchat(input: PersistedWebchatInput): Promise<void> {
+    try {
+      const flows = await deps.store.listActiveFlows(input.workspaceId);
+      for (const flow of flows) {
+        const trigger = flow.trigger as FlowTrigger;
+        let matched = false;
+        let triggerText: string | undefined;
+        if (input.buttonPayload && flowTriggerMatches(trigger, { payload: input.buttonPayload })) {
+          matched = true;
+          triggerText = input.buttonPayload;
+        } else if (input.text && flowTriggerMatches(trigger, { text: input.text })) {
+          matched = true;
+          triggerText = input.text;
+        }
+        if (!matched) continue;
+        try {
+          await deps.flowEnqueuer.enqueueFlowRun({
+            flowId: flow.id,
+            workspaceId: input.workspaceId,
+            contactId: input.contactId,
+            conversationId: input.conversationId,
+            channelAccountId: input.channelAccountId,
+            triggerText,
+          });
+        } catch (err) {
+          log({ event: "flow_run_enqueue_failed", flowId: flow.id, workspaceId: input.workspaceId, error: String(err) });
+        }
+      }
+    } catch (err) {
+      // Same contract as dispatch(): never throw into the caller's path.
+      log({ event: "webchat_dispatch_failed", workspaceId: input.workspaceId, error: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
   return {
     async dispatch(events: InboundEvent[]): Promise<void> {
       for (const event of events) {
@@ -521,6 +589,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
         }
       }
     },
+    dispatchPersistedWebchat,
   };
 }
 
@@ -541,4 +610,7 @@ export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowD
 }
 
 /** No-op dispatcher for tests / unconfigured deployments. */
-export const noopFlowDispatcher: InboundFlowDispatcher = { async dispatch() {} };
+export const noopFlowDispatcher: InboundFlowDispatcher = {
+  async dispatch() {},
+  async dispatchPersistedWebchat() {},
+};

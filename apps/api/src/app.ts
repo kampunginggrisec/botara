@@ -2192,10 +2192,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       direction: "out",
       type: body.kind === "template" ? "template" : body.rich ? "rich" : "text",
       // Rich messages persist as their formatted plain-text rendering so
-      // the thread stays readable on every surface.
+      // the thread stays readable on every surface; the block itself
+      // rides in `payload` (the webchat widget renders clickable
+      // buttons/lists from it, the inbox thread shows read-only chips).
       body: body.kind === "template"
         ? templateInput!.name
         : body.rich ? richToPlainText(body.rich) : body.text,
+      payload: body.kind === "free_form" && body.rich ? body.rich : undefined,
       status: "queued",
       idempotencyKey,
     });
@@ -3379,6 +3382,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (text.length < 1 || text.length > 2000) {
       throw new AppError("VALIDATION", "Message text must be 1-2000 characters.", { status: 400 });
     }
+    // A button click posts the button's title as `text` plus its payload
+    // code as `buttonPayload`; the click is stored on the row's payload
+    // so the round-trip stays auditable in the thread.
+    const buttonPayload = typeof body.buttonPayload === "string" ? body.buttonPayload.trim() : "";
+    if (body.buttonPayload !== undefined && (buttonPayload.length < 1 || buttonPayload.length > 256)) {
+      throw new AppError("VALIDATION", "buttonPayload must be 1-256 characters.", { status: 400 });
+    }
     if (!webchatRateOk(session.id, new Date())) {
       throw new AppError("RATE_LIMITED", "Too many messages - please slow down.", { status: 429 });
     }
@@ -3388,6 +3398,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       direction: "in",
       type: "text",
       body: text,
+      payload: buttonPayload ? { buttonPayload } : undefined,
       status: "delivered",
     });
     await touchConversationLastUserMessage(db, session.conversationId, now);
@@ -3398,6 +3409,21 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       workspaceId: session.workspaceId, conversationId: session.conversationId,
       direction: "in", messageId: message.id,
     }).catch(() => undefined);
+    // Flow triggers: the message is already persisted (above), so the
+    // dispatcher only evaluates triggers - keyword on the text, postback
+    // on the button payload - and enqueues matching flow runs. It never
+    // throws; the extra catch is belt-and-braces for the visitor's 201.
+    const conversation = await getConversation(db, session.workspaceId, session.conversationId);
+    if (conversation) {
+      await deps.flowDispatcher.dispatchPersistedWebchat({
+        workspaceId: session.workspaceId,
+        channelAccountId: conversation.channelAccountId,
+        contactId: session.contactId,
+        conversationId: session.conversationId,
+        text,
+        ...(buttonPayload ? { buttonPayload } : {}),
+      }).catch(() => undefined);
+    }
     return c.json({ message: { ...message, createdAt: iso(message.createdAt) } }, 201);
   });
 

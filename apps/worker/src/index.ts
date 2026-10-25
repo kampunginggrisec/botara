@@ -114,8 +114,12 @@ function buildWorkerWebchatStore(db: Database): WebchatStore {
       const message = await createMessage(db, {
         conversationId: session.conversationId,
         direction: "out",
-        type: "text",
+        // Mirrors apps/api's store: a payload-carrying send is a rich
+        // message - the widget renders its buttons/lists from the row's
+        // payload, the body stays the plain-text rendering.
+        type: input.payload ? "rich" : "text",
         body: input.text,
+        payload: input.payload,
         status: "sent",
         idempotencyKey: input.idempotencyKey,
       });

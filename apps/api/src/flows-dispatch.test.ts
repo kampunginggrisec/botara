@@ -200,3 +200,56 @@ describe("growth attribution", () => {
     expect(flowRuns.map((r) => r.flowId)).toEqual(["f-kw"]);
   });
 });
+
+describe("persisted webchat dispatch (clickable buttons)", () => {
+  const base = {
+    workspaceId: "ws-1", channelAccountId: "acc-webchat", contactId: "ct-1", conversationId: "conv-1",
+  };
+
+  test("a typed message matches keyword triggers and persists NOTHING (route owns persistence)", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "harga" } } });
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "minta harga dong" });
+    expect(flowRuns).toHaveLength(1);
+    expect(flowRuns[0]).toMatchObject({
+      flowId: "f-kw", workspaceId: "ws-1", contactId: "ct-1",
+      conversationId: "conv-1", channelAccountId: "acc-webchat", triggerText: "minta harga dong",
+    });
+    expect(store.messages).toHaveLength(0);
+  });
+
+  test("a button click matches the postback trigger by payload", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "HARGA" } } });
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "Lihat Harga", buttonPayload: "HARGA" });
+    expect(flowRuns.map((r) => r.flowId)).toEqual(["f-pb"]);
+    expect(flowRuns[0]!.triggerText).toBe("HARGA");
+    expect(store.messages).toHaveLength(0);
+  });
+
+  test("a button click ALSO matches keyword triggers against the button title", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-kw-title", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "jadwal" } } });
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "JADWAL" } } });
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "Cek Jadwal", buttonPayload: "JADWAL" });
+    // Both flows fire: postback by payload, keyword by title text.
+    expect(flowRuns.map((r) => r.flowId).sort()).toEqual(["f-kw-title", "f-pb"]);
+  });
+
+  test("a click whose payload matches nothing enqueues nothing; other workspaces' flows never match", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "HARGA" } } });
+    store.flows.push({ id: "f-other", workspaceId: "ws-2", trigger: { type: "keyword", config: { keyword: "halo" } } });
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "Lihat Harga", buttonPayload: "LAINNYA" });
+    expect(flowRuns).toHaveLength(0);
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "halo" });
+    expect(flowRuns).toHaveLength(0);
+  });
+
+  test("a typed message never matches postback triggers (no payload)", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "HARGA" } } });
+    await dispatcher.dispatchPersistedWebchat({ ...base, text: "HARGA" });
+    expect(flowRuns).toHaveLength(0);
+  });
+});
