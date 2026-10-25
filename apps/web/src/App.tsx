@@ -81,6 +81,22 @@ const errText = (err: unknown, fallback: string): string =>
 const initialsOf = (label: string): string =>
   label.split(/[\s@.]+/).filter(Boolean).slice(0, 2).map((p) => p[0]!.toUpperCase()).join("") || "?";
 
+/** The three conversation statuses, in lifecycle order. */
+const CONVERSATION_STATUSES = ["open", "pending", "resolved"] as const;
+type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
+
+/** i18n key for a status value; unknown values fall back to "open". */
+const statusLabelKey = (status: string): "inbox.statusOpen" | "inbox.statusPending" | "inbox.statusResolved" =>
+  status === "pending" ? "inbox.statusPending" : status === "resolved" ? "inbox.statusResolved" : "inbox.statusOpen";
+
+/** Badge palette per status: open = sky, pending = amber, resolved = muted. */
+const statusBadgeCls = (status: string): string =>
+  status === "pending"
+    ? "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-300"
+    : status === "resolved"
+      ? "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400"
+      : "bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300";
+
 // ------------------------------------------------------------------- Inbox
 
 /**
@@ -135,6 +151,9 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   // the list filter itself ("" = all, "me", "unassigned", or a user id).
   const [members, setMembers] = useState<Member[]>([]);
   const [assigneeFilter, setAssigneeFilter] = useState("");
+  // Status management: the list filter ("" = all) mirrors the API's
+  // ?status= enum; the row's status itself changes from the thread header.
+  const [statusFilter, setStatusFilter] = useState("");
   // Rich composer (adopted features): reply/url buttons OR a catalog
   // product attached to the reply as a rich block; channels render or
   // degrade them. Synced products for the open conversation's account
@@ -150,7 +169,10 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
 
   const loadConversations = useCallback(async (): Promise<Conversation[]> => {
     try {
-      const data = await api.listConversations(assigneeFilter ? { assignee: assigneeFilter } : {});
+      const data = await api.listConversations({
+        ...(assigneeFilter ? { assignee: assigneeFilter } : {}),
+        ...(statusFilter ? { status: statusFilter } : {}),
+      });
       setConversations(data.conversations);
       setError(null);
       return data.conversations;
@@ -158,7 +180,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
       setError(errText(err, t("inbox.loadFailed")));
       return [];
     }
-  }, [t, assigneeFilter]);
+  }, [t, assigneeFilter, statusFilter]);
 
   useEffect(() => { void loadConversations(); }, [loadConversations]);
 
@@ -202,6 +224,16 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
       if (selectedRef.current?.id === conv.id) setSelected(res.conversation);
     } catch (err) {
       setError(errText(err, t("inbox.assignFailed")));
+    }
+  };
+
+  const changeStatus = async (conv: Conversation, status: "open" | "pending" | "resolved") => {
+    try {
+      const res = await api.setConversationStatus(conv.id, status);
+      setConversations((prev) => prev.map((c) => (c.id === conv.id ? res.conversation : c)));
+      if (selectedRef.current?.id === conv.id) setSelected(res.conversation);
+    } catch (err) {
+      setError(errText(err, t("inbox.statusFailed")));
     }
   };
 
@@ -330,6 +362,17 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                 ))}
               </select>
             )}
+            <select
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value)}
+              aria-label={t("inbox.statusFilterLabel")}
+              className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              <option value="">{t("inbox.statusFilterAll")}</option>
+              {CONVERSATION_STATUSES.map((s) => (
+                <option key={s} value={s}>{t(statusLabelKey(s))}</option>
+              ))}
+            </select>
           </div>
           {conversations.length === 0 && !error && <EmptyState>{t("inbox.empty")}</EmptyState>}
           {conversations.map((conv) => (
@@ -344,10 +387,13 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                 <span className="font-medium text-sm">{conv.contactDisplayName ?? conv.contactExternalId}</span>
                 <span className={chipCls}>{conv.channel}</span>
               </div>
-              <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                {t("inbox.statusLabel")}: {conv.status} · {t("inbox.windowLabel")}: {conv.windowOpen
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${statusBadgeCls(conv.status)}`}>
+                  {t(statusLabelKey(conv.status))}
+                </span>
+                <span>· {t("inbox.windowLabel")}: {conv.windowOpen
                   ? <span className="text-emerald-600 dark:text-emerald-400 font-medium">{t("inbox.windowOpen")}</span>
-                  : <span className="text-red-600 dark:text-red-400 font-medium">{t("inbox.windowClosed")}</span>}
+                  : <span className="text-red-600 dark:text-red-400 font-medium">{t("inbox.windowClosed")}</span>}</span>
               </div>
               <div className="mt-1.5 flex items-center gap-1.5 text-xs">
                 {conv.assignee ? (
@@ -373,19 +419,33 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                 <span className="font-medium text-sm">
                   {selected.contactDisplayName ?? selected.contactExternalId} · {selected.channel}
                 </span>
-                <label className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
-                  {t("inbox.assigneeLabel")}
-                  <select
-                    value={selected.assignedUserId ?? ""}
-                    onChange={(e) => void changeAssignee(selected, e.target.value || null)}
-                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  >
-                    <option value="">{t("inbox.unassigned")}</option>
-                    {members.map((m) => (
-                      <option key={m.userId} value={m.userId}>{m.name ?? m.email} ({m.role})</option>
-                    ))}
-                  </select>
-                </label>
+                <div className="flex flex-wrap items-center gap-3">
+                  <label className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    {t("inbox.statusLabel")}
+                    <select
+                      value={CONVERSATION_STATUSES.includes(selected.status as ConversationStatus) ? selected.status : "open"}
+                      onChange={(e) => void changeStatus(selected, e.target.value as ConversationStatus)}
+                      className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    >
+                      {CONVERSATION_STATUSES.map((s) => (
+                        <option key={s} value={s}>{t(statusLabelKey(s))}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
+                    {t("inbox.assigneeLabel")}
+                    <select
+                      value={selected.assignedUserId ?? ""}
+                      onChange={(e) => void changeAssignee(selected, e.target.value || null)}
+                      className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-900 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    >
+                      <option value="">{t("inbox.unassigned")}</option>
+                      {members.map((m) => (
+                        <option key={m.userId} value={m.userId}>{m.name ?? m.email} ({m.role})</option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
               </div>
               <div className="flex-1 p-4 space-y-2 overflow-y-auto">
                 {messages.length === 0 && <div className="text-sm text-slate-400 dark:text-slate-500">{t("inbox.noMessages")}</div>}

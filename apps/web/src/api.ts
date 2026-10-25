@@ -529,6 +529,16 @@ export const api = {
       body: JSON.stringify({ userId }),
     });
   },
+  /** Move a conversation between open / pending / resolved. */
+  setConversationStatus(
+    conversationId: string,
+    status: "open" | "pending" | "resolved",
+  ): Promise<{ conversation: Conversation }> {
+    return request(`/conversations/${conversationId}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    });
+  },
   listMessages(conversationId: string): Promise<{ messages: Message[] }> {
     return request(`/conversations/${conversationId}/messages`);
   },
