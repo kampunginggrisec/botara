@@ -43,6 +43,23 @@ describe("createRealtimePublisher", () => {
       noopRealtimePublisher.publishInboxMessage({ workspaceId: "w", conversationId: "c", direction: "in" }),
     ).resolves.toBeUndefined();
   });
+
+  test("publishes a serialized inbox.update event for metadata changes (assignment)", async () => {
+    const calls: Array<{ channel: string; payload: string }> = [];
+    const publisher = createRealtimePublisher(async (channel, payload) => {
+      calls.push({ channel, payload });
+    });
+    await publisher.publishInboxUpdate({ workspaceId: "ws-1", conversationId: "conv-1" });
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.channel).toBe(REALTIME_CHANNEL);
+    expect(JSON.parse(calls[0]!.payload)).toEqual({
+      type: "inbox.update", workspaceId: "ws-1", conversationId: "conv-1",
+    });
+    // The noop publisher covers both methods too.
+    await expect(
+      noopRealtimePublisher.publishInboxUpdate({ workspaceId: "w", conversationId: "c" }),
+    ).resolves.toBeUndefined();
+  });
 });
 
 describe("dispatcher realtime wiring", () => {
@@ -54,6 +71,7 @@ describe("dispatcher realtime wiring", () => {
     const events: Array<Parameters<RealtimePublisher["publishInboxMessage"]>[0]> = [];
     const publisher: RealtimePublisher = {
       async publishInboxMessage(event) { events.push(event); },
+      async publishInboxUpdate() {},
     };
     const dispatcher = createFlowDispatcher({
       store,

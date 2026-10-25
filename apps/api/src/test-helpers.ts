@@ -21,6 +21,9 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
     whatsappOnboarding: async () => {
       throw new AppError("CONFIGURATION", "onboarding not configured (test).", { status: 503 });
     },
+    catalogSync: async () => {
+      throw new AppError("CONFIGURATION", "catalog sync not configured (test).", { status: 503 });
+    },
     getAiProvider: () => null,
     authStore: new InMemoryAuthStore(),
     emailInboundEnqueuer: { async enqueueEmailInbound() {} },
@@ -34,7 +37,7 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
     kbEnqueuer: { async enqueueKbIngest() {} },
     flowEnqueuer: { async enqueueFlowRun() {} },
     flowDispatcher: { async dispatch() {} },
-    realtimePublisher: { async publishInboxMessage() {} },
+    realtimePublisher: { async publishInboxMessage() {}, async publishInboxUpdate() {} },
     vault: new InMemoryVault(),
     providerFetch: async () => new Response(JSON.stringify({}), { status: 200 }),
     readiness: {

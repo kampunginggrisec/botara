@@ -24,6 +24,7 @@ let fake: FakeDatabase;
 const published: Array<{ workspaceId: string; conversationId: string; direction: "in" | "out"; messageId?: string }> = [];
 const recordingPublisher: RealtimePublisher = {
   async publishInboxMessage(event) { published.push(event); },
+  async publishInboxUpdate() {},
 };
 
 const app = createApp(testDeps({

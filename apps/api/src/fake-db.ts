@@ -1,5 +1,5 @@
 import {
-  channelAccounts, contacts, conversations, messages, webchatSessions,
+  catalogProducts, channelAccounts, contacts, conversations, messages, webchatSessions,
   type Database,
 } from "@botara/db";
 
@@ -274,6 +274,7 @@ export interface FakeDatabase {
     contacts: Row[];
     channelAccounts: Row[];
     webchatSessions: Row[];
+    catalogProducts: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -285,6 +286,7 @@ export function createFakeDatabase(): FakeDatabase {
     contacts: [] as Row[],
     channelAccounts: [] as Row[],
     webchatSessions: [] as Row[],
+    catalogProducts: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -292,6 +294,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(contacts, store.contacts);
   core.register(channelAccounts, store.channelAccounts);
   core.register(webchatSessions, store.webchatSessions);
+  core.register(catalogProducts, store.catalogProducts);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),

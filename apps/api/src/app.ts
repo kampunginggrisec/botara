@@ -29,8 +29,10 @@ import {
   updateChannelAccountToken,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
+  updateConversationAssignment,
+  upsertCatalogProduct, listCatalogProducts, listCatalogProductKeys, deleteCatalogProduct,
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
-  type GrowthLinkRow,
+  type GrowthLinkRow, type ConversationListItem,
 } from "@botara/db";
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
@@ -38,6 +40,7 @@ import {
   TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter,
   StaticCredentialProvider, buildInstagramAuthorizeUrl, buildThreadsAuthorizeUrl,
   buildMessengerAuthorizeUrl, richBlockSchema, richBlockText, richToPlainText,
+  VaultCredentialProvider, envWhatsAppCredentials,
   type ChannelKey, type InboundEvent, type FetchLike, type InstagramAuthMode,
 } from "@botara/channels";
 import { runFlow, storedGraphSchema, toRunnableFlow, type FlowAction } from "@botara/flow-engine";
@@ -68,6 +71,7 @@ import {
   contactsToCsv, contactsToJson, dedupeImportRows, parseImport,
 } from "./contacts-io";
 import { buildGrowthTarget, generateGrowthSlug, growthShortUrl } from "./growth";
+import { syncWhatsAppCatalog, type CatalogSyncResult } from "./catalog-sync";
 
 /**
  * Botara API - Fase 3.
@@ -166,6 +170,8 @@ export interface ApiDeps {
   templateCategoryUpdater: TemplateCategoryUpdater;
   /** Embedded Signup v4 code exchange (Graph calls + vault + persistence). */
   whatsappOnboarding: (workspaceId: string, input: EmbeddedSignupInput) => Promise<EmbeddedSignupResult>;
+  /** Meta Catalog sync for a WhatsApp account (Graph discovery + paging + mirror). */
+  catalogSync: (input: { workspaceId: string; accountId: string; catalogId?: string }) => Promise<CatalogSyncResult>;
   /** The configured AI provider, or null - routes answer 503, never fake. */
   getAiProvider: () => AIProvider | null;
   /** Fase 3: users, workspaces, memberships, audit (auth persistence). */
@@ -416,6 +422,40 @@ export function createDefaultVault(): TokenVaultPort {
   };
 }
 
+/**
+ * Catalog-sync access-token resolution: the SAME mechanism the channel
+ * adapters resolve with - VaultCredentialProvider over the encrypted
+ * TokenVault (lazily built, mirroring createDefaultVault's guard), with
+ * the WhatsApp env provider as the fallback. Returns null when the
+ * account has no usable token (the sync service turns that into a typed
+ * 503 CONFIGURATION).
+ */
+export function createCatalogTokenResolver(): (
+  account: { id: string; externalId: string; tokenVaultRef?: string | null },
+) => Promise<string | null> {
+  let vault: ReturnType<typeof createTokenVault> | null | undefined;
+  const resolveVault = () => {
+    if (vault !== undefined) return vault;
+    vault = process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY
+      ? createTokenVault(defaultGetDatabase(), process.env)
+      : null;
+    return vault;
+  };
+  return async (account) => {
+    const v = resolveVault();
+    const provider = new VaultCredentialProvider(
+      { getSecret: async (ref) => (v ? v.get(ref) : null) },
+      envWhatsAppCredentials(),
+    );
+    const secrets = await provider.resolve({
+      id: account.id,
+      externalId: account.externalId,
+      tokenVaultRef: account.tokenVaultRef ?? undefined,
+    });
+    return secrets.accessToken ?? null;
+  };
+}
+
 /** Default template-category updater: the Drizzle repository behind the DB getter. */
 export function createDbTemplateCategoryUpdater(getDatabase: () => Database): TemplateCategoryUpdater {
   return {
@@ -473,6 +513,28 @@ export function defaultDeps(): ApiDeps {
         workspaceId,
         input,
       ),
+    catalogSync: async (input) => {
+      const account = await getChannelAccount(defaultGetDatabase(), input.workspaceId, input.accountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+      }
+      if (account.channel !== "whatsapp") {
+        throw new AppError("VALIDATION", "Catalog sync is only available for WhatsApp accounts.", { status: 400 });
+      }
+      return syncWhatsAppCatalog(
+        {
+          fetchFn: (url, init) => fetch(url, init as RequestInit),
+          graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+          resolveAccessToken: createCatalogTokenResolver(),
+          store: {
+            upsertProduct: async (row) => { await upsertCatalogProduct(defaultGetDatabase(), row); },
+            listKeys: (accountId, catalogId) => listCatalogProductKeys(defaultGetDatabase(), accountId, catalogId),
+            deleteProduct: async (id) => { await deleteCatalogProduct(defaultGetDatabase(), id); },
+          },
+        },
+        { workspaceId: input.workspaceId, account, catalogId: input.catalogId },
+      );
+    },
     getAiProvider: () => createAIProviderFromEnv(process.env),
     env: process.env,
   };
@@ -1665,7 +1727,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products"]) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
@@ -1993,27 +2055,61 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
 
   // --------------------------------------------------------- conversations
+  /**
+   * Shared conversation serializer: ISO dates, the 24h window flag, and
+   * the assignee's display identity resolved from the workspace member
+   * list (name/email are null when the assignee is no longer a member -
+   * the id alone survives honestly).
+   */
+  const serializeConversation = (
+    r: ConversationListItem,
+    memberById: Map<string, { name: string | null; email: string }>,
+  ) => ({
+    ...r,
+    createdAt: iso(r.createdAt),
+    lastUserMessageAt: iso(r.lastUserMessageAt),
+    windowOpen: evaluateReplyWindow({
+      channel: r.channel, kind: "free_form", lastUserMessageAt: r.lastUserMessageAt, now: new Date(),
+    }).windowOpen,
+    assignee: r.assignedUserId
+      ? {
+          userId: r.assignedUserId,
+          name: memberById.get(r.assignedUserId)?.name ?? null,
+          email: memberById.get(r.assignedUserId)?.email ?? null,
+        }
+      : null,
+  });
+  const memberMapOf = async (ws: string) => {
+    const members = await deps.authStore.listMembers(ws);
+    return new Map(members.map((m) => [m.userId, { name: m.name, email: m.email }]));
+  };
+
   const listConversationsRoute = createRoute({
     method: "get", path: "/conversations",
-    request: { query: z.object({ channel: z.string().optional(), status: z.string().optional() }) },
+    request: {
+      query: z.object({
+        channel: z.string().optional(),
+        status: z.string().optional(),
+        /** "me" = the caller, "unassigned", or a member user id; absent = all. */
+        assignee: z.string().optional(),
+      }),
+    },
     responses: { 200: { description: "Conversations" } },
   });
   app.openapi(listConversationsRoute, async (c) => {
     const ws = workspaceId(c);
     const db = deps.getDatabase();
-    const { channel, status } = c.req.valid("query");
-    const rows = await listConversations(db, ws, { channel, status });
-    const now = new Date();
-    return c.json({
-      conversations: rows.map((r) => ({
-        ...r,
-        createdAt: iso(r.createdAt),
-        lastUserMessageAt: iso(r.lastUserMessageAt),
-        windowOpen: evaluateReplyWindow({
-          channel: r.channel, kind: "free_form", lastUserMessageAt: r.lastUserMessageAt, now,
-        }).windowOpen,
-      })),
-    });
+    const { channel, status, assignee } = c.req.valid("query");
+    const assignedTo = assignee === undefined
+      ? undefined
+      : assignee === "me"
+        ? authContext(c).user.id
+        : assignee === "unassigned"
+          ? null
+          : assignee;
+    const rows = await listConversations(db, ws, { channel, status, assignedTo });
+    const memberById = await memberMapOf(ws);
+    return c.json({ conversations: rows.map((r) => serializeConversation(r, memberById)) });
   });
 
   const listMessagesRoute = createRoute({
@@ -2138,6 +2234,54 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       if (err instanceof AppError) throw err;
       throw new AppError("PROVIDER_ERROR", `Provider send failed: ${err instanceof Error ? err.message : String(err)}`, { status: 502 });
     }
+  });
+
+  const assignConversationRoute = createRoute({
+    method: "patch", path: "/conversations/{id}/assign",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({ userId: z.string().min(1).nullable() }),
+          },
+        },
+        required: true,
+      },
+    },
+    responses: { 200: { description: "Conversation assignment updated" } },
+  });
+  app.openapi(assignConversationRoute, async (c) => {
+    // Same role set that may reply in the inbox.
+    requireRole(c.get("auth"), ROLES);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const { userId } = c.req.valid("json");
+
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    if (userId !== null) {
+      // Only workspace members can own a conversation - anything else is
+      // a client bug, answered with a typed 400 rather than a silent write.
+      const membership = await deps.authStore.getMembership(ws, userId);
+      if (!membership) {
+        throw new AppError("VALIDATION", "Assignee must be a member of this workspace.", { status: 400 });
+      }
+    }
+    const updated = await updateConversationAssignment(db, ws, id, userId);
+    if (!updated) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+
+    // Other open inboxes refresh their list + thread header (NATS-style
+    // hint; the payload carries ids only, clients refetch over REST).
+    await deps.realtimePublisher
+      .publishInboxUpdate({ workspaceId: ws, conversationId: id })
+      .catch(() => undefined);
+
+    const memberById = await memberMapOf(ws);
+    return c.json({
+      conversation: serializeConversation({ ...conversation, assignedUserId: updated.assignedUserId }, memberById),
+    });
   });
 
   // -------------------------------------------------------------- contacts
@@ -2738,6 +2882,83 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           tokenExpiresAt: iso(r.tokenExpiresAt),
         };
       }),
+    });
+  });
+
+  // ------------------------------------------------- Meta catalog sync
+  // Sync mirrors a WhatsApp account's catalogs into catalog_products;
+  // reads serve the Channels summary card and the product pickers.
+  const catalogSyncRoute = createRoute({
+    method: "post", path: "/channels/{id}/catalog/sync",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({ catalogId: z.string().min(1).optional() }),
+          },
+        },
+        required: false,
+      },
+    },
+    responses: { 200: { description: "Catalog sync result" } },
+  });
+  app.openapi(catalogSyncRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json") as { catalogId?: string } | undefined;
+    const result = await deps.catalogSync({ workspaceId: ws, accountId: id, catalogId: body?.catalogId });
+    return c.json(result);
+  });
+
+  const catalogSummaryRoute = createRoute({
+    method: "get", path: "/channels/{id}/catalog",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Synced catalog summary for the account" } },
+  });
+  app.openapi(catalogSummaryRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const account = await getChannelAccount(db, ws, id);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    const products = await listCatalogProducts(db, ws, { accountId: id });
+    const lastSyncedAt = products.reduce<Date | null>(
+      (max, p) => (max === null || p.syncedAt > max ? p.syncedAt : max),
+      null,
+    );
+    return c.json({
+      accountId: id,
+      productCount: products.length,
+      catalogs: [...new Set(products.map((p) => p.catalogId))],
+      lastSyncedAt: iso(lastSyncedAt),
+    });
+  });
+
+  const listCatalogProductsRoute = createRoute({
+    method: "get", path: "/catalog-products",
+    request: {
+      query: z.object({
+        accountId: z.string().optional(),
+        q: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(500).optional(),
+      }),
+    },
+    responses: { 200: { description: "Synced catalog products" } },
+  });
+  app.openapi(listCatalogProductsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { accountId, q, limit } = c.req.valid("query");
+    const rows = await listCatalogProducts(db, ws, { accountId, q, limit: limit ?? 200 });
+    return c.json({
+      products: rows.map((r) => ({
+        ...r,
+        syncedAt: iso(r.syncedAt),
+        createdAt: iso(r.createdAt),
+        updatedAt: iso(r.updatedAt),
+      })),
     });
   });
 
