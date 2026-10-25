@@ -6,7 +6,7 @@ payment/legal attestations) — they cannot be delegated. **[PREPARED]**
 steps are already built/drafted in this repo; the owner only pastes or
 clicks.
 
-Replace `botara.my.id` with the production domain everywhere if it
+Replace `dev.botara.my.id` with the production domain everywhere if it
 changes, and keep this file updated with the real ids (never secrets —
 app secrets go into the server env / Secure Vault, NOT into git).
 
@@ -16,9 +16,9 @@ app secrets go into the server env / Secure Vault, NOT into git).
 - [ ] **[OWNER]** A verified business (Business Settings → Business
       Info) — business verification can take days; start FIRST.
 - [ ] **[OWNER]** Production domain live over HTTPS with Botara deployed
-      (trial: `https://botara.my.id`).
+      (trial: `https://dev.botara.my.id`).
 - [ ] **[PREPARED]** Privacy + Terms pages live at
-      `https://botara.my.id/privacy` and `/terms`.
+      `https://dev.botara.my.id/privacy` and `/terms`.
 - [ ] **[PREPARED]** UI language: the web app **defaults to English**
       (Fase 4 i18n, EN + ID dictionaries). Reviewers see English without
       touching anything; the EN | ID switcher is in the top-right of the
@@ -58,7 +58,7 @@ app secrets go into the server env / Secure Vault, NOT into git).
 - [ ] **[OWNER]** OAuth redirect URIs: add the Botara callback URLs
       shown on the Channels connect screens for Instagram / Threads /
       Facebook Login.
-- [ ] **[OWNER]** App domains + website URL: `botara.my.id`.
+- [ ] **[OWNER]** App domains + website URL: `dev.botara.my.id`.
 
 ## 3. Webhooks (URLs prepared — paste into each product's config)
 
@@ -66,23 +66,23 @@ All URLs hang off the API origin (the `/api` prefix is Botara's public
 mount; the app strips it in the trial nginx layout):
 
 - [ ] **[OWNER]** WhatsApp webhook:
-      `https://botara.my.id/api/webhooks/whatsapp`
+      `https://dev.botara.my.id/api/webhooks/whatsapp`
       verify token = env `WHATSAPP_VERIFY_TOKEN`; subscribe `messages`
       (+ template status fields).
 - [ ] **[OWNER]** Instagram (Facebook Login): Page webhook →
-      `https://botara.my.id/api/webhooks/instagram`
+      `https://dev.botara.my.id/api/webhooks/instagram`
 - [ ] **[OWNER]** Messenger: Page webhook →
-      `https://botara.my.id/api/webhooks/messenger`
+      `https://dev.botara.my.id/api/webhooks/messenger`
       fields: `messages`, `messaging_postbacks`, `message_deliveries`.
 - [ ] **[OWNER]** Threads webhook:
-      `https://botara.my.id/api/webhooks/threads`
+      `https://dev.botara.my.id/api/webhooks/threads`
 - [ ] **[OWNER]** **Data deletion callback (REQUIRED for approval)**:
-      `https://botara.my.id/api/webhooks/meta/data-deletion`
+      `https://dev.botara.my.id/api/webhooks/meta/data-deletion`
       — implemented: verifies the `signed_request` HMAC with
       `META_APP_SECRET`, returns `{ url, confirmation_code }`; status
-      page pattern: `https://botara.my.id/api/data-deletion/status/<code>`.
+      page pattern: `https://dev.botara.my.id/api/data-deletion/status/<code>`.
       Also fill the "Data deletion instructions URL" field with
-      `https://botara.my.id/privacy` (section 4).
+      `https://dev.botara.my.id/privacy` (section 4).
 - [ ] **[PREPARED]** Verify each webhook with Meta's "Verify and save" —
       the API implements the GET challenge for WhatsApp/Instagram/
       Messenger/Threads.
@@ -95,7 +95,7 @@ mount; the app strips it in the trial nginx layout):
       real number on the business).
 - [ ] **[OWNER]** Create a Botara review account and hand Meta the
       credentials in the submission notes:
-      register at `https://botara.my.id` → workspace "App Review" with
+      register at `https://dev.botara.my.id` → workspace "App Review" with
       the test channels connected.
 - [ ] **[PREPARED]** Screencasts: record per `screencast-scripts.md`
       (W1–W2, I1–I4 per login mode, M1, T1–T5).

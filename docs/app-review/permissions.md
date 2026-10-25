@@ -8,7 +8,7 @@ reproduce each one with the screencast scripts in
 `screencast-scripts.md`.
 
 > How to use: in App Review, paste the justification under the matching
-> permission. Replace `botara.my.id` with the production domain if it
+> permission. Replace `dev.botara.my.id` with the production domain if it
 > differs. Do not request permissions that are not listed here — the app
 > must not ask for anything the product does not use.
 
@@ -217,8 +217,8 @@ offers both; the feature set is the same, the scopes differ.
 
 - Channel credentials are stored encrypted at rest (AES-256-GCM token
   vault) and are only used to call Meta APIs for the owning workspace.
-- Data deletion callback: `POST https://botara.my.id/api/webhooks/meta/data-deletion`
-  (signed_request verified). Status page: `https://botara.my.id/api/data-deletion/status/<confirmation_code>`.
-- Privacy policy: `https://botara.my.id/privacy` · Terms: `https://botara.my.id/terms`
+- Data deletion callback: `POST https://dev.botara.my.id/api/webhooks/meta/data-deletion`
+  (signed_request verified). Status page: `https://dev.botara.my.id/api/data-deletion/status/<confirmation_code>`.
+- Privacy policy: `https://dev.botara.my.id/privacy` · Terms: `https://dev.botara.my.id/terms`
   (both are templates the business owner finalizes before submission —
   see `submission-checklist.md`).
