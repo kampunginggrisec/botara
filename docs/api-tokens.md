@@ -35,7 +35,7 @@ A token created with `workspaceId` is bound to that workspace:
 ## Scopes
 
 Scopes use a small, closed taxonomy (defined in `@botara/shared`,
-`packages/shared/src/api-tokens.ts`): ten resources, each with a `read`
+`packages/shared/src/api-tokens.ts`): eleven resources, each with a `read`
 and a `write` level, plus `*` for full access.
 
 | Scope | Covers |

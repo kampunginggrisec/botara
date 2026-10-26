@@ -13,6 +13,7 @@ export const TOKEN_RESOURCES = [
   "broadcasts",
   "flows",
   "sequences",
+  "deals",
   "templates",
   "channels",
   "kb",

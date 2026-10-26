@@ -8,7 +8,7 @@ import "@xyflow/react/dist/style.css";
 import {
   api, ApiError,
   type CatalogProduct, type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger,
-  type Member, type RichBlock, type RichButton, type Sequence,
+  type Member, type Pipeline, type RichBlock, type RichButton, type Sequence,
 } from "../api";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
@@ -484,21 +484,26 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
   // the underlying id fields stay editable if a load fails.
   const [members, setMembers] = useState<Member[]>([]);
   const [sequences, setSequences] = useState<Sequence[]>([]);
+  const [pipelines, setPipelines] = useState<Pipeline[]>([]);
   const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
   // Variable picker target for the collect_input prompt editor.
   const collectPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  // Variable picker target for the create_deal title editor (#6).
+  const dealTitleRef = useRef<HTMLInputElement | null>(null);
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const [m, s, c] = await Promise.all([
+        const [m, s, c, p] = await Promise.all([
           api.listMembers(flow.workspaceId),
           api.listSequences(),
           api.listContacts(),
+          api.listPipelines(),
         ]);
         if (cancelled) return;
         setMembers(m.members);
         setSequences(s.sequences);
+        setPipelines(p.pipelines);
         setTagSuggestions([...new Set(c.contacts.flatMap((ct) => ct.tags))].sort());
       } catch { /* pickers are an enhancement; manual ids still work */ }
     })();
@@ -949,6 +954,64 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                         placeholder="24"
                       />
                       <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.timeoutHoursHint")}</p>
+                    </div>
+                  </>
+                )}
+                {selected.type === "create_deal" && (
+                  <>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.dealPipeline")}</label>
+                      <select
+                        value={str(selected, "pipelineId")}
+                        onChange={(e) => patchSelected({ pipelineId: e.target.value || undefined, stageId: undefined })}
+                        className={inputCls}
+                      >
+                        <option value="">{t("flows.field.dealPipelineDefault")}</option>
+                        {pipelines.map((p) => (
+                          <option key={p.id} value={p.id}>{p.name}{p.isDefault ? " ★" : ""}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.dealStage")}</label>
+                      <select
+                        value={str(selected, "stageId")}
+                        onChange={(e) => patchSelected({ stageId: e.target.value || undefined })}
+                        className={inputCls}
+                      >
+                        <option value="">{t("flows.field.dealStageFirst")}</option>
+                        {(pipelines.find((p) => p.id === str(selected, "pipelineId"))
+                          ?? pipelines.find((p) => p.isDefault)
+                          ?? pipelines[0])?.stages.map((s) => (
+                          <option key={s.id} value={s.id}>{s.name}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.dealTitle")}</label>
+                      <input
+                        ref={dealTitleRef}
+                        value={str(selected, "title")}
+                        onChange={(e) => patchSelected({ title: e.target.value })}
+                        className={inputCls}
+                        placeholder={t("flows.field.dealTitlePlaceholder")}
+                      />
+                      <div className="mt-1">
+                        <VariablePicker target={() => dealTitleRef.current} />
+                      </div>
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.dealTitleHint")}</p>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.dealValue")}</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="any"
+                        value={selected.value === undefined ? "" : String(selected.value)}
+                        onChange={(e) => patchSelected({ value: e.target.value === "" ? undefined : Number(e.target.value) })}
+                        className={inputCls}
+                      />
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.dealHint")}</p>
                     </div>
                   </>
                 )}

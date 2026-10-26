@@ -15,6 +15,8 @@ export const NODE_TYPES = [
   // Action steps + collect-input (adoption package #3).
   "add_tag", "remove_tag", "assign", "set_conversation_status",
   "sequence_subscribe", "sequence_unsubscribe", "collect_input",
+  // Create-deal action step (adoption package #6).
+  "create_deal",
 ] as const;
 export type NodeType = (typeof NODE_TYPES)[number];
 
@@ -33,6 +35,7 @@ export const NODE_ACCENT: Record<NodeType, string> = {
   sequence_subscribe: "bg-cyan-500",
   sequence_unsubscribe: "bg-cyan-700",
   collect_input: "bg-yellow-500",
+  create_deal: "bg-emerald-600",
 };
 
 let nodeSeq = 0;
@@ -71,6 +74,8 @@ export function defaultEngineNode(type: NodeType, id: string): EngineNode {
       return { id, type, sequenceId: "all", next: null };
     case "collect_input":
       return { id, type, promptText: "", variable: "", next: null };
+    case "create_deal":
+      return { id, type, title: "", next: null };
   }
 }
 
@@ -109,6 +114,7 @@ export function nodeSummary(node: EngineNode): string {
     case "sequence_subscribe": return str(node, "sequenceId") ? `seq ${str(node, "sequenceId").slice(0, 8)}…` : "…";
     case "sequence_unsubscribe": return str(node, "sequenceId") === "all" ? "all sequences" : `seq ${str(node, "sequenceId").slice(0, 8)}…`;
     case "collect_input": return `? {{vars.${str(node, "variable") || "…"}}}`;
+    case "create_deal": return str(node, "title").slice(0, 50) || "Deal for {{contact.name}}";
     default: return "";
   }
 }

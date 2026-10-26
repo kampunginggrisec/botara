@@ -9,11 +9,11 @@ import { NODE_TYPES, defaultEngineNode, nodeSummary } from "./flow-nodes";
  */
 
 describe("flow node model", () => {
-  test("the palette lists every engine node type (14)", () => {
+  test("the palette lists every engine node type (15)", () => {
     expect([...NODE_TYPES]).toEqual([
       "trigger", "send_message", "condition", "delay", "webhook", "set_field", "ai_reply",
       "add_tag", "remove_tag", "assign", "set_conversation_status",
-      "sequence_subscribe", "sequence_unsubscribe", "collect_input",
+      "sequence_subscribe", "sequence_unsubscribe", "collect_input", "create_deal",
     ]);
   });
 
@@ -25,6 +25,7 @@ describe("flow node model", () => {
     expect(defaultEngineNode("sequence_subscribe", "n5")).toEqual({ id: "n5", type: "sequence_subscribe", sequenceId: "", next: null });
     expect(defaultEngineNode("sequence_unsubscribe", "n6")).toEqual({ id: "n6", type: "sequence_unsubscribe", sequenceId: "all", next: null });
     expect(defaultEngineNode("collect_input", "n7")).toEqual({ id: "n7", type: "collect_input", promptText: "", variable: "", next: null });
+    expect(defaultEngineNode("create_deal", "n8")).toEqual({ id: "n8", type: "create_deal", title: "", next: null });
   });
 
   test("a graph built from filled-in defaults passes the engine's stored-graph schema", () => {

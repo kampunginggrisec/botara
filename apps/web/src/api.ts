@@ -160,6 +160,8 @@ export interface WorkspaceSummary {
   name: string;
   slug: string;
   role: string;
+  /** Workspace default currency (ISO 4217) for new deals - package #6. */
+  defaultCurrency: string;
 }
 
 export interface AuthResponse {
@@ -399,6 +401,67 @@ export interface BroadcastRecipientsPage {
   total: number;
   limit: number;
   offset: number;
+}
+
+// ------------------------------------------------------------ deals (#6)
+
+/** One sales pipeline stage; position is dense and 0-based per pipeline. */
+export interface PipelineStage {
+  id: string;
+  pipelineId: string;
+  name: string;
+  position: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Pipeline {
+  id: string;
+  workspaceId: string;
+  name: string;
+  isDefault: boolean;
+  createdAt: string;
+  updatedAt: string;
+  stages: PipelineStage[];
+}
+
+export type DealStatus = "open" | "won" | "lost";
+
+/**
+ * One deal. `value` arrives as a JSON number or null (the API normalizes
+ * the drizzle numeric string) - never render it raw without a formatter.
+ */
+export interface Deal {
+  id: string;
+  workspaceId: string;
+  pipelineId: string;
+  stageId: string;
+  contactId: string;
+  conversationId: string | null;
+  title: string;
+  value: number | null;
+  currency: string;
+  status: DealStatus;
+  expectedCloseDate: string | null;
+  notes: string | null;
+  createdByUserId: string | null;
+  stageChangedAt: string;
+  closedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  contactDisplayName: string;
+  contactExternalId: string;
+  contactChannel: string;
+}
+
+export interface PipelineStageSummary { stageId: string; openCount: number; openValue: number }
+export interface PipelineTotals { count: number; value: number }
+export interface PipelineSummary {
+  pipelineId: string;
+  stages: PipelineStageSummary[];
+  open: PipelineTotals;
+  won: PipelineTotals;
+  lost: PipelineTotals;
 }
 
 /** One registered sending domain (Channels → Email, F2). */
@@ -972,6 +1035,66 @@ export const api = {
   resendBroadcastFailed(id: string): Promise<{ resent: number }> {
     return request(`/broadcasts/${id}/resend-failed`, { method: "POST" });
   },
+  // ------------------------------------------------------ deals (#6)
+  listPipelines(): Promise<{ pipelines: Pipeline[] }> {
+    return request("/pipelines");
+  },
+  createPipeline(body: {
+    name: string; withDefaultStages?: boolean; stages?: string[]; makeDefault?: boolean;
+  }): Promise<{ pipeline: Pipeline }> {
+    return request("/pipelines", { method: "POST", body: JSON.stringify(body) });
+  },
+  updatePipeline(id: string, body: { name?: string; isDefault?: boolean }): Promise<{ pipeline: Pipeline }> {
+    return request(`/pipelines/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deletePipeline(id: string, force = false): Promise<{ ok: boolean }> {
+    return request(`/pipelines/${id}${force ? "?force=true" : ""}`, { method: "DELETE" });
+  },
+  getPipelineSummary(id: string): Promise<PipelineSummary> {
+    return request(`/pipelines/${id}/summary`);
+  },
+  createPipelineStage(pipelineId: string, body: { name: string }): Promise<{ stage: PipelineStage }> {
+    return request(`/pipelines/${pipelineId}/stages`, { method: "POST", body: JSON.stringify(body) });
+  },
+  updatePipelineStage(pipelineId: string, stageId: string, body: { name: string }): Promise<{ stage: PipelineStage }> {
+    return request(`/pipelines/${pipelineId}/stages/${stageId}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deletePipelineStage(pipelineId: string, stageId: string): Promise<{ ok: boolean }> {
+    return request(`/pipelines/${pipelineId}/stages/${stageId}`, { method: "DELETE" });
+  },
+  reorderPipelineStages(pipelineId: string, stageIds: string[]): Promise<{ stages: PipelineStage[] }> {
+    return request(`/pipelines/${pipelineId}/stages/reorder`, {
+      method: "POST", body: JSON.stringify({ stageIds }),
+    });
+  },
+  listDeals(query: {
+    pipelineId?: string; stageId?: string; status?: string; contactId?: string;
+    limit?: number; offset?: number;
+  } = {}): Promise<{ deals: Deal[]; total: number }> {
+    const params = new URLSearchParams();
+    for (const [key, value] of Object.entries(query)) {
+      if (value !== undefined && value !== "") params.set(key, String(value));
+    }
+    const suffix = params.toString() ? `?${params}` : "";
+    return request(`/deals${suffix}`);
+  },
+  createDeal(body: {
+    pipelineId: string; contactId: string; title: string;
+    stageId?: string; conversationId?: string | null; value?: number | null;
+    currency?: string; status?: DealStatus; expectedCloseDate?: string | null; notes?: string | null;
+  }): Promise<{ deal: Deal }> {
+    return request("/deals", { method: "POST", body: JSON.stringify(body) });
+  },
+  updateDeal(id: string, body: Partial<{
+    title: string; pipelineId: string; stageId: string; contactId: string;
+    conversationId: string | null; value: number | null; currency: string;
+    status: DealStatus; expectedCloseDate: string | null; notes: string | null;
+  }>): Promise<{ deal: Deal }> {
+    return request(`/deals/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deleteDeal(id: string): Promise<{ ok: boolean }> {
+    return request(`/deals/${id}`, { method: "DELETE" });
+  },
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
     return request("/channels/accounts");
   },
@@ -1053,7 +1176,10 @@ export const api = {
   changePassword(body: { currentPassword: string; newPassword: string }): Promise<{ ok: boolean }> {
     return request("/auth/change-password", { method: "POST", body: JSON.stringify(body) });
   },
-  renameWorkspace(workspaceDbId: string, body: { name: string }): Promise<{ workspace: WorkspaceSummary | null }> {
+  renameWorkspace(
+    workspaceDbId: string,
+    body: { name?: string; defaultCurrency?: string },
+  ): Promise<{ workspace: WorkspaceSummary | null }> {
     return request(`/workspaces/${workspaceDbId}`, { method: "PATCH", body: JSON.stringify(body) });
   },
   listMembers(workspaceDbId: string): Promise<{ members: Member[] }> {

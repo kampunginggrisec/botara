@@ -33,7 +33,7 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 
 ## Parity table (post-fix state, 2026-10-26)
 
-122 routes: 95 UI · 18 WEBHOOK · 9 API-ONLY.
+136 routes: 108 UI · 18 WEBHOOK · 10 API-ONLY.
 
 ### Auth & session
 
@@ -61,7 +61,7 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 |---|---|---|
 | GET /workspaces | UI | Workspace switcher |
 | POST /workspaces | UI | Workspace switcher → "+ New workspace" (F7) |
-| PATCH /workspaces/{} | UI | Settings → Workspace (rename) |
+| PATCH /workspaces/{} | UI | Settings → Workspace (rename + default currency, package #6) |
 | GET /workspaces/{}/members | UI | Settings → Members; Inbox assignee picker |
 | POST /workspaces/{}/members | UI | Settings → Members (invite) |
 | PATCH /workspaces/{}/members/{} | UI | Settings → Members (role) |
@@ -142,6 +142,25 @@ Resend; the status shown is the stored verification state.
 | GET /templates | UI | Broadcast form + template manager (F6); Inbox template replies |
 | POST /templates | UI | Broadcast → Template manager register form (F6). Fields match the API schema exactly: channelAccountId, name, language?, category?, externalId? |
 | PATCH /templates/{}/category | UI | Template manager → per-template category correction (F6) |
+
+### Deals & pipelines (package #6)
+
+| Route | Class | UI location / reason |
+|---|---|---|
+| GET /pipelines | UI | Deals → pipeline switcher (stages embedded) |
+| POST /pipelines | UI | Deals → "New pipeline" (default-stages option) |
+| PATCH /pipelines/{} | UI | Deals → rename / "Make default" |
+| DELETE /pipelines/{} | UI | Deals → "Delete pipeline" (409 with deals; `?force=true` after confirm) |
+| GET /pipelines/{}/summary | UI | Deals → board header totals + column counts |
+| POST /pipelines/{}/stages | UI | Deals → stage manager "Add stage" |
+| PATCH /pipelines/{}/stages/{} | UI | Deals → stage manager rename |
+| DELETE /pipelines/{}/stages/{} | UI | Deals → stage manager delete (409 while deals sit in it) |
+| POST /pipelines/{}/stages/reorder | UI | Deals → stage manager move up/down |
+| GET /deals | UI | Deals → board (filtered by pipelineId) |
+| POST /deals | UI | Deals → "New deal" form |
+| GET /deals/{} | API-ONLY | Single-deal fetch for API consumers; the SPA reads deals board-wide via GET /deals and mutates by id |
+| PATCH /deals/{} | UI | Deals → card stage picker, drag-and-drop, status actions, edit form |
+| DELETE /deals/{} | UI | Deals → card delete |
 
 ### Publish (scheduled posts)
 

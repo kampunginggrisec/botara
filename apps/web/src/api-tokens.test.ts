@@ -5,8 +5,8 @@ import {
 } from "./api-tokens";
 
 describe("web API token scope helpers", () => {
-  test("the resource mirror matches the taxonomy size (10 resources)", () => {
-    expect(TOKEN_RESOURCES).toHaveLength(10);
+  test("the resource mirror matches the taxonomy size (11 resources)", () => {
+    expect(TOKEN_RESOURCES).toHaveLength(11);
     expect(TOKEN_RESOURCES).toContain("kb");
     expect(TOKEN_RESOURCES).toContain("settings");
   });

@@ -7,8 +7,9 @@ import {
   type BroadcastRecipientCounts, type BroadcastSummary,
   type CatalogProduct, type CatalogSummary,
   type ChannelAccount, type ConnectionInfo, type Contact,
-  type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
-  type Member, type Message, type PublicConfig, type RichBlock, type ScheduledPost, type SegmentInfo,
+  type ContactImportResult, type Conversation, type Deal, type Flow, type GrowthLink, type KbDocument,
+  type Member, type Message, type Pipeline, type PipelineSummary, type PublicConfig,
+  type RichBlock, type ScheduledPost, type SegmentInfo,
   type Sequence, type SequenceStep, type StatsOverview, type Template, type WorkspaceDomain,
   type WorkspaceSummary,
 } from "./api";
@@ -24,6 +25,7 @@ import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-exam
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
+import { formatDealMoney, groupDealsByStage, movedStageOrder, visibleDeals } from "./deals";
 import {
   TOKEN_RESOURCES, countPickedResources, emptyScopePicks, expiryIsoFromDays,
   picksToScopes, scopeParts, tokenIsExpired, type ScopePicks, type TokenResource,
@@ -34,7 +36,7 @@ import {
   type PlatformCardGroup,
 } from "./admin-settings-model";
 
-type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
+type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "deals" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
 const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "dashboard", labelKey: "nav.dashboard" },
@@ -43,6 +45,7 @@ const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["
   { id: "flows", labelKey: "nav.flows" },
   { id: "broadcast", labelKey: "nav.broadcast" },
   { id: "sequences", labelKey: "nav.sequences" },
+  { id: "deals", labelKey: "nav.deals" },
   { id: "publish", labelKey: "nav.publish" },
   { id: "channels", labelKey: "nav.channels" },
   { id: "knowledge", labelKey: "nav.knowledge" },
@@ -2635,6 +2638,598 @@ function draftToStep(draft: StepDraft): SequenceStep {
     : { delaySeconds: Math.max(0, Math.round(draft.delayHours * 3600)), text: draft.body };
 }
 
+
+/**
+ * Deals board (adoption package #6): pipelines + Kanban stages.
+ *
+ * Won/lost is a STATUS shown as a badge on the card - the card stays in
+ * its stage column (filter toggle hides closed deals). Moving works by
+ * drag-and-drop AND by the stage picker on every card (drag alone is
+ * not accessible). All money renders through formatDealMoney - never
+ * raw - per the package #4 numeric-string lesson.
+ */
+function DealsPage({ workspace }: { workspace: WorkspaceSummary | undefined }) {
+  const { t } = useI18n();
+  const [pipelines, setPipelines] = useState<Pipeline[]>([]);
+  const [pipelineId, setPipelineId] = useState("");
+  const [deals, setDeals] = useState<Deal[]>([]);
+  const [summary, setSummary] = useState<PipelineSummary | null>(null);
+  const [contacts, setContacts] = useState<Contact[]>([]);
+  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [hideClosed, setHideClosed] = useState(false);
+  const [dragOverStage, setDragOverStage] = useState<string | null>(null);
+  // Pipeline form
+  const [showPipelineForm, setShowPipelineForm] = useState(false);
+  const [newPipelineName, setNewPipelineName] = useState("");
+  const [withDefaultStages, setWithDefaultStages] = useState(true);
+  // Stage manager
+  const [newStageName, setNewStageName] = useState("");
+  const [stageEditId, setStageEditId] = useState<string | null>(null);
+  const [stageEditName, setStageEditName] = useState("");
+  // Deal form
+  const [showDealForm, setShowDealForm] = useState(false);
+  const [editingDeal, setEditingDeal] = useState<Deal | null>(null);
+  const [fTitle, setFTitle] = useState("");
+  const [fContactId, setFContactId] = useState("");
+  const [fConversationId, setFConversationId] = useState("");
+  const [fPipelineId, setFPipelineId] = useState("");
+  const [fStageId, setFStageId] = useState("");
+  const [fValue, setFValue] = useState("");
+  const [fCurrency, setFCurrency] = useState("IDR");
+  const [fExpectedClose, setFExpectedClose] = useState("");
+  const [fNotes, setFNotes] = useState("");
+
+  const selectedPipeline = pipelines.find((p) => p.id === pipelineId) ?? null;
+  const defaultCurrency = workspace?.defaultCurrency ?? "IDR";
+
+  const loadPipelines = useCallback(async () => {
+    try {
+      const res = await api.listPipelines();
+      setPipelines(res.pipelines);
+      setPipelineId((prev) => {
+        if (prev && res.pipelines.some((p) => p.id === prev)) return prev;
+        return (res.pipelines.find((p) => p.isDefault) ?? res.pipelines[0])?.id ?? "";
+      });
+      setError(null);
+    } catch (err) {
+      setError(errText(err, t("deals.loadFailed")));
+    }
+  }, [t]);
+
+  const loadBoard = useCallback(async () => {
+    if (!pipelineId) { setDeals([]); setSummary(null); return; }
+    try {
+      const [d, s] = await Promise.all([
+        api.listDeals({ pipelineId, limit: 500 }),
+        api.getPipelineSummary(pipelineId),
+      ]);
+      setDeals(d.deals);
+      setSummary(s);
+    } catch (err) {
+      setError(errText(err, t("deals.loadFailed")));
+    }
+  }, [pipelineId, t]);
+
+  useEffect(() => { void loadPipelines(); }, [loadPipelines]);
+  useEffect(() => { void loadBoard(); }, [loadBoard]);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [c, cv] = await Promise.all([api.listContacts(), api.listConversations()]);
+        if (cancelled) return;
+        setContacts(c.contacts);
+        setConversations(cv.conversations);
+      } catch { /* pickers are an enhancement; the board still renders */ }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const refreshAll = async () => { await loadPipelines(); await loadBoard(); };
+
+  const createPipeline = async () => {
+    setBusy(true); setError(null);
+    try {
+      const res = await api.createPipeline({
+        name: newPipelineName.trim(),
+        withDefaultStages,
+        makeDefault: pipelines.length === 0,
+      });
+      setShowPipelineForm(false);
+      setNewPipelineName("");
+      await loadPipelines();
+      setPipelineId(res.pipeline.id);
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const deletePipeline = async (p: Pipeline) => {
+    if (!window.confirm(t("deals.deletePipelineConfirm"))) return;
+    setBusy(true); setError(null);
+    try {
+      await api.deletePipeline(p.id);
+      if (p.id === pipelineId) setPipelineId("");
+      await loadPipelines();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        let count = 0;
+        try {
+          const s = await api.getPipelineSummary(p.id);
+          count = s.open.count + s.won.count + s.lost.count;
+        } catch { /* count is cosmetic in the confirm text */ }
+        if (window.confirm(t("deals.pipelineHasDeals", { count }))) {
+          try {
+            await api.deletePipeline(p.id, true);
+            if (p.id === pipelineId) setPipelineId("");
+            await loadPipelines();
+          } catch (err2) {
+            setError(errText(err2, t("deals.saveFailed")));
+          }
+        }
+      } else {
+        setError(errText(err, t("deals.saveFailed")));
+      }
+    } finally { setBusy(false); }
+  };
+
+  const moveDeal = async (deal: Deal, stageId: string) => {
+    if (stageId === deal.stageId || !stageId) return;
+    setError(null);
+    try {
+      await api.updateDeal(deal.id, { stageId });
+      await loadBoard();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    }
+  };
+
+  const setDealStatus = async (deal: Deal, status: Deal["status"]) => {
+    setError(null);
+    try {
+      await api.updateDeal(deal.id, { status });
+      await loadBoard();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    }
+  };
+
+  const deleteDeal = async (deal: Deal) => {
+    if (!window.confirm(t("deals.deleteDealConfirm"))) return;
+    setError(null);
+    try {
+      await api.deleteDeal(deal.id);
+      await loadBoard();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    }
+  };
+
+  const openNewDeal = () => {
+    if (!selectedPipeline) return;
+    setEditingDeal(null);
+    setFTitle("");
+    setFContactId("");
+    setFConversationId("");
+    setFPipelineId(selectedPipeline.id);
+    setFStageId("");
+    setFValue("");
+    setFCurrency(defaultCurrency);
+    setFExpectedClose("");
+    setFNotes("");
+    setShowDealForm(true);
+  };
+
+  const openEditDeal = (deal: Deal) => {
+    setEditingDeal(deal);
+    setFTitle(deal.title);
+    setFContactId(deal.contactId);
+    setFConversationId(deal.conversationId ?? "");
+    setFPipelineId(deal.pipelineId);
+    setFStageId(deal.stageId);
+    setFValue(deal.value === null ? "" : String(deal.value));
+    setFCurrency(deal.currency);
+    setFExpectedClose(deal.expectedCloseDate ?? "");
+    setFNotes(deal.notes ?? "");
+    setShowDealForm(true);
+  };
+
+  const saveDeal = async () => {
+    setBusy(true); setError(null);
+    try {
+      const body = {
+        title: fTitle.trim(),
+        contactId: fContactId,
+        conversationId: fConversationId || null,
+        value: fValue.trim() === "" ? null : Number(fValue),
+        currency: fCurrency.trim().toUpperCase() || defaultCurrency,
+        expectedCloseDate: fExpectedClose || null,
+        notes: fNotes.trim() || null,
+        ...(fStageId ? { stageId: fStageId } : {}),
+      };
+      if (editingDeal) {
+        await api.updateDeal(editingDeal.id, { ...body, pipelineId: fPipelineId });
+      } else {
+        await api.createDeal({ ...body, pipelineId: fPipelineId });
+      }
+      setShowDealForm(false);
+      if (fPipelineId !== pipelineId) setPipelineId(fPipelineId);
+      await loadBoard();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const addStage = async () => {
+    if (!selectedPipeline || !newStageName.trim()) return;
+    setBusy(true); setError(null);
+    try {
+      await api.createPipelineStage(selectedPipeline.id, { name: newStageName.trim() });
+      setNewStageName("");
+      await refreshAll();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const renameStage = async (stageId: string) => {
+    if (!selectedPipeline || !stageEditName.trim()) return;
+    setBusy(true); setError(null);
+    try {
+      await api.updatePipelineStage(selectedPipeline.id, stageId, { name: stageEditName.trim() });
+      setStageEditId(null);
+      await refreshAll();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const moveStage = async (stageId: string, direction: -1 | 1) => {
+    if (!selectedPipeline) return;
+    const order = movedStageOrder(selectedPipeline.stages, stageId, direction);
+    if (!order) return;
+    setError(null);
+    try {
+      await api.reorderPipelineStages(selectedPipeline.id, order);
+      await refreshAll();
+    } catch (err) {
+      setError(errText(err, t("deals.saveFailed")));
+    }
+  };
+
+  const deleteStage = async (stageId: string) => {
+    if (!selectedPipeline) return;
+    if (!window.confirm(t("deals.deleteStageConfirm"))) return;
+    setError(null);
+    try {
+      await api.deletePipelineStage(selectedPipeline.id, stageId);
+      await refreshAll();
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) setError(t("deals.stageHasDeals"));
+      else setError(errText(err, t("deals.saveFailed")));
+    }
+  };
+
+  const formPipeline = pipelines.find((p) => p.id === fPipelineId) ?? null;
+  const formConversations = conversations.filter((c) => c.contactId === fContactId);
+  const boardDeals = visibleDeals(deals, hideClosed);
+  const columns = selectedPipeline ? groupDealsByStage(selectedPipeline.stages, boardDeals) : [];
+  const stageSummary = (stageId: string) => summary?.stages.find((s) => s.stageId === stageId);
+
+  const statusBadge = (deal: Deal) => deal.status === "open" ? null : (
+    <span className={`rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase ${deal.status === "won"
+      ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/50 dark:text-emerald-300"
+      : "bg-red-100 text-red-800 dark:bg-red-900/50 dark:text-red-300"}`}>
+      {t(`deals.status.${deal.status}`)}
+    </span>
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold">{t("deals.title")}</h2>
+          <p className={mutedCls}>{t("deals.subtitle")}</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={pipelineId}
+            onChange={(e) => setPipelineId(e.target.value)}
+            className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          >
+            {pipelines.map((p) => (
+              <option key={p.id} value={p.id}>{p.name}{p.isDefault ? " ★" : ""}</option>
+            ))}
+          </select>
+          {selectedPipeline && !selectedPipeline.isDefault && (
+            <button
+              onClick={() => void api.updatePipeline(selectedPipeline.id, { isDefault: true }).then(refreshAll)}
+              className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700"
+            >
+              {t("deals.makeDefault")}
+            </button>
+          )}
+          {selectedPipeline && (
+            <button
+              onClick={() => void deletePipeline(selectedPipeline)}
+              disabled={busy}
+              className="rounded-md border border-red-300 px-3 py-2 text-sm text-red-600 dark:border-red-800 dark:text-red-400"
+            >
+              {t("deals.deletePipeline")}
+            </button>
+          )}
+          <button onClick={() => setShowPipelineForm((v) => !v)} className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700">
+            {t("deals.newPipeline")}
+          </button>
+          <button onClick={openNewDeal} disabled={!selectedPipeline || selectedPipeline.stages.length === 0} className={primaryBtn}>
+            {t("deals.newDeal")}
+          </button>
+        </div>
+      </div>
+
+      {error && <p className="text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+      {showPipelineForm && (
+        <div className={`${cardCls} flex flex-wrap items-end gap-3 p-4`}>
+          <div className="min-w-56 flex-1">
+            <label className={labelCls}>{t("deals.pipelineName")}</label>
+            <input value={newPipelineName} onChange={(e) => setNewPipelineName(e.target.value)} className={inputCls} />
+          </div>
+          <label className="flex items-center gap-2 pb-2 text-sm">
+            <input type="checkbox" checked={withDefaultStages} onChange={(e) => setWithDefaultStages(e.target.checked)} />
+            {t("deals.withDefaultStages")}
+          </label>
+          <button onClick={() => void createPipeline()} disabled={busy || !newPipelineName.trim()} className={primaryBtn}>
+            {t("common.create")}
+          </button>
+          <button onClick={() => setShowPipelineForm(false)} className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700">
+            {t("common.cancel")}
+          </button>
+        </div>
+      )}
+
+      {pipelines.length === 0 && !showPipelineForm && (
+        <div className={`${cardCls} p-6 text-center`}>
+          <div className="font-medium">{t("deals.emptyTitle")}</div>
+          <p className={mutedCls}>{t("deals.emptyBody")}</p>
+        </div>
+      )}
+
+      {selectedPipeline && (
+        <>
+          <div className="flex flex-wrap items-center gap-4 text-sm">
+            <span>
+              {t("deals.openTotal")}: <strong>{summary?.open.count ?? 0}</strong>
+              {" · "}{formatDealMoney(summary?.open.value ?? null, defaultCurrency)}
+            </span>
+            <span>
+              {t("deals.wonTotal")}: <strong>{summary?.won.count ?? 0}</strong>
+              {" · "}{formatDealMoney(summary?.won.value ?? null, defaultCurrency)}
+            </span>
+            <span>
+              {t("deals.lostTotal")}: <strong>{summary?.lost.count ?? 0}</strong>
+              {" · "}{formatDealMoney(summary?.lost.value ?? null, defaultCurrency)}
+            </span>
+            <label className="ml-auto flex items-center gap-2">
+              <input type="checkbox" checked={hideClosed} onChange={(e) => setHideClosed(e.target.checked)} />
+              {t("deals.hideClosed")}
+            </label>
+          </div>
+
+          {selectedPipeline.stages.length === 0 ? (
+            <p className={mutedCls}>{t("deals.noStages")}</p>
+          ) : (
+            <div className="flex gap-3 overflow-x-auto pb-2">
+              {columns.map(({ stage, deals: columnDeals }) => (
+                <div
+                  key={stage.id}
+                  onDragOver={(e) => { e.preventDefault(); setDragOverStage(stage.id); }}
+                  onDragLeave={() => setDragOverStage((cur) => (cur === stage.id ? null : cur))}
+                  onDrop={(e) => {
+                    e.preventDefault();
+                    setDragOverStage(null);
+                    const dealId = e.dataTransfer.getData("text/plain");
+                    const deal = deals.find((d) => d.id === dealId);
+                    if (deal) void moveDeal(deal, stage.id);
+                  }}
+                  className={`flex w-72 shrink-0 flex-col rounded-lg border bg-slate-50 dark:bg-slate-900/60 ${dragOverStage === stage.id
+                    ? "border-slate-500" : "border-slate-200 dark:border-slate-800"}`}
+                >
+                  <div className="border-b border-slate-200 px-3 py-2 dark:border-slate-800">
+                    <div className="text-sm font-medium">{stage.name}</div>
+                    <div className="text-xs text-slate-500 dark:text-slate-400">
+                      {stageSummary(stage.id)?.openCount ?? 0} · {formatDealMoney(stageSummary(stage.id)?.openValue ?? null, defaultCurrency)}
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 p-2">
+                    {columnDeals.map((deal) => (
+                      <div
+                        key={deal.id}
+                        draggable
+                        onDragStart={(e) => {
+                          e.dataTransfer.setData("text/plain", deal.id);
+                          e.dataTransfer.effectAllowed = "move";
+                        }}
+                        className={`${cardCls} cursor-grab p-3`}
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="text-sm font-medium">{deal.title}</div>
+                          {statusBadge(deal)}
+                        </div>
+                        <div className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
+                          {deal.contactDisplayName} · {deal.contactChannel}
+                        </div>
+                        <div className="mt-1 text-sm">{formatDealMoney(deal.value, deal.currency)}</div>
+                        {deal.expectedCloseDate && (
+                          <div className="text-xs text-slate-500 dark:text-slate-400">
+                            {t("deals.expectedClose")}: {deal.expectedCloseDate}
+                          </div>
+                        )}
+                        <label className="mt-2 block">
+                          <span className="sr-only">{t("deals.moveTo")}</span>
+                          <select
+                            value={deal.stageId}
+                            onChange={(e) => void moveDeal(deal, e.target.value)}
+                            className="w-full rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                          >
+                            {selectedPipeline.stages.map((s) => (
+                              <option key={s.id} value={s.id}>{s.name}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <div className="mt-2 flex flex-wrap gap-1 text-xs">
+                          {deal.status === "open" ? (
+                            <>
+                              <button onClick={() => void setDealStatus(deal, "won")} className="rounded border border-emerald-300 px-2 py-1 text-emerald-700 dark:border-emerald-800 dark:text-emerald-300">
+                                {t("deals.markWon")}
+                              </button>
+                              <button onClick={() => void setDealStatus(deal, "lost")} className="rounded border border-red-300 px-2 py-1 text-red-700 dark:border-red-800 dark:text-red-300">
+                                {t("deals.markLost")}
+                              </button>
+                            </>
+                          ) : (
+                            <button onClick={() => void setDealStatus(deal, "open")} className="rounded border border-slate-300 px-2 py-1 dark:border-slate-700">
+                              {t("deals.reopen")}
+                            </button>
+                          )}
+                          <button onClick={() => openEditDeal(deal)} className="rounded border border-slate-300 px-2 py-1 dark:border-slate-700">
+                            {t("common.edit")}
+                          </button>
+                          <button onClick={() => void deleteDeal(deal)} className="rounded border border-slate-300 px-2 py-1 text-red-600 dark:border-slate-700 dark:text-red-400">
+                            {t("common.delete")}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <div className={`${cardCls} p-4`}>
+            <div className="text-sm font-medium">{t("deals.manageStages")}</div>
+            <div className="mt-2 space-y-2">
+              {selectedPipeline.stages.map((stage, idx) => (
+                <div key={stage.id} className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="w-6 text-slate-400">{idx + 1}.</span>
+                  {stageEditId === stage.id ? (
+                    <>
+                      <input value={stageEditName} onChange={(e) => setStageEditName(e.target.value)} className="w-56 rounded-md border border-slate-300 bg-white px-2 py-1 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" />
+                      <button onClick={() => void renameStage(stage.id)} disabled={busy || !stageEditName.trim()} className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700">
+                        {t("common.save")}
+                      </button>
+                      <button onClick={() => setStageEditId(null)} className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700">
+                        {t("common.cancel")}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span className="w-56">{stage.name}</span>
+                      <button onClick={() => void moveStage(stage.id, -1)} disabled={idx === 0} className="rounded border border-slate-300 px-2 py-1 text-xs disabled:opacity-40 dark:border-slate-700">↑</button>
+                      <button onClick={() => void moveStage(stage.id, 1)} disabled={idx === selectedPipeline.stages.length - 1} className="rounded border border-slate-300 px-2 py-1 text-xs disabled:opacity-40 dark:border-slate-700">↓</button>
+                      <button onClick={() => { setStageEditId(stage.id); setStageEditName(stage.name); }} className="rounded border border-slate-300 px-2 py-1 text-xs dark:border-slate-700">
+                        {t("common.edit")}
+                      </button>
+                      <button onClick={() => void deleteStage(stage.id)} className="rounded border border-slate-300 px-2 py-1 text-xs text-red-600 dark:border-slate-700 dark:text-red-400">
+                        {t("common.delete")}
+                      </button>
+                    </>
+                  )}
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <div>
+                <label className={labelCls}>{t("deals.stageName")}</label>
+                <input value={newStageName} onChange={(e) => setNewStageName(e.target.value)} className="w-56 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100" />
+              </div>
+              <button onClick={() => void addStage()} disabled={busy || !newStageName.trim()} className="rounded-md border border-slate-300 px-3 py-1.5 text-sm dark:border-slate-700">
+                {t("deals.addStage")}
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {showDealForm && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/40 p-4" role="dialog" aria-modal="true">
+          <div className={`${cardCls} max-h-full w-full max-w-lg space-y-3 overflow-y-auto p-5`}>
+            <div className="text-base font-semibold">{editingDeal ? t("deals.editDeal") : t("deals.newDeal")}</div>
+            <div>
+              <label className={labelCls}>{t("deals.formTitle")}</label>
+              <input value={fTitle} onChange={(e) => setFTitle(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>{t("deals.contact")} *</label>
+              <select value={fContactId} onChange={(e) => { setFContactId(e.target.value); setFConversationId(""); }} className={inputCls}>
+                <option value="">{t("deals.contactPick")}</option>
+                {contacts.map((c) => (
+                  <option key={c.id} value={c.id}>{c.displayName} ({c.channel})</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className={labelCls}>{t("deals.conversation")}</label>
+              <select value={fConversationId} onChange={(e) => setFConversationId(e.target.value)} className={inputCls} disabled={!fContactId}>
+                <option value="">{t("deals.conversationNone")}</option>
+                {formConversations.map((c) => (
+                  <option key={c.id} value={c.id}>{c.channel} · {c.status} · {c.id.slice(0, 8)}…</option>
+                ))}
+              </select>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className={labelCls}>{t("deals.pipeline")}</label>
+                <select value={fPipelineId} onChange={(e) => { setFPipelineId(e.target.value); setFStageId(""); }} className={inputCls}>
+                  {pipelines.map((p) => (
+                    <option key={p.id} value={p.id}>{p.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>{t("deals.stage")}</label>
+                <select value={fStageId} onChange={(e) => setFStageId(e.target.value)} className={inputCls}>
+                  <option value="">{formPipeline?.stages[0]?.name ?? ""}</option>
+                  {(formPipeline?.stages ?? []).map((s) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>{t("deals.value")}</label>
+                <input type="number" min={0} step="any" value={fValue} onChange={(e) => setFValue(e.target.value)} className={inputCls} />
+              </div>
+              <div>
+                <label className={labelCls}>{t("deals.currency")}</label>
+                <input value={fCurrency} onChange={(e) => setFCurrency(e.target.value.toUpperCase().slice(0, 3))} className={inputCls} maxLength={3} />
+              </div>
+              <div>
+                <label className={labelCls}>{t("deals.expectedClose")}</label>
+                <input type="date" value={fExpectedClose} onChange={(e) => setFExpectedClose(e.target.value)} className={inputCls} />
+              </div>
+            </div>
+            <div>
+              <label className={labelCls}>{t("deals.notes")}</label>
+              <textarea value={fNotes} onChange={(e) => setFNotes(e.target.value)} rows={3} className={inputCls} />
+            </div>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setShowDealForm(false)} className="rounded-md border border-slate-300 px-3 py-2 text-sm dark:border-slate-700">
+                {t("common.cancel")}
+              </button>
+              <button onClick={() => void saveDeal()} disabled={busy || !fTitle.trim() || !fContactId || !fPipelineId} className={primaryBtn}>
+                {t("common.save")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SequencesPage() {
   const { t } = useI18n();
   const [sequences, setSequences] = useState<Sequence[]>([]);
@@ -4769,6 +5364,7 @@ const TOKEN_RESOURCE_LABEL_KEYS = {
   broadcasts: "settings.tokenResource.broadcasts",
   flows: "settings.tokenResource.flows",
   sequences: "settings.tokenResource.sequences",
+  deals: "settings.tokenResource.deals",
   templates: "settings.tokenResource.templates",
   channels: "settings.tokenResource.channels",
   kb: "settings.tokenResource.kb",
@@ -4784,6 +5380,7 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const { t } = useI18n();
   const [name, setName] = useState(user.name ?? "");
   const [wsName, setWsName] = useState(workspace?.name ?? "");
+  const [wsCurrency, setWsCurrency] = useState(workspace?.defaultCurrency ?? "IDR");
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [members, setMembers] = useState<Member[]>([]);
@@ -4886,7 +5483,7 @@ function SettingsPage({ user, workspace, refreshSession }: {
     if (!workspace) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      await api.renameWorkspace(workspace.id, { name: wsName.trim() });
+      await api.renameWorkspace(workspace.id, { name: wsName.trim(), defaultCurrency: wsCurrency });
       setNotice(t("settings.workspaceSaved"));
       refreshSession();
     } catch (err) {
@@ -4966,8 +5563,19 @@ function SettingsPage({ user, workspace, refreshSession }: {
             <label className={labelCls}>{t("settings.workspaceName")}</label>
             <input value={wsName} onChange={(e) => setWsName(e.target.value)} disabled={!canRename} className={`${inputCls} ${!canRename ? "opacity-60" : ""}`} />
           </div>
+          <div>
+            <label className={labelCls}>{t("settings.defaultCurrency")}</label>
+            <input
+              value={wsCurrency}
+              onChange={(e) => setWsCurrency(e.target.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3))}
+              disabled={!canRename}
+              maxLength={3}
+              className={`${inputCls} ${!canRename ? "opacity-60" : ""}`}
+            />
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("settings.defaultCurrencyHint")}</p>
+          </div>
           {!canRename && <p className="text-xs text-amber-600 dark:text-amber-400">{t("settings.renameForbidden")}</p>}
-          <button onClick={() => void saveWorkspace()} disabled={busy || !canRename || !wsName.trim()} className={primaryBtn}>{t("common.save")}</button>
+          <button onClick={() => void saveWorkspace()} disabled={busy || !canRename || !wsName.trim() || wsCurrency.length !== 3} className={primaryBtn}>{t("common.save")}</button>
         </div>
 
         <div className={section}>
@@ -5616,6 +6224,7 @@ function AuthedApp() {
         {page === "flows" && <FlowsPage />}
         {page === "broadcast" && <BroadcastPage />}
         {page === "sequences" && <SequencesPage />}
+        {page === "deals" && <DealsPage workspace={currentWorkspace} />}
         {page === "publish" && <PublishPage />}
         {page === "channels" && <ChannelsPage />}
         {page === "knowledge" && <KnowledgePage />}
