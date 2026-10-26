@@ -4,7 +4,8 @@ import { InstagramAdapter } from "./instagram";
 import { MessengerAdapter } from "./messenger";
 import { TelegramAdapter } from "./telegram";
 import { WhatsAppAdapter } from "./whatsapp";
-import { richBlockSchema, richToPlainText, type RichBlock } from "./rich";
+import { buildVariableContext } from "@botara/shared";
+import { interpolateRichBlock, richBlockSchema, richToPlainText, type RichBlock } from "./rich";
 import type { FetchLike } from "./types";
 
 /**
@@ -440,5 +441,67 @@ describe("telegram rich renderer", () => {
     });
     expect(res.warnings).toEqual(["RICH_DEGRADED_TO_TEXT"]);
     expect(bodies()[0]!.text).toContain("p1");
+  });
+});
+
+describe("interpolateRichBlock (variables package #1)", () => {
+  const vctx = buildVariableContext({
+    contact: { displayName: "Sari", externalId: "628111", channel: "whatsapp", customFields: { city: "Surabaya" } },
+    workspaceName: "Toko Sari",
+  });
+
+  test("buttons block: text + button titles render; payload/url untouched; input not mutated", () => {
+    const block: RichBlock = {
+      kind: "buttons",
+      text: "Halo {{contact.name}} dari {{contact.city}}!",
+      buttons: [
+        { type: "reply", title: "Pesanan {{contact.name}}", payload: "track_{{contact.name}}" },
+        { type: "url", title: "Buka {{workspace.name}}", url: "https://example.com/{{contact.name}}" },
+      ],
+    };
+    const { block: out, warnings } = interpolateRichBlock(block, vctx);
+    expect(warnings).toEqual([]);
+    if (out.kind !== "buttons") throw new Error("kind changed");
+    expect(out.text).toBe("Halo Sari dari Surabaya!");
+    expect(out.buttons[0]!.title).toBe("Pesanan Sari");
+    expect(out.buttons[0]!.payload).toBe("track_{{contact.name}}");
+    expect(out.buttons[1]!.title).toBe("Buka Toko Sari");
+    expect(out.buttons[1]!.url).toBe("https://example.com/{{contact.name}}");
+    if (block.kind !== "buttons") throw new Error("kind changed");
+    expect(block.text).toBe("Halo {{contact.name}} dari {{contact.city}}!");
+  });
+
+  test("list + carousel + catalog text fields render; unknown variables warn", () => {
+    const list: RichBlock = {
+      kind: "list",
+      text: "Menu untuk {{contact.name}}",
+      buttonText: "Lihat {{contact.missing}}",
+      sections: [{ title: "Seksi {{contact.city}}", rows: [{ id: "1", title: "Baris {{contact.name}}", description: "di {{contact.city}}" }] }],
+    };
+    const r1 = interpolateRichBlock(list, vctx);
+    if (r1.block.kind !== "list") throw new Error("kind changed");
+    expect(r1.block.text).toBe("Menu untuk Sari");
+    expect(r1.block.buttonText).toBe("Lihat ");
+    expect(r1.block.sections[0]!.title).toBe("Seksi Surabaya");
+    expect(r1.block.sections[0]!.rows[0]!.title).toBe("Baris Sari");
+    expect(r1.block.sections[0]!.rows[0]!.description).toBe("di Surabaya");
+    expect(r1.warnings).toEqual([{ code: "UNKNOWN_VARIABLE", path: "contact.missing" }]);
+
+    const carousel: RichBlock = {
+      kind: "carousel",
+      cards: [{ title: "Untuk {{contact.name}}", subtitle: "dari {{workspace.name}}", imageUrl: "https://x.co/a.png" }],
+    };
+    const r2 = interpolateRichBlock(carousel, vctx);
+    if (r2.block.kind !== "carousel") throw new Error("kind changed");
+    expect(r2.block.cards[0]!.title).toBe("Untuk Sari");
+    expect(r2.block.cards[0]!.subtitle).toBe("dari Toko Sari");
+    expect(r2.block.cards[0]!.imageUrl).toBe("https://x.co/a.png");
+  });
+
+  test("a block without variables passes through with zero warnings", () => {
+    const block: RichBlock = { kind: "product", catalogId: "c1", productId: "p1", text: "Lihat produk ini" };
+    const { block: out, warnings } = interpolateRichBlock(block, vctx);
+    expect(out).toEqual(block);
+    expect(warnings).toEqual([]);
   });
 });

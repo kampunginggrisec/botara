@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { interpolate, type InterpolationWarning, type VariableContext } from "@botara/shared";
 
 /**
  * Rich message blocks (adopted-features package) - the channel-agnostic
@@ -163,5 +164,78 @@ export function richToPlainText(block: RichBlock): string {
       }
       return lines.join("\n");
     }
+  }
+}
+
+/**
+ * Interpolate the TEXT-BEARING fields of a block against a variable
+ * context (variables package #1): message text, captions, button
+ * titles, list button/section/row labels, carousel card titles and
+ * subtitles. Identifiers and targets (product/catalog ids, button
+ * payloads, URLs, image URLs) are NEVER interpolated - a variable in
+ * them would corrupt the reference. Returns a NEW block; the input is
+ * not mutated. Unknown variables render empty and are collected as
+ * warnings, exactly like plain-text interpolation.
+ */
+export function interpolateRichBlock(
+  block: RichBlock,
+  ctx: VariableContext,
+): { block: RichBlock; warnings: InterpolationWarning[] } {
+  const warnings: InterpolationWarning[] = [];
+  const render = (value: string): string => {
+    const r = interpolate(value, ctx);
+    warnings.push(...r.warnings);
+    return r.text;
+  };
+  const renderOptional = (value: string | undefined): string | undefined =>
+    value === undefined ? undefined : render(value);
+  const renderButtons = (buttons: RichButton[]): RichButton[] =>
+    buttons.map((b) => ({ ...b, title: render(b.title) }));
+
+  switch (block.kind) {
+    case "buttons":
+      return { block: { ...block, text: render(block.text), buttons: renderButtons(block.buttons) }, warnings };
+    case "list":
+      return {
+        block: {
+          ...block,
+          text: render(block.text),
+          buttonText: render(block.buttonText),
+          sections: block.sections.map((section) => ({
+            ...section,
+            title: render(section.title),
+            rows: section.rows.map((row) => ({
+              ...row,
+              title: render(row.title),
+              description: renderOptional(row.description),
+            })),
+          })),
+        },
+        warnings,
+      };
+    case "carousel":
+      return {
+        block: {
+          ...block,
+          cards: block.cards.map((card) => ({
+            ...card,
+            title: render(card.title),
+            subtitle: renderOptional(card.subtitle),
+            buttons: card.buttons ? renderButtons(card.buttons) : undefined,
+          })),
+        },
+        warnings,
+      };
+    case "product":
+      return { block: { ...block, text: renderOptional(block.text) }, warnings };
+    case "catalog":
+      return {
+        block: {
+          ...block,
+          text: renderOptional(block.text),
+          sections: block.sections?.map((section) => ({ ...section, title: render(section.title) })),
+        },
+        warnings,
+      };
   }
 }

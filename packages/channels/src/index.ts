@@ -8,7 +8,7 @@ export {
 export {
   richBlockSchema, richButtonSchema, richButtonsBlockSchema, richListBlockSchema,
   richCarouselBlockSchema, richProductBlockSchema, richCatalogBlockSchema,
-  richBlockText, richToPlainText,
+  richBlockText, richToPlainText, interpolateRichBlock,
   type RichBlock, type RichButton, type RichWarning,
 } from "./rich";
 export {
