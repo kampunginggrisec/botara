@@ -78,8 +78,10 @@ mount; the app strips it in the trial nginx layout):
       `https://dev.botara.my.id/api/webhooks/threads`
 - [ ] **[OWNER]** **Data deletion callback (REQUIRED for approval)**:
       `https://dev.botara.my.id/api/webhooks/meta/data-deletion`
-      — implemented: verifies the `signed_request` HMAC with
-      `META_APP_SECRET`, returns `{ url, confirmation_code }`; status
+      — implemented: verifies the `signed_request` HMAC against the
+      sending app's secret (`META_APP_SECRET` / `INSTAGRAM_APP_SECRET` /
+      `THREADS_APP_SECRET`), returns `{ url, confirmation_code }`;
+      register this same URL in all three app consoles. Status
       page pattern: `https://dev.botara.my.id/api/data-deletion/status/<code>`.
       Also fill the "Data deletion instructions URL" field with
       `https://dev.botara.my.id/privacy` (section 4).

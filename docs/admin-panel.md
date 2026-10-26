@@ -71,12 +71,13 @@ DB setting  →  environment variable  →  unset
   derived from the keys that are effectively set, the callback/webhook
   URLs to paste into that provider's console (from
   `GET /admin/connection-info`), and the group's credential fields.
-  Two honest exceptions: there is no Instagram- or Threads-specific
-  data-deletion URL — the only deletion handler verifies signed
-  requests with the Meta app secret — so those cards show a note
-  instead of a URL. Telegram and Resend webhooks live in a slim "Other
-  endpoints" card; the Telegram, Storage, Email and AI groups keep the
-  plain group-card form below.
+  All three Meta-family cards (Meta, Instagram, Threads) show the SAME
+  data-deletion URL: Botara's single deletion endpoint verifies signed
+  requests against all three app secrets (Meta, Instagram, Threads —
+  each per-app secret falling back to the Meta app secret), so one URL
+  is registered in all three app consoles. Telegram and Resend webhooks
+  live in a slim "Other endpoints" card; the Telegram, Storage, Email
+  and AI groups keep the plain group-card form below.
 - Saving in the panel applies to the API process immediately; the API and
   worker processes also re-read the database every ~60 seconds, so an
   edit propagates to every service within about a minute. Clearing a

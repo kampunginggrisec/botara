@@ -51,7 +51,7 @@ Tabel induk — satu baris per permukaan Meta:
 | Messenger | `{PUBLIC_WEBHOOK_BASE_URL}/webhooks/messenger` | `META_VERIFY_TOKEN`, fallback `WHATSAPP_VERIFY_TOKEN` | `META_APP_SECRET` | `{PUBLIC_WEBHOOK_BASE_URL}/channels/messenger/oauth/callback` |
 | Instagram | `{PUBLIC_WEBHOOK_BASE_URL}/webhooks/instagram` | `META_VERIFY_TOKEN`, fallback `WHATSAPP_VERIFY_TOKEN` | `META_APP_SECRET` | `{PUBLIC_WEBHOOK_BASE_URL}/channels/instagram/oauth/callback` |
 | Threads | `{PUBLIC_WEBHOOK_BASE_URL}/webhooks/threads` | `THREADS_VERIFY_TOKEN`, fallback `META_VERIFY_TOKEN`, lalu `WHATSAPP_VERIFY_TOKEN` | `THREADS_APP_SECRET`, fallback `META_APP_SECRET` | `{PUBLIC_WEBHOOK_BASE_URL}/channels/threads/oauth/callback` |
-| Penghapusan data | `POST {PUBLIC_WEBHOOK_BASE_URL}/webhooks/meta/data-deletion` | — (memakai `signed_request`) | `META_APP_SECRET` (**wajib ada**) | — |
+| Penghapusan data | `POST {PUBLIC_WEBHOOK_BASE_URL}/webhooks/meta/data-deletion` | — (memakai `signed_request`) | `META_APP_SECRET`, `INSTAGRAM_APP_SECRET`, atau `THREADS_APP_SECRET` — endpoint menerima tanda tangan dari ketiga aplikasi (secret per-app fallback ke `META_APP_SECRET`; minimal satu **wajib ada**) | — |
 
 Dengan contoh trial, URL-nya menjadi:
 
@@ -413,11 +413,18 @@ mengimplementasikannya; tugas operator hanya mendaftarkan URL-nya:
 
 - **URL callback** (Settings → Basic → Data Deletion Request URL, app
   utama): `https://dev.botara.my.id/api/webhooks/meta/data-deletion`
+- **URL yang sama didaftarkan di ketiga aplikasi**: app Instagram Login
+  (developers.facebook.com → app Instagram Login → Settings →
+  Advanced) dan app Threads (developers.threads.net → Settings →
+  Advanced) memakai URL callback yang persis sama — satu endpoint
+  melayani Meta + Instagram Login + Threads.
 - Perilaku endpoint: menerima POST berisi `signed_request`, memverifikasi
-  HMAC-nya dengan `META_APP_SECRET` (tanpa secret ini endpoint menjawab
-  503 — isi secret-nya), mencatat permintaan, menghapus data kontak
-  pengguna provider terkait secara best-effort, dan membalas
-  `{ url, confirmation_code }`.
+  HMAC-nya terhadap secret aplikasi pengirim — `META_APP_SECRET`,
+  `INSTAGRAM_APP_SECRET`, atau `THREADS_APP_SECRET` (secret per-app
+  fallback ke `META_APP_SECRET`; bila tidak ada satu pun yang
+  terkonfigurasi endpoint menjawab 503 — isi secret-nya), mencatat
+  permintaan, menghapus data kontak pengguna provider terkait secara
+  best-effort, dan membalas `{ url, confirmation_code }`.
 - **Halaman status publik** untuk pengguna:
   `https://dev.botara.my.id/api/data-deletion/status/<confirmation_code>`
 - Di field **Data deletion instructions URL** pada formulir App Review,
@@ -548,9 +555,10 @@ bisa berinteraksi. Selesaikan App Review (bagian 10) lalu alihkan ke
 
 ### 12h. Callback penghapusan data gagal / 503
 
-`META_APP_SECRET` belum dikonfigurasi di deployment — endpoint
-penghapusan data menolak memproses `signed_request` tanpa secret. Isi
-dari Panel Admin → Settings → grup Meta.
+Belum ada app secret yang dikonfigurasi di deployment
+(`META_APP_SECRET` / `INSTAGRAM_APP_SECRET` / `THREADS_APP_SECRET`) —
+endpoint penghapusan data menolak memproses `signed_request` tanpa
+secret. Isi dari Panel Admin → Settings.
 
 ### 12i. Pesan masuk tidak tiba padahal webhook terverifikasi
 

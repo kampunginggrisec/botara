@@ -4277,17 +4277,25 @@ function AdminSettingsView() {
         return [
           cb("instagram", t("admin.platform.note.instagramCallback")),
           wh("instagram", `${t("admin.platform.note.instagramWebhook")} ${webhookNote("instagram")}`),
-          // No URL box: the shared Meta deletion endpoint verifies with
-          // the Meta app secret, so it cannot serve this app's requests.
-          { id: "del-instagram", label: boxLabel("deletion"), note: t("admin.platform.note.deletionInstagram") },
+          // Same shared deletion endpoint as the Meta card: it verifies
+          // signed requests from all three app secrets, so this app's
+          // console registers this very URL.
+          {
+            id: "del-instagram", label: boxLabel("deletion"), url: webhookById("meta-data-deletion")?.url,
+            note: t("admin.platform.note.deletionInstagram"),
+          },
         ];
       case "threads":
         return [
           cb("threads", t("admin.platform.callbackNote")),
           wh("threads", webhookNote("threads")),
-          // No URL box: Botara's only deletion handler verifies signed
-          // requests with META_APP_SECRET, never the Threads secret.
-          { id: "del-threads", label: boxLabel("deletion"), note: t("admin.platform.note.deletionThreads") },
+          // Same shared deletion endpoint as the Meta card: it verifies
+          // signed requests from all three app secrets, so this app's
+          // console registers this very URL.
+          {
+            id: "del-threads", label: boxLabel("deletion"), url: webhookById("meta-data-deletion")?.url,
+            note: t("admin.platform.note.deletionThreads"),
+          },
         ];
       case "tiktok":
         return [
