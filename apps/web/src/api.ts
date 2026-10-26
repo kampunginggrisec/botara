@@ -219,6 +219,15 @@ export interface Conversation {
   assignedUserId: string | null;
   assignee: ConversationAssignee | null;
   createdAt: string;
+  /** AI copilot (package #7): persisted analysis; null until analyzed. */
+  aiSummary?: string | null;
+  aiSummaryAt?: string | null;
+  /** Closed-set intent label (docs/ai-copilot.md). */
+  aiIntent?: string | null;
+  /** 0-100 confidence for aiIntent. */
+  aiIntentScore?: number | null;
+  /** Takeover stamp: non-null = automatic AI sends paused on this thread. */
+  aiPausedAt?: string | null;
 }
 
 /** One synced Meta catalog product (picker + summary reads). */
@@ -262,6 +271,12 @@ export interface Message {
   kind?: "message" | "note";
   /** Authoring member for human-written rows (notes); null otherwise. */
   authorUserId?: string | null;
+  /**
+   * Producer badge (package #7): "ai" for model-generated sends (flow
+   * ai_reply); "human" for everything a person - or an authored
+   * automation - sent. Absent on pre-0013 rows (= human).
+   */
+  authorKind?: "human" | "ai";
   author?: { userId: string; name: string | null; email: string | null } | null;
   type: string;
   body: string | null;
@@ -911,6 +926,24 @@ export const api = {
   /** AI reply suggestion for the composer (F4): fills the draft, never sends. 503 when no AI provider is configured. */
   aiSuggest(conversationId: string): Promise<{ suggestion: string; model: string; kbChunksUsed: number }> {
     return request(`/conversations/${conversationId}/ai-suggest`, { method: "POST", body: "{}" });
+  },
+  /**
+   * AI analysis (package #7): one model call -> persisted summary +
+   * intent on the conversation. 503 when no AI provider is configured,
+   * 502 when the model answered malformed JSON (nothing persisted).
+   */
+  aiAnalyze(conversationId: string): Promise<{
+    aiSummary: string; aiSummaryAt: string; aiIntent: string; aiIntentScore: number; model: string;
+  }> {
+    return request(`/conversations/${conversationId}/ai-analyze`, { method: "POST", body: "{}" });
+  },
+  /** Takeover (package #7): pause automatic AI sends on this thread. */
+  aiPause(conversationId: string): Promise<{ conversation: Conversation }> {
+    return request(`/conversations/${conversationId}/ai-pause`, { method: "POST", body: "{}" });
+  },
+  /** Takeover (package #7): resume automatic AI sends on this thread. */
+  aiResume(conversationId: string): Promise<{ conversation: Conversation }> {
+    return request(`/conversations/${conversationId}/ai-resume`, { method: "POST", body: "{}" });
   },
   /** Local flag-list moderation verdict for a draft (F9). */
   moderationCheck(text: string): Promise<{ flagged: boolean; matches: Array<{ term: string; index: number }> }> {

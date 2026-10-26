@@ -281,6 +281,8 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   // Composer assist (F4/F9): AI suggestion fills the draft; the
   // moderation check only reports a verdict - neither ever sends.
   const [aiBusy, setAiBusy] = useState(false);
+  // AI analysis (package #7): the header's Analyze/Refresh button.
+  const [aiAnalyzeBusy, setAiAnalyzeBusy] = useState(false);
   const [checkBusy, setCheckBusy] = useState(false);
 
   const showButtons = richKind === "buttons";
@@ -368,6 +370,43 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
       }
     } finally {
       setAiBusy(false);
+    }
+  };
+
+  const runAiAnalyze = async () => {
+    if (!selected) return;
+    setAiAnalyzeBusy(true);
+    try {
+      const res = await api.aiAnalyze(selected.id);
+      const patch = {
+        aiSummary: res.aiSummary, aiSummaryAt: res.aiSummaryAt,
+        aiIntent: res.aiIntent, aiIntentScore: res.aiIntentScore,
+      };
+      setSelected((prev) => (prev && prev.id === selected.id ? { ...prev, ...patch } : prev));
+      setConversations((prev) => prev.map((c) => (c.id === selected.id ? { ...c, ...patch } : c)));
+      pushToast("ok", t("inbox.aiAnalyzed"));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 503) {
+        pushToast("err", t("inbox.aiUnavailable"));
+      } else if (err instanceof ApiError && err.status === 502) {
+        pushToast("err", t("inbox.aiAnalysisInvalid"));
+      } else {
+        pushToast("err", errText(err, t("inbox.aiFailed")));
+      }
+    } finally {
+      setAiAnalyzeBusy(false);
+    }
+  };
+
+  // Takeover (package #7): pause/resume AUTOMATIC AI sends on the open
+  // thread. The API returns the fresh conversation row either way.
+  const setAiPaused = async (conv: Conversation, paused: boolean) => {
+    try {
+      const res = paused ? await api.aiPause(conv.id) : await api.aiResume(conv.id);
+      setConversations((prev) => prev.map((c) => (c.id === conv.id ? res.conversation : c)));
+      if (selectedRef.current?.id === conv.id) setSelected(res.conversation);
+    } catch (err) {
+      pushToast("err", errText(err, t("inbox.aiFailed")));
     }
   };
 
@@ -662,6 +701,59 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                   </label>
                 </div>
               </div>
+              {/* AI copilot strip (package #7): persisted analysis +
+                  takeover state for the open thread. */}
+              <div className="border-b border-slate-100 dark:border-slate-800 px-4 py-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="rounded-full bg-violet-100 px-2 py-0.5 text-[11px] font-semibold text-violet-700 dark:bg-violet-950 dark:text-violet-300">
+                    {t("inbox.aiBadge")}
+                  </span>
+                  {selected.aiIntent && (
+                    <span className={chipCls}>
+                      {selected.aiIntent}{selected.aiIntentScore != null ? ` · ${selected.aiIntentScore}` : ""}
+                    </span>
+                  )}
+                  <button
+                    onClick={() => void runAiAnalyze()}
+                    disabled={aiAnalyzeBusy}
+                    className="rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+                  >
+                    {aiAnalyzeBusy
+                      ? t("inbox.aiAnalyzing")
+                      : selected.aiSummary ? t("inbox.aiRefresh") : t("inbox.aiAnalyze")}
+                  </button>
+                  {selected.aiPausedAt ? (
+                    <>
+                      <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[11px] font-semibold text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                        {t("inbox.aiPaused")}
+                      </span>
+                      <button
+                        onClick={() => void setAiPaused(selected, false)}
+                        className="rounded-md border border-amber-400 px-2.5 py-1 text-xs font-medium text-amber-800 dark:border-amber-700 dark:text-amber-300"
+                      >
+                        {t("inbox.aiResume")}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {messages.some((m) => m.authorKind === "ai") && (
+                        <span className="text-[11px] text-slate-400 dark:text-slate-500">{t("inbox.aiActive")}</span>
+                      )}
+                      <button
+                        onClick={() => void setAiPaused(selected, true)}
+                        className="rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 dark:border-slate-700 dark:text-slate-200"
+                      >
+                        {t("inbox.aiPause")}
+                      </button>
+                    </>
+                  )}
+                </div>
+                {selected.aiSummary && (
+                  <p className="mt-1.5 text-xs leading-relaxed text-slate-600 dark:text-slate-300">
+                    <span className="font-semibold">{t("inbox.aiSummaryLabel")}:</span> {selected.aiSummary}
+                  </p>
+                )}
+              </div>
               <div className="flex-1 p-4 space-y-2 overflow-y-auto">
                 {messages.length === 0 && <div className="text-sm text-slate-400 dark:text-slate-500">{t("inbox.noMessages")}</div>}
                 {messages.map((m) => m.kind === "note" ? (
@@ -683,7 +775,14 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                         ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
                         : "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-100"}`}>
                         <div>{m.body ?? <em>({m.type})</em>}</div>
-                        <div className={`mt-1 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>{m.status}</div>
+                        <div className={`mt-1 flex items-center gap-1.5 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>
+                          {m.authorKind === "ai" && (
+                            <span className="rounded-full bg-violet-500/25 px-1.5 py-px font-semibold">
+                              {t("inbox.aiBadge")}
+                            </span>
+                          )}
+                          <span>{m.status}</span>
+                        </div>
                       </div>
                       <MessageMediaList message={m} />
                       {m.direction === "out" && <RichPayloadChips payload={m.payload} />}
