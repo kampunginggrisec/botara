@@ -51,7 +51,8 @@ not started; *Not planned* = deliberately out of scope for now.
 | Growth tools: conversation-starter links, ref links, QR codes | Claimed | **Implemented** | `growth_links` table + Growth page: public short link `/r/:slug` (click-counted 302 to wa.me / m.me?ref / t.me?start / ig.me), server-side QR SVG (`qrcode`), referral capture in the dispatcher (Messenger ref + postback referral, Telegram `/start <slug>`, WhatsApp ctwa under a documented single-link rule) → conversion counted once per contact, `growth:<slug>` tag, bound flow runs with priority over keyword matching |
 | Flow export/import (JSON) | Claimed (homepage FAQ: Cloud → self-hosted) | **Partial** | Flow graphs are JSON via the API (GET/PATCH), so export exists de facto; an import/export UI is planned |
 | Sequences / drip campaigns (+ auto-enrollment) | All plans | **Implemented** | Sequences API + worker scheduler + full UI (step editor, enroll-by-tag) |
-| Broadcasts (targeted, recurring, audience preview) | All plans | **Implemented** | WhatsApp template broadcasts with versioned rate-card estimates + cost ledger; per-delivered-message pricing per Meta's current model |
+| Message & system variables (`{{contact.*}}`, `{{workspace.*}}`, `{{channel.*}}`, `{{vars.*}}`, `{{system.*}}`) | All plans | **Implemented** | One engine (`packages/shared` `interpolate`) rendering per recipient at send time on flows, sequences, broadcasts, and inbox replies; unknown variables render empty + warn, never leak raw; shared variable-insert picker in every builder — see `docs/variables.md` |
+| Broadcasts (targeted, recurring, audience preview) | All plans | **Implemented** | WhatsApp template broadcasts with versioned rate-card estimates + cost ledger; per-delivered-message pricing per Meta's current model; per-recipient template body parameters (`templateParams`, interpolated per recipient — see `docs/variables.md`) |
 
 ## AI
 

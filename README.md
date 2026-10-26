@@ -272,6 +272,14 @@ independently, clean-room — concepts only, no third-party code):
   `/start`, WhatsApp ctwa) that counts a conversion once per contact,
   tags the contact `growth:<slug>`, and runs a bound flow with priority
   over keyword matching. Growth page in the dashboard.
+- **Message & system variables (combined adoption #1):**
+  `{{contact.*}}` / `{{workspace.*}}` / `{{channel.*}}` / `{{vars.*}}` /
+  `{{system.*}}` interpolation from one shared engine
+  (`packages/shared`), rendered per recipient at send time on flow
+  messages, sequence steps, broadcast template parameters, and inbox
+  replies — plus a variable-insert picker in every builder. Unknown
+  variables render empty with a warning, never raw. See
+  `docs/variables.md`.
 
 All new web strings exist in both EN and ID dictionaries; the parity
 table in `docs/feature-parity.md` reflects the new status per item.
