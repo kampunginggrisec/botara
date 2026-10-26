@@ -3,7 +3,8 @@ import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
   type AdminUserItem, type AdminWorkspaceItem,
-  type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastSummary,
+  type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastRecipient,
+  type BroadcastRecipientCounts, type BroadcastSummary,
   type CatalogProduct, type CatalogSummary,
   type ChannelAccount, type ConnectionInfo, type Contact,
   type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
@@ -22,6 +23,7 @@ import { downloadFlowExport, parseFlowImport } from "./flows/flow-transfer";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
+import { RECIPIENT_STATUSES, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { SavedRepliesPicker } from "./saved-replies-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
@@ -51,6 +53,8 @@ const inputCls = "w-full rounded-md border border-slate-300 bg-white px-3 py-2 t
 const labelCls = "block text-xs font-medium text-slate-500 dark:text-slate-400 mb-1";
 const primaryBtn = "rounded-md bg-slate-900 text-white text-sm px-4 py-2 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900";
 const outlineBtn = "rounded-md border border-slate-900 text-slate-900 text-sm px-4 py-2 disabled:opacity-50 dark:border-slate-100 dark:text-slate-100";
+const chipBtn = "rounded-full border border-slate-300 px-2.5 py-0.5 text-xs text-slate-500 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-400 dark:hover:bg-slate-800";
+const chipBtnActive = "rounded-full border border-slate-900 bg-slate-900 px-2.5 py-0.5 text-xs text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-900";
 const chipCls = "text-xs px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300";
 const mutedCls = "text-sm text-slate-500 dark:text-slate-400";
 
@@ -1406,6 +1410,13 @@ function BroadcastPage() {
   const [broadcasts, setBroadcasts] = useState<BroadcastSummary[]>([]);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [detail, setDetail] = useState<BroadcastDetail | null>(null);
+  // Per-recipient delivery records (package #4): rows for the open
+  // detail, per-status counts for the WHOLE broadcast, active filter.
+  const [recipientRows, setRecipientRows] = useState<BroadcastRecipient[]>([]);
+  const [recipientCounts, setRecipientCounts] = useState<BroadcastRecipientCounts | null>(null);
+  const [recipientStatusFilter, setRecipientStatusFilter] = useState("");
+  const [recipientError, setRecipientError] = useState<string | null>(null);
+  const [resendBusy, setResendBusy] = useState(false);
   // Template manager (F6): register form + per-template category drafts.
   const [waAccounts, setWaAccounts] = useState<ChannelAccount[]>([]);
   const [tplAccountId, setTplAccountId] = useState("");
@@ -1438,16 +1449,45 @@ function BroadcastPage() {
   useEffect(() => {
     api.listChannelAccounts()
       .then((data) => setWaAccounts(data.accounts.filter((a) => a.channel === "whatsapp")))
-      .catch(() => { /* the register form degrades to the raw account-id field above */ });
+      .catch(() => { /* selectors degrade to empty lists */ });
   }, []);
+
+  const loadRecipients = useCallback(async (broadcastId: string, status: string) => {
+    try {
+      const page = await api.listBroadcastRecipients(broadcastId, status || undefined);
+      setRecipientRows(page.recipients);
+      setRecipientCounts(page.counts);
+      setRecipientError(null);
+    } catch (err) {
+      setRecipientError(errText(err, t("broadcast.historyLoadFailed")));
+    }
+  }, [t]);
 
   const openDetail = async (id: string) => {
     if (detail?.id === id) { setDetail(null); return; }
     try {
       const res = await api.getBroadcast(id);
       setDetail(res.broadcast);
+      setRecipientStatusFilter("");
+      void loadRecipients(id, "");
     } catch (err) {
       pushToast("err", errText(err, t("broadcast.historyLoadFailed")));
+    }
+  };
+
+  const resendFailed = async () => {
+    if (!detail || !recipientCounts || recipientCounts.failed === 0) return;
+    if (!window.confirm(t("broadcast.resendConfirm", { count: recipientCounts.failed }))) return;
+    setResendBusy(true);
+    try {
+      const res = await api.resendBroadcastFailed(detail.id);
+      pushToast("ok", t("broadcast.resent", { count: res.resent }));
+      await loadRecipients(detail.id, recipientStatusFilter);
+      await loadBroadcasts();
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.resendError")));
+    } finally {
+      setResendBusy(false);
     }
   };
 
@@ -1546,7 +1586,12 @@ function BroadcastPage() {
         </div>
         <div>
           <label className={labelCls}>{t("broadcast.accountId")}</label>
-          <input value={channelAccountId} onChange={(e) => setChannelAccountId(e.target.value)} placeholder={t("broadcast.accountIdPlaceholder")} className={inputCls} />
+          <select value={channelAccountId} onChange={(e) => setChannelAccountId(e.target.value)} className={inputCls}>
+            <option value="">{t("broadcast.accountPlaceholder")}</option>
+            {waAccounts.filter((a) => a.status === "connected").map((a) => (
+              <option key={a.id} value={a.id}>{a.displayName ?? a.externalId}</option>
+            ))}
+          </select>
         </div>
         <div>
           <label className={labelCls}>{t("broadcast.recipients")}</label>
@@ -1674,6 +1719,73 @@ function BroadcastPage() {
                 <div><dt className="text-slate-500 dark:text-slate-400">{t("templateParams.detailLabel")}</dt><dd>{detail.templateParams.join(" · ")}</dd></div>
               )}
             </dl>
+            <div className="mt-4 border-t border-slate-200 pt-3 dark:border-slate-700">
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-medium">{t("broadcast.recipientsTitle")}</div>
+                {recipientCounts && recipientCounts.failed > 0 && (
+                  <button onClick={() => void resendFailed()} disabled={resendBusy} className={outlineBtn}>
+                    {t("broadcast.resendFailed")} ({recipientCounts.failed})
+                  </button>
+                )}
+              </div>
+              {recipientError && <div className="mt-2"><ErrorBox error={recipientError} /></div>}
+              {recipientCounts && (
+                <div className="mt-2 flex flex-wrap gap-1.5">
+                  <button
+                    onClick={() => { setRecipientStatusFilter(""); void loadRecipients(detail.id, ""); }}
+                    className={recipientStatusFilter === "" ? chipBtnActive : chipBtn}
+                  >
+                    {t("broadcast.filterAll")} · {recipientCounts.total}
+                  </button>
+                  {RECIPIENT_STATUSES.map((status) => (
+                    <button
+                      key={status}
+                      onClick={() => { setRecipientStatusFilter(status); void loadRecipients(detail.id, status); }}
+                      className={recipientStatusFilter === status ? chipBtnActive : chipBtn}
+                    >
+                      {t(`broadcast.recipientStatus.${status}`)} · {recipientCounts[status]}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {recipientRows.length === 0 && !recipientError ? (
+                <div className="mt-2 text-xs text-slate-500 dark:text-slate-400">{t("broadcast.recipientsEmpty")}</div>
+              ) : (
+                <table className="mt-3 w-full text-xs">
+                  <thead className="text-left text-slate-500 dark:text-slate-400">
+                    <tr>
+                      <th className="py-1 font-medium">{t("broadcast.colContact")}</th>
+                      <th className="py-1 font-medium">{t("common.status")}</th>
+                      <th className="py-1 font-medium">{t("broadcast.colTimeline")}</th>
+                      <th className="py-1 font-medium">{t("broadcast.colError")}</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {recipientRows.map((row) => (
+                      <tr key={row.id} className="border-t border-slate-100 align-top dark:border-slate-800">
+                        <td className="py-1.5">
+                          <div>{row.contactDisplayName}</div>
+                          <div className="text-slate-400">{row.contactExternalId}</div>
+                        </td>
+                        <td className="py-1.5">
+                          <span className={`rounded-full px-2 py-0.5 text-[11px] ${recipientStatusTone(row.status)}`}>
+                            {t(`broadcast.recipientStatus.${row.status}` as I18nKey)}
+                          </span>
+                        </td>
+                        <td className="py-1.5">
+                          {recipientTimeline(row).map((stamp) => (
+                            <div key={stamp.status}>
+                              {t(`broadcast.recipientStatus.${stamp.status}`)}: {fmtDateTime(stamp.at)}
+                            </div>
+                          ))}
+                        </td>
+                        <td className="py-1.5 text-red-600 dark:text-red-400">{row.status === "failed" ? row.error ?? "" : ""}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
           </div>
         )}
       </div>

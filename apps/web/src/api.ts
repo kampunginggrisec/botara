@@ -359,6 +359,40 @@ export interface BroadcastDetail extends BroadcastSummary {
   costUnits: number;
 }
 
+/** Per-recipient broadcast delivery record (package #4). */
+export interface BroadcastRecipient {
+  id: string;
+  broadcastId: string;
+  workspaceId: string;
+  contactId: string;
+  status: string;
+  providerMessageId: string | null;
+  messageId: string | null;
+  error: string | null;
+  contactDisplayName: string;
+  contactExternalId: string;
+  contactChannel: string;
+  sentAt: string | null;
+  deliveredAt: string | null;
+  readAt: string | null;
+  repliedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BroadcastRecipientCounts {
+  pending: number; sent: number; delivered: number; read: number;
+  replied: number; failed: number; total: number;
+}
+
+export interface BroadcastRecipientsPage {
+  recipients: BroadcastRecipient[];
+  counts: BroadcastRecipientCounts;
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 /** One registered sending domain (Channels → Email, F2). */
 export interface WorkspaceDomain {
   id: string;
@@ -906,6 +940,15 @@ export const api = {
     costUnits: number;
   }> {
     return request(`/broadcasts/${id}`);
+  },
+  /** Per-recipient delivery records for one broadcast (package #4). */
+  listBroadcastRecipients(id: string, status?: string): Promise<BroadcastRecipientsPage> {
+    const qs = status ? "?status=" + encodeURIComponent(status) : "";
+    return request(`/broadcasts/${id}/recipients${qs}`);
+  },
+  /** Re-queue sends for the broadcast's failed recipients only (package #4). */
+  resendBroadcastFailed(id: string): Promise<{ resent: number }> {
+    return request(`/broadcasts/${id}/resend-failed`, { method: "POST" });
   },
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
     return request("/channels/accounts");

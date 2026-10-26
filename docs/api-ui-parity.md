@@ -33,7 +33,7 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 
 ## Parity table (post-fix state, 2026-10-26)
 
-120 routes: 93 UI · 18 WEBHOOK · 9 API-ONLY.
+122 routes: 95 UI · 18 WEBHOOK · 9 API-ONLY.
 
 ### Auth & session
 
@@ -131,6 +131,8 @@ Resend; the status shown is the stored verification state.
 | POST /broadcasts | UI | Broadcast → Create broadcast |
 | GET /broadcasts | UI | Broadcast history list (F5) — added by the parity fix; rows carry delivery counts + realized cost |
 | GET /broadcasts/{} | UI | Broadcast history → expandable detail (F5) |
+| GET /broadcasts/{}/recipients | UI | Broadcast detail → per-recipient delivery records with status filter + per-status counts (package #4) |
+| POST /broadcasts/{}/resend-failed | UI | Broadcast detail → "Resend to failed" re-queues only the failed recipients (package #4) |
 | GET /templates | UI | Broadcast form + template manager (F6); Inbox template replies |
 | POST /templates | UI | Broadcast → Template manager register form (F6). Fields match the API schema exactly: channelAccountId, name, language?, category?, externalId? |
 | PATCH /templates/{}/category | UI | Template manager → per-template category correction (F6) |
