@@ -116,7 +116,7 @@ Daftarkan URL berikut persis seperti ini:
 - **WhatsApp (Meta App → WhatsApp → Configuration → Webhook):**
   - Callback URL: `https://DOMAIN/api/webhooks/whatsapp`
   - Verify token: nilai `WHATSAPP_VERIFY_TOKEN` dari `.env.production`
-  - Langganan field: `messages` dan `message_template_category_update`
+  - Langganan field: `messages` dan `template_category_update`
 - **Telegram (Bot API setWebhook):**
   ```bash
   curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook" \

@@ -16,6 +16,10 @@ export const envSchema = z.object({
   META_GRAPH_VERSION: z.string().default("v26.0"),
   META_APP_ID: z.string().optional(),
   META_APP_SECRET: z.string().optional(),
+  /** WhatsApp Cloud API fallback token for accounts not yet in the vault. */
+  WHATSAPP_ACCESS_TOKEN: z.string().optional(),
+  /** Shared secret used only for Meta's WhatsApp webhook verification handshake. */
+  WHATSAPP_VERIFY_TOKEN: z.string().optional(),
   THREADS_APP_ID: z.string().optional(),
   THREADS_APP_SECRET: z.string().optional(),
 

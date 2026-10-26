@@ -97,6 +97,22 @@ describe("api app (no DB configured)", () => {
     expect(res.status).toBe(403);
   });
 
+  test("WhatsApp webhook refuses unsigned payloads in production", async () => {
+    const app = createApp(testDeps({ env: {
+      NODE_ENV: "production",
+      WHATSAPP_VERIFY_TOKEN: "verify-me",
+      SESSION_SECRET: "test-session-secret",
+    } }));
+    const res = await app.request("/webhooks/whatsapp", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ object: "whatsapp_business_account", entry: [] }),
+    });
+    expect(res.status).toBe(503);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("CONFIGURATION");
+  });
+
   test("Telegram webhook enforces the secret token when configured", async () => {
     const app = createApp(testDeps({ env: { TELEGRAM_WEBHOOK_SECRET: "s3cret" } }));
     const res = await app.request("/webhooks/telegram", {

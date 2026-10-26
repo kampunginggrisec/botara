@@ -205,7 +205,7 @@ export const templates = pgTable("templates", {
   latestCategory: varchar("latest_category", { length: 40 }),
   /**
    * WhatsApp messaging account (WABA) id that owns this template, learned
-   * from the message_template_category_update webhook (entry.id). Persisted
+   * from the template_category_update webhook (entry.id). Persisted
    * by the Fase 2 webhook wiring whenever Meta reports a category change.
    */
   messagingAccountId: varchar("messaging_account_id", { length: 200 }),

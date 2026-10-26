@@ -13,6 +13,8 @@ domain produksi Anda di semua tempat — strukturnya tidak berubah.
 
 Dokumen pendamping:
 
+- `docs/whatsapp-saas-meta-dev.md` — runbook ringkas khusus operator SaaS:
+  model kepemilikan pelanggan, Embedded Signup, coexistence, dan go-live.
 - `docs/admin-panel.md` — cara kerja Panel Admin dan pengaturan platform.
 - `docs/app-review/` — paket App Review: justifikasi izin siap tempel
   (`permissions.md`), naskah screencast (`screencast-scripts.md`), dan
@@ -225,7 +227,7 @@ field berikut — field inilah yang diproses kode Botara:
 | Field | Dipakai untuk |
 |---|---|
 | `messages` | Pesan masuk, status kirim, dan echo dari nomor yang sama. **Wajib.** |
-| `message_template_category_update` | Perubahan kategori template diterapkan ke data template Botara. |
+| `template_category_update` | Perubahan kategori template diterapkan ke data template Botara. |
 | `smb_message_echoes` | Coexistence: pesan yang dikirim dari aplikasi WhatsApp Business tampil sebagai pesan keluar di inbox. |
 | `smb_app_state_sync` | Coexistence: sinkronisasi kontak dari aplikasi WhatsApp Business. |
 | `history` | Coexistence: backfill riwayat chat dengan timestamp asli. |
@@ -594,7 +596,7 @@ Konfigurasi dianggap selesai bila semua kotak tercentang:
 **Webhook (Verify and save berhasil untuk semuanya)**
 
 - [ ] WhatsApp: `.../api/webhooks/whatsapp` + field `messages`,
-      `message_template_category_update`, dan field coexistence
+      `template_category_update`, dan field coexistence
       (`smb_message_echoes`, `smb_app_state_sync`, `history`).
 - [ ] Messenger: `.../api/webhooks/messenger` + field Page `messages`,
       `messaging_postbacks`, `message_deliveries`.

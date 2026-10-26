@@ -202,6 +202,26 @@ describe("whatsapp webhook parsing", () => {
     });
   });
 
+  test("template_category_update uses the current Meta webhook field name", async () => {
+    const events = await wa.parseWebhook({
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "template_category_update",
+          value: {
+            message_template_id: 988, message_template_name: "invoice_due",
+            message_template_language: "id", previous_category: "MARKETING", new_category: "UTILITY",
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "template.category_changed", templateExternalId: "988",
+      previousCategory: "marketing", newCategory: "utility",
+    });
+  });
+
   test("coexistence smb_message_echoes -> message.echo", async () => {
     const events = await wa.parseWebhook({
       entry: [{

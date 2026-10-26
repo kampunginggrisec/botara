@@ -473,7 +473,11 @@ export class WhatsAppAdapter implements ChannelAdapter {
           value.metadata?.phone_number_id ?? (entry.id as string) ?? "";
         const field = change.field as string;
 
-        if (field === "message_template_category_update") {
+        // Meta currently exposes this subscription as
+        // `template_category_update`. Keep the former spelling as a
+        // compatibility alias for deliveries/subscriptions created before
+        // the rename.
+        if (field === "template_category_update" || field === "message_template_category_update") {
           events.push({
             type: "template.category_changed",
             channel: "whatsapp",

@@ -1457,6 +1457,15 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   app.post("/webhooks/whatsapp", async (c) => {
     const raw = await c.req.text();
     const appSecret = deps.env.META_APP_SECRET;
+    // Development fixtures may intentionally omit Meta credentials, but a
+    // production endpoint must never accept an unsigned provider payload.
+    if (!appSecret && deps.env.NODE_ENV === "production") {
+      throw new AppError(
+        "CONFIGURATION",
+        "META_APP_SECRET is required to authenticate WhatsApp webhooks in production.",
+        { status: 503 },
+      );
+    }
     if (appSecret) {
       const ok = verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret);
       if (!ok) throw new AppError("UNAUTHORIZED", "Invalid X-Hub-Signature-256.", { status: 401 });

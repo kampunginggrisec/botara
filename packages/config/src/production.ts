@@ -9,15 +9,33 @@
  */
 export const REQUIRED_PRODUCTION_ENV = ["DATABASE_URL", "SESSION_SECRET", "TOKEN_VAULT_KEY"] as const;
 
+/** A non-empty env value, used without disclosing its value in diagnostics. */
+function hasValue(env: Record<string, string | undefined>, name: string): boolean {
+  return (env[name] ?? "").trim() !== "";
+}
+
 /** Names of required production env vars that are absent or empty. */
 export function missingProductionEnv(
   env: Record<string, string | undefined>,
 ): string[] {
   if (env.NODE_ENV !== "production") return [];
-  return REQUIRED_PRODUCTION_ENV.filter((name) => {
-    const value = env[name];
-    return value === undefined || value.trim() === "";
-  });
+  const missing: string[] = REQUIRED_PRODUCTION_ENV.filter((name) => !hasValue(env, name));
+
+  // WhatsApp is optional for a deployment. Once an operator enables either
+  // its webhook or Embedded Signup, though, an unsigned webhook must never
+  // be accepted in production. Embedded Signup additionally needs an app id.
+  if (hasValue(env, "WHATSAPP_VERIFY_TOKEN") && !hasValue(env, "META_APP_SECRET")) {
+    missing.push("META_APP_SECRET (required when WHATSAPP_VERIFY_TOKEN is set)");
+  }
+  if (hasValue(env, "WHATSAPP_EMBEDDED_CONFIG_ID")) {
+    if (!hasValue(env, "META_APP_ID")) {
+      missing.push("META_APP_ID (required when WHATSAPP_EMBEDDED_CONFIG_ID is set)");
+    }
+    if (!hasValue(env, "META_APP_SECRET") && !missing.includes("META_APP_SECRET (required when WHATSAPP_VERIFY_TOKEN is set)")) {
+      missing.push("META_APP_SECRET (required when WHATSAPP_EMBEDDED_CONFIG_ID is set)");
+    }
+  }
+  return missing;
 }
 
 /**
