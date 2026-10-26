@@ -1,8 +1,8 @@
-import { and, asc, desc, eq, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
-  dataDeletionRequests, flows, growthLinks, kbChunks, kbDocuments, messages,
+  dataDeletionRequests, flows, flowWaits, growthLinks, kbChunks, kbDocuments, messages,
   platformSettings,
   processedComments,
   savedReplies,
@@ -1994,6 +1994,118 @@ export async function deleteFlow(db: Database, workspaceId: string, id: string):
   if (!existing) return false;
   await db.delete(flows).where(eq(flows.id, id));
   return true;
+}
+
+// ------------------------------------------------- flow waits (package #3)
+
+/** A collect_input wait row: a flow run paused for the contact's reply. */
+export type FlowWaitRow = typeof flowWaits.$inferSelect;
+
+export async function createFlowWait(
+  db: Database,
+  input: {
+    workspaceId: string;
+    conversationId: string;
+    contactId: string;
+    channelAccountId: string;
+    flowId: string;
+    nodeId: string;
+    variable: string;
+    saveToContactField?: string | null;
+    resumeState: Record<string, unknown>;
+    deadlineAt?: Date | null;
+  },
+): Promise<FlowWaitRow> {
+  const [row] = await db
+    .insert(flowWaits)
+    .values({
+      workspaceId: input.workspaceId,
+      conversationId: input.conversationId,
+      contactId: input.contactId,
+      channelAccountId: input.channelAccountId,
+      flowId: input.flowId,
+      nodeId: input.nodeId,
+      variable: input.variable,
+      saveToContactField: input.saveToContactField ?? null,
+      resumeState: input.resumeState,
+      deadlineAt: input.deadlineAt ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+/**
+ * Atomically claim the OLDEST wait on a conversation: a single
+ * delete ... returning statement, so when an inbound reply and the
+ * wait's timeout race, exactly one claimant gets the row and the
+ * other sees null (and no-ops). Returns null when nothing waits.
+ */
+export async function claimFlowWaitByConversation(
+  db: Database,
+  conversationId: string,
+): Promise<FlowWaitRow | null> {
+  const oldest = db
+    .select({ id: flowWaits.id })
+    .from(flowWaits)
+    .where(eq(flowWaits.conversationId, conversationId))
+    .orderBy(asc(flowWaits.createdAt))
+    .limit(1);
+  const [row] = await db.delete(flowWaits).where(inArray(flowWaits.id, oldest)).returning();
+  return row ?? null;
+}
+
+/** Atomically claim one wait by id (the timeout path). Same race rule. */
+export async function claimFlowWaitById(db: Database, id: string): Promise<FlowWaitRow | null> {
+  const [row] = await db.delete(flowWaits).where(eq(flowWaits.id, id)).returning();
+  return row ?? null;
+}
+
+/**
+ * Drop every wait on a conversation without resuming: used when the
+ * conversation resolves - a run waiting on a closed thread ends
+ * quietly rather than resuming into it later.
+ */
+export async function deleteFlowWaitsForConversation(db: Database, conversationId: string): Promise<void> {
+  await db.delete(flowWaits).where(eq(flowWaits.conversationId, conversationId));
+}
+
+/** Remove one tag from a contact if present (flow remove_tag step). */
+export async function removeContactTag(
+  db: Database,
+  workspaceId: string,
+  contactId: string,
+  tag: string,
+): Promise<boolean> {
+  const contact = await getContact(db, workspaceId, contactId);
+  if (!contact) return false;
+  const tags = (contact.tags as string[]) ?? [];
+  if (!tags.includes(tag)) return false;
+  await updateContact(db, workspaceId, contactId, { tags: tags.filter((t) => t !== tag) });
+  return true;
+}
+
+/**
+ * Cancel a contact's ACTIVE sequence enrollments (flow
+ * sequence_unsubscribe step): the rows are deleted, so a later
+ * re-subscribe starts a fresh enrollment (the unique index would
+ * otherwise block it). Without `sequenceId`, every active enrollment
+ * of the contact in the workspace is cancelled. Returns the count.
+ */
+export async function cancelActiveEnrollments(
+  db: Database,
+  input: { workspaceId: string; contactId: string; sequenceId?: string },
+): Promise<number> {
+  const conditions = [
+    eq(sequenceEnrollments.workspaceId, input.workspaceId),
+    eq(sequenceEnrollments.contactId, input.contactId),
+    eq(sequenceEnrollments.status, "active"),
+    ...(input.sequenceId ? [eq(sequenceEnrollments.sequenceId, input.sequenceId)] : []),
+  ];
+  const rows = await db
+    .delete(sequenceEnrollments)
+    .where(and(...conditions))
+    .returning({ id: sequenceEnrollments.id });
+  return rows.length;
 }
 
 // ------------------------------------------- inbound persistence (Fase 4)

@@ -448,6 +448,40 @@ export const flows = pgTable("flows", {
 }, (t) => [index("flows_ws_status_idx").on(t.workspaceId, t.status)]);
 
 /**
+ * Collect-input waits (adoption package #3). One row per flow run
+ * paused at a `collect_input` node: everything needed to resume the
+ * run - the executor's resume state snapshot plus the capture spec
+ * (which variable, which contact field). A wait is CLAIMED by deleting
+ * its row (single-statement delete ... returning): the inbound reply
+ * path (API dispatcher) and the timeout job (worker) race on the
+ * claim, exactly one wins, the loser no-ops. Resolving the
+ * conversation deletes its waits - a run waiting on a closed thread
+ * ends quietly instead of resuming into it.
+ */
+export const flowWaits = pgTable("flow_waits", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  conversationId: uuid("conversation_id").notNull().references(() => conversations.id),
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
+  flowId: uuid("flow_id").notNull().references(() => flows.id),
+  /** The collect_input node the run paused at (observability). */
+  nodeId: varchar("node_id", { length: 200 }).notNull(),
+  /** Run variable the answer lands in ({{vars.<variable>}}). */
+  variable: varchar("variable", { length: 120 }).notNull(),
+  /** Optional contact custom field that also persists the answer. */
+  saveToContactField: varchar("save_to_contact_field", { length: 200 }),
+  /** FlowState snapshot: status "waiting", currentNodeId past the collect node. */
+  resumeState: jsonb("resume_state").notNull(),
+  /** When the timeout resume fires; null = wait for a reply forever. */
+  deadlineAt: timestamp("deadline_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("flow_waits_conversation_idx").on(t.conversationId),
+  index("flow_waits_deadline_idx").on(t.deadlineAt),
+]);
+
+/**
  * Personal API tokens (adopted-features package). A token is shown ONCE at
  * creation; only its SHA-256 hash is stored. `prefix` is the non-secret
  * display fragment (e.g. "bta_AbCd1234") shown in Settings so users can

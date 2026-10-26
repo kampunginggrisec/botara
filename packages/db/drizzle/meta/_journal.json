@@ -64,6 +64,13 @@
       "when": 1793028201865,
       "tag": "0008_short_star_brand",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793029639637,
+      "tag": "0009_bright_peter_quill",
+      "breakpoints": true
     }
   ]
 }
