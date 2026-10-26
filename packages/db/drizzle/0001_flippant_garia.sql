@@ -1,0 +1,1 @@
+ALTER TABLE "conversations" ADD COLUMN "external_id" varchar(200);

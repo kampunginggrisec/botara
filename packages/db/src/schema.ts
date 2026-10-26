@@ -42,8 +42,8 @@ export const workspaceMembers = pgTable("workspace_members", {
 export const channelAccounts = pgTable("channel_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
-  channel: varchar("channel", { length: 40 }).notNull(), // whatsapp|instagram|messenger|threads|telegram|email
-  externalId: varchar("external_id", { length: 200 }).notNull(), // WABA/phone id, IG id, page id, threads user id...
+  channel: varchar("channel", { length: 40 }).notNull(), // whatsapp|instagram|messenger|threads|telegram|email|tiktok
+  externalId: varchar("external_id", { length: 200 }).notNull(), // WABA/phone id, IG id, page id, threads user id, TikTok open_id...
   displayName: varchar("display_name", { length: 200 }),
   authMode: varchar("auth_mode", { length: 60 }), // e.g. instagram: "instagram-login" | "facebook-login"
   apiVersion: varchar("api_version", { length: 20 }), // pinned provider API version, e.g. "v26.0"
@@ -72,6 +72,14 @@ export const conversations = pgTable("conversations", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
   channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
   contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  /**
+   * The provider's own conversation id, when the channel addresses sends
+   * by conversation rather than by contact (TikTok conversation_id).
+   * Learned from inbound events and backfilled by the dispatcher; null
+   * for contact-addressed channels and for conversations a comment opened
+   * before the customer ever sent a DM.
+   */
+  externalId: varchar("external_id", { length: 200 }),
   status: varchar("status", { length: 40 }).notNull().default("open"), // open|pending|resolved
   assignedUserId: uuid("assigned_user_id").references(() => users.id),
   /** Drives messaging-window enforcement (Meta 24h window, human-agent 7d). */

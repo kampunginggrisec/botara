@@ -686,7 +686,14 @@ export async function findOrCreateWebchatAccount(db: Database, workspaceId: stri
 
 export async function createConversation(
   db: Database,
-  input: { workspaceId: string; channelAccountId: string; contactId: string; status?: string },
+  input: {
+    workspaceId: string;
+    channelAccountId: string;
+    contactId: string;
+    status?: string;
+    /** Provider conversation id (TikTok) when the first event carries one. */
+    externalId?: string;
+  },
 ): Promise<ConversationRow> {
   const [row] = await db
     .insert(conversations)
@@ -695,9 +702,40 @@ export async function createConversation(
       channelAccountId: input.channelAccountId,
       contactId: input.contactId,
       status: input.status ?? "open",
+      ...(input.externalId ? { externalId: input.externalId } : {}),
     })
     .returning();
   return row!;
+}
+
+/**
+ * Backfill a conversation's provider id (TikTok conversation_id learned
+ * from a later inbound event). Only fills an EMPTY external_id - the
+ * first learned id wins, a conflicting later id never rewrites history.
+ */
+export async function updateConversationExternalId(
+  db: Database,
+  conversationId: string,
+  externalId: string,
+): Promise<void> {
+  await db
+    .update(conversations)
+    .set({ externalId })
+    .where(and(eq(conversations.id, conversationId), isNull(conversations.externalId)));
+}
+
+/** Find a conversation by its provider id within one channel account. */
+export async function findConversationByExternalId(
+  db: Database,
+  channelAccountId: string,
+  externalId: string,
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .select()
+    .from(conversations)
+    .where(and(eq(conversations.channelAccountId, channelAccountId), eq(conversations.externalId, externalId)))
+    .limit(1);
+  return row ?? null;
 }
 
 export async function getContactByExternal(
