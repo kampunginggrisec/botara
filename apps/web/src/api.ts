@@ -599,6 +599,8 @@ export interface AdminSettingView {
   label: string;
   hint?: string;
   isSet: boolean;
+  /** Resolved value for non-secret keys (input prefill); always null for secrets. */
+  value: string | null;
   source: "db" | "env" | null;
   updatedAt: string | null;
   updatedBy: string | null;

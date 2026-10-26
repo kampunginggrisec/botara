@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type SetStateAction } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
@@ -20,6 +20,10 @@ import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
+import {
+  buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
+  type PlatformCardGroup,
+} from "./admin-settings-model";
 
 type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
@@ -3563,9 +3567,9 @@ const ADMIN_TABS: Array<{ id: AdminTab; labelKey: Parameters<ReturnType<typeof u
   { id: "audit", labelKey: "admin.tab.audit" },
 ];
 
-/** Managed-setting groups, in panel display order (mirrors the API registry). */
-const ADMIN_SETTING_GROUPS = ["meta", "threads", "instagram", "tiktok", "telegram", "storage", "email", "ai"] as const;
-type AdminSettingGroup = (typeof ADMIN_SETTING_GROUPS)[number];
+/** Managed-setting groups are rendered by AdminSettingsView: meta /
+ * instagram / threads / tiktok as platform cards, the rest as plain
+ * group cards (both lists declared next to that view). */
 
 const adminGroupLabelKey = (group: string): "admin.group.meta" | "admin.group.threads" | "admin.group.instagram" | "admin.group.tiktok" | "admin.group.telegram" | "admin.group.storage" | "admin.group.email" | "admin.group.ai" => {
   switch (group) {
@@ -3587,76 +3591,188 @@ type I18nKey = Parameters<ReturnType<typeof useI18n>["t"]>[0];
 
 const adminGroupDescKey = (group: string): I18nKey => `admin.groupDesc.${group}` as I18nKey;
 
+/** The i18n translate function, passed to presentational admin components. */
+type AdminTranslate = ReturnType<typeof useI18n>["t"];
+
+/** One URL sub-box in a platform card; url absent = note-only box. */
+interface AdminUrlBoxSpec {
+  id: string;
+  label: string;
+  url?: string;
+  note: string;
+}
+
 /**
- * Connection reference (F11): every webhook callback + OAuth redirect URL
- * an operator must paste into a provider dashboard, from
- * GET /admin/connection-info. URLs are computed server-side from the
- * public base; verify-token rows name the settings KEY only.
+ * Inset URL panel (reference layout): a label, the URL in mono with a
+ * copy button, and a note saying where it is registered / where its
+ * verify token lives. Note-only boxes (no url) state honestly that
+ * Botara serves no such URL yet instead of inventing one.
  */
-function ConnectionReferenceCard() {
-  const { t } = useI18n();
-  const [info, setInfo] = useState<ConnectionInfo | null>(null);
-  const [failed, setFailed] = useState(false);
-
-  useEffect(() => {
-    let cancelled = false;
-    api.adminConnectionInfo()
-      .then((data) => { if (!cancelled) setInfo(data); })
-      .catch(() => { if (!cancelled) setFailed(true); });
-    return () => { cancelled = true; };
-  }, []);
-
-  const copyUrl = async (url: string) => {
-    try {
-      await navigator.clipboard.writeText(url);
-      pushToast("ok", t("admin.connection.copied"));
-    } catch {
-      pushToast("err", t("admin.connection.copyFailed"));
-    }
-  };
-
-  const row = (id: string, url: string, hint: string, extra?: string) => (
-    <div key={id} className="flex flex-wrap items-center gap-2 py-1.5">
-      <span className="w-36 shrink-0 text-xs font-medium text-slate-600 dark:text-slate-300">{id}</span>
-      <code className="min-w-0 flex-1 break-all rounded bg-slate-50 px-2 py-1 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">{url}</code>
-      <button
-        onClick={() => void copyUrl(url)}
-        className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
-      >
-        {t("admin.connection.copy")}
-      </button>
-      <span className="w-full text-[11px] text-slate-400 dark:text-slate-500">
-        {hint}
-        {extra ? ` ${extra}` : ""}
-      </span>
+function AdminUrlBox({ spec, onCopy, t }: { spec: AdminUrlBoxSpec; onCopy: (url: string) => void; t: AdminTranslate }) {
+  return (
+    <div className="rounded-md bg-slate-50 px-3 py-2.5 dark:bg-slate-800/60">
+      <div className="text-xs font-medium text-slate-600 dark:text-slate-300">{spec.label}</div>
+      {spec.url && (
+        <div className="mt-1 flex items-start gap-2">
+          <code className="min-w-0 flex-1 break-all font-mono text-[11px] text-slate-700 dark:text-slate-200">{spec.url}</code>
+          <button
+            type="button"
+            onClick={() => onCopy(spec.url as string)}
+            className="shrink-0 rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
+          >
+            {t("admin.connection.copy")}
+          </button>
+        </div>
+      )}
+      <p className="mt-1 text-[11px] leading-relaxed text-slate-400 dark:text-slate-500">{spec.note}</p>
     </div>
   );
+}
 
+/**
+ * Platform card (reference layout): header with monogram, name, an
+ * honest configured badge and subtitle; the card's URL sub-boxes from
+ * GET /admin/connection-info; then the group's credential fields and
+ * a per-card Save.
+ */
+function AdminPlatformCard({ title, monogram, configured, boxes, infoFailed, onCopy, onSave, saving, hasChanges, t, children }: {
+  title: string;
+  monogram: string;
+  configured: boolean;
+  boxes: AdminUrlBoxSpec[] | null;
+  infoFailed: boolean;
+  onCopy: (url: string) => void;
+  onSave: () => void;
+  saving: boolean;
+  hasChanges: boolean;
+  t: AdminTranslate;
+  children: ReactNode;
+}) {
+  const badgeCls = configured
+    ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300"
+    : "bg-slate-100 text-slate-500 dark:bg-slate-800 dark:text-slate-400";
   return (
     <div className={`mt-4 ${cardCls} p-4`}>
-      <div className="font-medium text-sm">{t("admin.connection.title")}</div>
-      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("admin.connection.subtitle")}</p>
+      <div className="flex items-center gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-100 text-xs font-semibold text-slate-600 dark:bg-slate-800 dark:text-slate-300">
+          {monogram}
+        </span>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">{title}</span>
+            <span className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${badgeCls}`}>
+              {t(configured ? "admin.platform.badge.configured" : "admin.platform.badge.notConfigured")}
+            </span>
+          </div>
+          <p className="text-xs text-slate-500 dark:text-slate-400">
+            {t(configured ? "admin.platform.subtitle.configured" : "admin.platform.subtitle.notConfigured")}
+          </p>
+        </div>
+      </div>
+      <div className="mt-3 space-y-2">
+        {infoFailed ? (
+          <ErrorBox error={t("admin.connection.loadFailed")} />
+        ) : boxes === null ? (
+          <p className={mutedCls}>{t("app.loading")}</p>
+        ) : (
+          boxes.map((spec) => <AdminUrlBox key={spec.id} spec={spec} onCopy={onCopy} t={t} />)
+        )}
+      </div>
+      <div className="mt-4 space-y-4">{children}</div>
+      <button type="button" onClick={onSave} disabled={saving || !hasChanges} className={`mt-4 ${primaryBtn}`}>
+        {saving ? t("common.saving") : t("common.save")}
+      </button>
+    </div>
+  );
+}
+
+/**
+ * One credential field: label + source chip, hint, the input (prefilled
+ * for non-secrets; empty with a masked "saved" placeholder for
+ * secrets), and - for panel-saved values only - the red "delete saved
+ * value (back to env)" text action. Env values are not panel-clearable.
+ */
+function AdminSettingField({ setting, value, onChange, onClear, clearing, sourceLabel, t }: {
+  setting: AdminSettingView;
+  value: string;
+  onChange: (value: string) => void;
+  onClear: () => void;
+  clearing: boolean;
+  sourceLabel: string;
+  t: AdminTranslate;
+}) {
+  return (
+    <div>
+      <div className="flex items-center justify-between gap-2">
+        <label className={labelCls} htmlFor={`admin-setting-${setting.key}`}>
+          {setting.label} <span className="font-mono normal-case">({setting.key})</span>
+        </label>
+        <span className={chipCls}>{sourceLabel}</span>
+      </div>
+      {setting.hint && <p className="mb-1 text-xs text-slate-500 dark:text-slate-400">{setting.hint}</p>}
+      <input
+        id={`admin-setting-${setting.key}`}
+        type={setting.secret ? "password" : "text"}
+        autoComplete="off"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={setting.secret && setting.isSet ? t("admin.settings.placeholderSavedMasked") : t("admin.settings.placeholderNotSet")}
+        className={inputCls}
+      />
+      {setting.source === "db" && (
+        <button
+          type="button"
+          onClick={onClear}
+          disabled={clearing}
+          className="mt-1 text-xs text-red-600 hover:underline disabled:opacity-50 dark:text-red-400"
+        >
+          {t("admin.settings.clearSaved")}
+        </button>
+      )}
+      {setting.updatedAt && (
+        <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+          {t("common.updated")}: {fmtDateTime(setting.updatedAt)}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Slim card for the webhook URLs that do not belong to a platform app
+ * card: Telegram (auto-configured at connect time) and Resend.
+ */
+function AdminOtherEndpointsCard({ info, failed, onCopy, t }: {
+  info: ConnectionInfo | null;
+  failed: boolean;
+  onCopy: (url: string) => void;
+  t: AdminTranslate;
+}) {
+  const rows = info ? info.webhooks.filter((w) => w.id === "telegram" || w.id === "resend") : [];
+  return (
+    <div className={`mt-4 ${cardCls} p-4`}>
+      <div className="font-medium text-sm">{t("admin.platform.otherEndpoints")}</div>
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("admin.platform.otherEndpointsNote")}</p>
       {failed && <div className="mt-3"><ErrorBox error={t("admin.connection.loadFailed")} /></div>}
       {info && (
         <div className="mt-2 divide-y divide-slate-100 dark:divide-slate-800">
-          <div className="pt-2">
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">{t("admin.connection.webhooks")}</div>
-            {info.webhooks.map((w) =>
-              row(
-                w.id,
-                w.url,
-                t(`admin.connection.hint.webhook.${w.id}` as I18nKey),
-                [
-                  w.verifyTokenKey ? t("admin.connection.verifyToken", { key: w.verifyTokenKey }) : "",
-                  w.autoConfigured ? t("admin.connection.autoConfigured") : "",
-                ].filter(Boolean).join(" ") || undefined,
-              ),
-            )}
-          </div>
-          <div className="pt-2">
-            <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">{t("admin.connection.oauth")}</div>
-            {info.oauthRedirects.map((o) => row(o.id, o.url, t("admin.connection.hint.oauth")))}
-          </div>
+          {rows.map((w) => (
+            <div key={w.id} className="flex flex-wrap items-center gap-2 py-1.5">
+              <span className="w-36 shrink-0 text-xs font-medium text-slate-600 dark:text-slate-300">{w.id}</span>
+              <code className="min-w-0 flex-1 break-all rounded bg-slate-50 px-2 py-1 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">{w.url}</code>
+              <button
+                type="button"
+                onClick={() => onCopy(w.url)}
+                className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
+              >
+                {t("admin.connection.copy")}
+              </button>
+              <span className="w-full text-[11px] text-slate-400 dark:text-slate-500">
+                {t(`admin.connection.hint.webhook.${w.id}` as I18nKey)}
+                {w.autoConfigured ? ` ${t("admin.connection.autoConfigured")}` : ""}
+              </span>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -4001,11 +4117,25 @@ function AdminBillingView() {
   );
 }
 
+/** Groups rendered as plain cards below the platform cards. */
+const ADMIN_PLAIN_GROUPS = ["telegram", "storage", "email", "ai"] as const;
+
+/** Platform cards, in display order, with their header monograms. */
+const ADMIN_PLATFORM_CARDS: Array<{ group: PlatformCardGroup; monogram: string }> = [
+  { group: "meta", monogram: "Me" },
+  { group: "instagram", monogram: "Ig" },
+  { group: "threads", monogram: "Th" },
+  { group: "tiktok", monogram: "Tt" },
+];
+
 function AdminSettingsView() {
   const { t } = useI18n();
   const [settings, setSettings] = useState<AdminSettingView[] | null>(null);
-  // Draft inputs keyed by setting key. Inputs ALWAYS start empty: an
-  // empty input means "keep the current value" and is never sent.
+  const [connInfo, setConnInfo] = useState<ConnectionInfo | null>(null);
+  const [connFailed, setConnFailed] = useState(false);
+  // Draft inputs keyed by setting key. A key ABSENT from this record is
+  // untouched: non-secret inputs show their current value, secrets stay
+  // empty. See admin-settings-model.ts for the draft semantics.
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -4023,6 +4153,23 @@ function AdminSettingsView() {
   }, [t]);
   useEffect(() => { void load(); }, [load]);
 
+  useEffect(() => {
+    let cancelled = false;
+    api.adminConnectionInfo()
+      .then((data) => { if (!cancelled) setConnInfo(data); })
+      .catch(() => { if (!cancelled) setConnFailed(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const copyUrl = useCallback(async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      pushToast("ok", t("admin.connection.copied"));
+    } catch {
+      pushToast("err", t("admin.connection.copyFailed"));
+    }
+  }, [t]);
+
   const sourceLabel = (setting: AdminSettingView): string =>
     setting.source === "db"
       ? t("admin.settings.sourcePanel")
@@ -4030,12 +4177,9 @@ function AdminSettingsView() {
         ? t("admin.settings.sourceEnv")
         : t("admin.settings.sourceNotSet");
 
-  const saveGroup = async (group: AdminSettingGroup) => {
+  const saveGroup = async (group: string) => {
     if (!settings) return;
-    const updates: AdminSettingUpdate[] = settings
-      .filter((s) => s.group === group)
-      .filter((s) => (drafts[s.key] ?? "").trim() !== "")
-      .map((s) => ({ key: s.key, value: drafts[s.key] ?? "" }));
+    const updates: AdminSettingUpdate[] = buildGroupUpdates(settings, group, drafts);
     if (updates.length === 0) return;
     setSavingGroup(group);
     setError(null);
@@ -4078,63 +4222,120 @@ function AdminSettingsView() {
     }
   };
 
+  const renderField = (setting: AdminSettingView) => (
+    <AdminSettingField
+      key={setting.key}
+      setting={setting}
+      value={inputValueFor(setting, drafts)}
+      onChange={(value) => setDrafts((prev) => ({ ...prev, [setting.key]: value }))}
+      onClear={() => void clearSetting(setting)}
+      clearing={clearingKey === setting.key}
+      sourceLabel={sourceLabel(setting)}
+      t={t}
+    />
+  );
+
+  // URL sub-boxes per platform card, from GET /admin/connection-info
+  // (null while it loads; each card shows its own failure state).
+  const webhookById = (id: string) => connInfo?.webhooks.find((w) => w.id === id);
+  const redirectById = (id: string) => connInfo?.oauthRedirects.find((o) => o.id === id);
+  const boxLabel = (kind: "callback" | "webhook" | "deletion", qualifier?: string): string => {
+    const baseKey = kind === "callback"
+      ? "admin.platform.box.callback"
+      : kind === "webhook"
+        ? "admin.platform.box.webhook"
+        : "admin.platform.box.dataDeletion";
+    return qualifier ? `${t(baseKey)} — ${qualifier}` : t(baseKey);
+  };
+  const webhookNote = (id: string): string => {
+    const w = webhookById(id);
+    const hint = t(`admin.connection.hint.webhook.${id}` as I18nKey);
+    return w?.verifyTokenKey ? `${hint} ${t("admin.connection.verifyToken", { key: w.verifyTokenKey })}` : hint;
+  };
+  const platformBoxes = (group: PlatformCardGroup): AdminUrlBoxSpec[] | null => {
+    if (!connInfo) return null;
+    const cb = (id: string, note: string, qualifier?: string): AdminUrlBoxSpec => ({
+      id: `cb-${id}`, label: boxLabel("callback", qualifier), url: redirectById(id)?.url, note,
+    });
+    const wh = (id: string, note: string, qualifier?: string): AdminUrlBoxSpec => ({
+      id: `wh-${id}`, label: boxLabel("webhook", qualifier), url: webhookById(id)?.url, note,
+    });
+    switch (group) {
+      case "meta":
+        return [
+          cb("messenger", t("admin.platform.callbackNote.meta"), "Messenger"),
+          cb("instagram", t("admin.platform.callbackNote.meta"), "Instagram"),
+          wh("whatsapp", webhookNote("whatsapp"), "WhatsApp"),
+          wh("messenger", webhookNote("messenger"), "Messenger"),
+          wh("instagram", webhookNote("instagram"), "Instagram"),
+          {
+            id: "del-meta", label: boxLabel("deletion"), url: webhookById("meta-data-deletion")?.url,
+            note: t("admin.connection.hint.webhook.meta-data-deletion"),
+          },
+        ];
+      case "instagram":
+        return [
+          cb("instagram", t("admin.platform.note.instagramCallback")),
+          wh("instagram", `${t("admin.platform.note.instagramWebhook")} ${webhookNote("instagram")}`),
+          // No URL box: the shared Meta deletion endpoint verifies with
+          // the Meta app secret, so it cannot serve this app's requests.
+          { id: "del-instagram", label: boxLabel("deletion"), note: t("admin.platform.note.deletionInstagram") },
+        ];
+      case "threads":
+        return [
+          cb("threads", t("admin.platform.callbackNote")),
+          wh("threads", webhookNote("threads")),
+          // No URL box: Botara's only deletion handler verifies signed
+          // requests with META_APP_SECRET, never the Threads secret.
+          { id: "del-threads", label: boxLabel("deletion"), note: t("admin.platform.note.deletionThreads") },
+        ];
+      case "tiktok":
+        return [
+          cb("tiktok", t("admin.platform.callbackNote")),
+          wh("tiktok", `${webhookNote("tiktok")} ${t("admin.platform.note.tiktokWebhook")}`),
+        ];
+    }
+  };
+
   return (
     <div className="max-w-4xl">
       <p className={mutedCls}>{t("admin.settings.propagationNote")}</p>
       <p className={`mt-1 ${mutedCls}`}>{t("admin.settings.overrideNote")}</p>
-      <ConnectionReferenceCard />
       {error && <div className="mt-4"><ErrorBox error={error} /></div>}
       {notice && <div className="mt-4"><NoticeBox>{notice}</NoticeBox></div>}
       {!settings && !error && <p className={`mt-4 ${mutedCls}`}>{t("app.loading")}</p>}
-      {settings && ADMIN_SETTING_GROUPS.map((group) => {
+      {settings && ADMIN_PLATFORM_CARDS.map(({ group, monogram }) => (
+        <AdminPlatformCard
+          key={group}
+          title={t(adminGroupLabelKey(group))}
+          monogram={monogram}
+          configured={platformConfigured(group, settings)}
+          boxes={connFailed ? [] : platformBoxes(group)}
+          infoFailed={connFailed}
+          onCopy={(url) => void copyUrl(url)}
+          onSave={() => void saveGroup(group)}
+          saving={savingGroup === group}
+          hasChanges={groupHasChanges(settings, group, drafts)}
+          t={t}
+        >
+          {settings.filter((s) => s.group === group).map(renderField)}
+        </AdminPlatformCard>
+      ))}
+      <AdminOtherEndpointsCard info={connInfo} failed={connFailed} onCopy={(url) => void copyUrl(url)} t={t} />
+      {settings && ADMIN_PLAIN_GROUPS.map((group) => {
         const groupSettings = settings.filter((s) => s.group === group);
         if (groupSettings.length === 0) return null;
-        const hasDrafts = groupSettings.some((s) => (drafts[s.key] ?? "").trim() !== "");
         return (
           <div key={group} className={`mt-4 ${cardCls} p-4 space-y-4`}>
             <div>
               <div className="font-medium text-sm">{t(adminGroupLabelKey(group))}</div>
               <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{t(adminGroupDescKey(group))}</p>
             </div>
-            {groupSettings.map((setting) => (
-              <div key={setting.key}>
-                <div className="flex items-center justify-between gap-2">
-                  <label className={labelCls} htmlFor={`admin-setting-${setting.key}`}>
-                    {setting.label} <span className="font-mono normal-case">({setting.key})</span>
-                  </label>
-                  <span className={chipCls}>{sourceLabel(setting)}</span>
-                </div>
-                {setting.hint && <p className="mb-1 text-xs text-slate-500 dark:text-slate-400">{setting.hint}</p>}
-                <div className="flex gap-2">
-                  <input
-                    id={`admin-setting-${setting.key}`}
-                    type={setting.secret ? "password" : "text"}
-                    autoComplete="off"
-                    value={drafts[setting.key] ?? ""}
-                    onChange={(e) => setDrafts((prev) => ({ ...prev, [setting.key]: e.target.value }))}
-                    placeholder={setting.isSet ? t("admin.settings.placeholderSet") : t("admin.settings.placeholderNotSet")}
-                    className={inputCls}
-                  />
-                  {setting.source === "db" && (
-                    <button
-                      onClick={() => void clearSetting(setting)}
-                      disabled={clearingKey === setting.key}
-                      className={`${outlineBtn} whitespace-nowrap`}
-                    >
-                      {t("admin.settings.clear")}
-                    </button>
-                  )}
-                </div>
-                {setting.updatedAt && (
-                  <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
-                    {t("common.updated")}: {fmtDateTime(setting.updatedAt)}
-                  </p>
-                )}
-              </div>
-            ))}
+            {groupSettings.map(renderField)}
             <button
+              type="button"
               onClick={() => void saveGroup(group)}
-              disabled={savingGroup === group || !hasDrafts}
+              disabled={savingGroup === group || !groupHasChanges(settings, group, drafts)}
               className={primaryBtn}
             >
               {savingGroup === group ? t("common.saving") : t("common.save")}

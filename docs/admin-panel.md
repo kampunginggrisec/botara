@@ -62,9 +62,21 @@ DB setting  →  environment variable  →  unset
 
 - Non-secret values are stored as plaintext rows; **secrets are stored
   AES-256-GCM-encrypted** with `TOKEN_VAULT_KEY` (the same scheme as the
-  channel token vault). The API never returns a secret value — the panel
-  shows only whether a value is set and where it came from
-  (Panel / Env / Not set).
+  channel token vault). The API never returns a secret value — for
+  secrets the panel shows only whether a value is set and where it came
+  from (Panel / Env / Not set). Non-secret values (app ids, config) ARE
+  returned, so their inputs are prefilled with the current value.
+- The Settings tab is laid out as **platform cards** (Meta, Instagram,
+  Threads, TikTok): each card carries an honest "Configured" badge
+  derived from the keys that are effectively set, the callback/webhook
+  URLs to paste into that provider's console (from
+  `GET /admin/connection-info`), and the group's credential fields.
+  Two honest exceptions: there is no Instagram- or Threads-specific
+  data-deletion URL — the only deletion handler verifies signed
+  requests with the Meta app secret — so those cards show a note
+  instead of a URL. Telegram and Resend webhooks live in a slim "Other
+  endpoints" card; the Telegram, Storage, Email and AI groups keep the
+  plain group-card form below.
 - Saving in the panel applies to the API process immediately; the API and
   worker processes also re-read the database every ~60 seconds, so an
   edit propagates to every service within about a minute. Clearing a
