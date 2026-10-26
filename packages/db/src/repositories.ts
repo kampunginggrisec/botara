@@ -5,6 +5,7 @@ import {
   dataDeletionRequests, flows, growthLinks, kbChunks, kbDocuments, messages,
   platformSettings,
   processedComments,
+  savedReplies,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
   users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
 } from "./schema";
@@ -235,6 +236,10 @@ export async function createMessage(
   input: {
     conversationId: string;
     direction: "in" | "out";
+    /** Timeline kind; "note" rows are internal-only and never sent. */
+    kind?: "message" | "note";
+    /** Authoring workspace user (internal notes); null for traffic. */
+    authorUserId?: string;
     type?: string;
     body?: string;
     /** Rich block (outbound sends) or { buttonPayload } (webchat clicks). */
@@ -258,6 +263,8 @@ export async function createMessage(
     .values({
       conversationId: input.conversationId,
       direction: input.direction,
+      kind: input.kind ?? "message",
+      authorUserId: input.authorUserId,
       type: input.type ?? "text",
       body: input.body,
       payload: input.payload ?? null,
@@ -313,6 +320,95 @@ export async function advanceConversationLastUserMessage(
         or(isNull(conversations.lastUserMessageAt), lt(conversations.lastUserMessageAt, at)),
       ),
     );
+}
+
+// ---------------------------------------------------------- saved replies
+
+export type SavedReplyRow = typeof savedReplies.$inferSelect;
+
+/** The workspace's shared quick-reply library, ordered by title. */
+export async function listSavedReplies(db: Database, workspaceId: string): Promise<SavedReplyRow[]> {
+  return db
+    .select()
+    .from(savedReplies)
+    .where(eq(savedReplies.workspaceId, workspaceId))
+    .orderBy(asc(savedReplies.title));
+}
+
+export async function getSavedReply(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<SavedReplyRow | null> {
+  const [row] = await db
+    .select()
+    .from(savedReplies)
+    .where(and(eq(savedReplies.id, id), eq(savedReplies.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Shortcut lookup (uniqueness pre-check; the partial unique index is the backstop). */
+export async function getSavedReplyByShortcut(
+  db: Database,
+  workspaceId: string,
+  shortcut: string,
+): Promise<SavedReplyRow | null> {
+  const [row] = await db
+    .select()
+    .from(savedReplies)
+    .where(and(eq(savedReplies.workspaceId, workspaceId), eq(savedReplies.shortcut, shortcut)))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function createSavedReply(
+  db: Database,
+  input: {
+    workspaceId: string;
+    title: string;
+    body: string;
+    shortcut?: string | null;
+    createdBy: string;
+  },
+): Promise<SavedReplyRow> {
+  const [row] = await db
+    .insert(savedReplies)
+    .values({
+      workspaceId: input.workspaceId,
+      title: input.title,
+      body: input.body,
+      shortcut: input.shortcut ?? null,
+      createdBy: input.createdBy,
+    })
+    .returning();
+  return row!;
+}
+
+/**
+ * Partial update; returns null when the row is not in the workspace.
+ * Only the keys present in `patch` are written (shortcut: null clears it).
+ */
+export async function updateSavedReply(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: { title?: string; body?: string; shortcut?: string | null },
+): Promise<SavedReplyRow | null> {
+  const [row] = await db
+    .update(savedReplies)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(and(eq(savedReplies.id, id), eq(savedReplies.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
+}
+
+/** Hard delete (workspace-scoped); false when the row is not the workspace's. */
+export async function deleteSavedReply(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getSavedReply(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(savedReplies).where(eq(savedReplies.id, id));
+  return true;
 }
 
 // --------------------------------------------------------------- templates
