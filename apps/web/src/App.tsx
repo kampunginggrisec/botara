@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type SetStateAction } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
@@ -1308,12 +1308,87 @@ function BroadcastPage() {
   const [created, setCreated] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Broadcast history (F5): list + expandable detail from GET /broadcasts.
+  const [broadcasts, setBroadcasts] = useState<BroadcastSummary[]>([]);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [detail, setDetail] = useState<BroadcastDetail | null>(null);
+  // Template manager (F6): register form + per-template category drafts.
+  const [waAccounts, setWaAccounts] = useState<ChannelAccount[]>([]);
+  const [tplAccountId, setTplAccountId] = useState("");
+  const [tplName, setTplName] = useState("");
+  const [tplLanguage, setTplLanguage] = useState("id");
+  const [tplCategory, setTplCategory] = useState("marketing");
+  const [tplExternalId, setTplExternalId] = useState("");
+  const [tplBusy, setTplBusy] = useState(false);
+  const [categoryDrafts, setCategoryDrafts] = useState<Record<string, string>>({});
 
-  useEffect(() => {
-    api.listTemplates()
-      .then((data) => setTemplates(data.templates))
-      .catch(() => { /* template list is optional for the estimate flow */ });
+  const loadTemplates = useCallback(async () => {
+    try {
+      const data = await api.listTemplates();
+      setTemplates(data.templates);
+    } catch { /* template list is optional for the estimate flow */ }
   }, []);
+
+  const loadBroadcasts = useCallback(async () => {
+    try {
+      const data = await api.listBroadcasts();
+      setBroadcasts(data.broadcasts);
+      setHistoryError(null);
+    } catch (err) {
+      setHistoryError(errText(err, t("broadcast.historyLoadFailed")));
+    }
+  }, [t]);
+
+  useEffect(() => { void loadTemplates(); }, [loadTemplates]);
+  useEffect(() => { void loadBroadcasts(); }, [loadBroadcasts]);
+  useEffect(() => {
+    api.listChannelAccounts()
+      .then((data) => setWaAccounts(data.accounts.filter((a) => a.channel === "whatsapp")))
+      .catch(() => { /* the register form degrades to the raw account-id field above */ });
+  }, []);
+
+  const openDetail = async (id: string) => {
+    if (detail?.id === id) { setDetail(null); return; }
+    try {
+      const res = await api.getBroadcast(id);
+      setDetail(res.broadcast);
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.historyLoadFailed")));
+    }
+  };
+
+  const registerTemplate = async () => {
+    setTplBusy(true);
+    try {
+      const accountId = tplAccountId || channelAccountId;
+      const res = await api.createTemplate({
+        channelAccountId: accountId,
+        name: tplName.trim(),
+        language: tplLanguage.trim() || undefined,
+        category: tplCategory,
+        ...(tplExternalId.trim() ? { externalId: tplExternalId.trim() } : {}),
+      });
+      setTemplates((prev) => [...prev, res.template]);
+      setTplName("");
+      setTplExternalId("");
+      pushToast("ok", t("broadcast.templateRegistered"));
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.templateRegisterFailed")));
+    } finally {
+      setTplBusy(false);
+    }
+  };
+
+  const correctCategory = async (tpl: Template) => {
+    const latestCategory = categoryDrafts[tpl.id] ?? tpl.latestCategory ?? tpl.category ?? "marketing";
+    try {
+      const res = await api.updateTemplateCategory(tpl.id, latestCategory);
+      setTemplates((prev) => prev.map((x) => (x.id === tpl.id ? res.template : x)));
+      pushToast("ok", t("broadcast.templateCategoryUpdated"));
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.templateCategoryFailed")));
+    }
+  };
 
   const selectedTemplate = templates.find((tpl) => tpl.id === templateId);
   const category = (selectedTemplate?.latestCategory ?? selectedTemplate?.category ?? "marketing").toLowerCase();
@@ -1346,6 +1421,7 @@ function BroadcastPage() {
         recipientCount: recipients,
       });
       setCreated(t("broadcast.created", { id: data.broadcast.id, status: data.broadcast.status }));
+      void loadBroadcasts();
     } catch (err) {
       setError(errText(err, t("broadcast.createFailed")));
     } finally {
@@ -1416,11 +1492,142 @@ function BroadcastPage() {
           <div className="mt-3 text-sm font-semibold">{t("broadcast.total")}: ${estimate.totalUsd.toFixed(4)}</div>
         </div>
       )}
+      <div className={`mt-8 max-w-3xl ${cardCls} p-4`}>
+        <div className="font-medium text-sm">{t("broadcast.historyTitle")}</div>
+        {historyError && <div className="mt-3"><ErrorBox error={historyError} /></div>}
+        {broadcasts.length === 0 && !historyError ? (
+          <div className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t("broadcast.historyEmpty")}</div>
+        ) : (
+          <table className="mt-3 w-full text-sm">
+            <thead className="text-left text-slate-500 dark:text-slate-400">
+              <tr>
+                <th className="py-1 font-medium">{t("broadcast.colName")}</th>
+                <th className="py-1 font-medium">{t("common.status")}</th>
+                <th className="py-1 font-medium">{t("broadcast.colDelivery")}</th>
+                <th className="py-1 font-medium">{t("broadcast.colCost")}</th>
+                <th className="py-1 font-medium">{t("broadcast.colCreated")}</th>
+              </tr>
+            </thead>
+            <tbody>
+              {broadcasts.map((b) => (
+                <tr
+                  key={b.id}
+                  onClick={() => void openDetail(b.id)}
+                  className="cursor-pointer border-t border-slate-100 hover:bg-slate-50 dark:border-slate-800 dark:hover:bg-slate-800/60"
+                >
+                  <td className="py-1.5">{b.name ?? t("broadcast.unnamed")}</td>
+                  <td className="py-1.5">{b.status}</td>
+                  <td className="py-1.5">{b.sentCount}/{b.recipientCount}{b.failedCount > 0 ? ` · ${b.failedCount} ${t("broadcast.failedLabel").toLowerCase()}` : ""}</td>
+                  <td className="py-1.5">${(b.totalCostUsd > 0 ? b.totalCostUsd : b.estimatedCostUsd).toFixed(4)}</td>
+                  <td className="py-1.5">{fmtDateTime(b.createdAt)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {detail && (
+          <div className="mt-3 rounded-md border border-slate-200 p-3 text-sm dark:border-slate-700">
+            <div className="font-medium">{detail.name ?? t("broadcast.unnamed")} · {detail.status}</div>
+            <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs sm:grid-cols-3">
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.recipientsLabel")}</dt><dd>{detail.recipientCount}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.sentLabel")}</dt><dd>{detail.sentCount}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.failedLabel")}</dt><dd>{detail.failedCount}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.estimatedCost")}</dt><dd>${detail.estimatedCostUsd.toFixed(4)}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.actualCost")}</dt><dd>${detail.totalCostUsd.toFixed(4)}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.costEntries")}</dt><dd>{detail.costEntries} · {detail.costUnits} units</dd></div>
+              {detail.tag && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.tagLabel")}</dt><dd>{detail.tag}</dd></div>}
+              {detail.country && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.colCountry")}</dt><dd>{detail.country}</dd></div>}
+            </dl>
+          </div>
+        )}
+      </div>
+      <div className={`mt-6 max-w-3xl ${cardCls} p-4`}>
+        <div className="font-medium text-sm">{t("broadcast.templatesTitle")}</div>
+        <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("broadcast.templatesHint")}</p>
+        {templates.length === 0 ? (
+          <div className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t("broadcast.templatesEmpty")}</div>
+        ) : (
+          <div className="mt-3 space-y-2">
+            {templates.map((tpl) => (
+              <div key={tpl.id} className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
+                <span className="font-medium">{tpl.name}</span>
+                <span className={chipCls}>{tpl.language}</span>
+                <span className={chipCls}>{tpl.latestCategory ?? tpl.category ?? "-"}</span>
+                <span className={chipCls}>{tpl.status}</span>
+                <span className="ml-auto flex items-center gap-2">
+                  <label className="text-xs text-slate-500 dark:text-slate-400">{t("broadcast.correctCategory")}</label>
+                  <select
+                    value={categoryDrafts[tpl.id] ?? tpl.latestCategory ?? tpl.category ?? "marketing"}
+                    onChange={(e) => setCategoryDrafts((prev) => ({ ...prev, [tpl.id]: e.target.value }))}
+                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  >
+                    <option value="marketing">marketing</option>
+                    <option value="utility">utility</option>
+                    <option value="authentication">authentication</option>
+                  </select>
+                  <button onClick={() => void correctCategory(tpl)} className="text-xs text-slate-600 underline dark:text-slate-300">
+                    {t("common.save")}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <label className={labelCls}>{t("broadcast.templateAccount")}</label>
+            {waAccounts.length > 0 ? (
+              <select value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} className={inputCls}>
+                <option value="">-</option>
+                {waAccounts.map((a) => (
+                  <option key={a.id} value={a.id}>{a.displayName ?? a.externalId}</option>
+                ))}
+              </select>
+            ) : (
+              <input value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} placeholder={t("broadcast.accountIdPlaceholder")} className={inputCls} />
+            )}
+          </div>
+          <div>
+            <label className={labelCls}>{t("broadcast.templateName")}</label>
+            <input value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder={t("broadcast.templateNamePlaceholder")} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("broadcast.templateLanguage")}</label>
+            <input value={tplLanguage} onChange={(e) => setTplLanguage(e.target.value)} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("broadcast.templateCategory")}</label>
+            <select value={tplCategory} onChange={(e) => setTplCategory(e.target.value)} className={inputCls}>
+              <option value="marketing">marketing</option>
+              <option value="utility">utility</option>
+              <option value="authentication">authentication</option>
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>{t("broadcast.templateExternalId")}</label>
+            <input value={tplExternalId} onChange={(e) => setTplExternalId(e.target.value)} className={inputCls} />
+          </div>
+        </div>
+        <button
+          onClick={() => void registerTemplate()}
+          disabled={tplBusy || !tplName.trim() || !(tplAccountId || channelAccountId)}
+          className={`mt-3 ${primaryBtn}`}
+        >
+          {t("broadcast.registerTemplate")}
+        </button>
+      </div>
     </div>
   );
 }
 
 // ----------------------------------------------------------------- Publish
+
+/** ISO instant -> the `datetime-local` input value in local time. */
+const toLocalInputValue = (iso: string): string => {
+  const d = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
 
 function PublishPage() {
   const { t } = useI18n();
@@ -1433,6 +1640,16 @@ function PublishPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Telegram publish destinations (item H): per selected telegram
+  // account, the channel chat the bot posts to (required by the API).
+  const [telegramTargets, setTelegramTargets] = useState<Record<string, string>>({});
+  // Edit flow (F10): a prefilled copy of the create form for one post.
+  const [editingPost, setEditingPost] = useState<ScheduledPost | null>(null);
+  const [editText, setEditText] = useState("");
+  const [editMediaUrl, setEditMediaUrl] = useState("");
+  const [editScheduledAt, setEditScheduledAt] = useState("");
+  const [editSelected, setEditSelected] = useState<Set<string>>(new Set());
+  const [editTelegramTargets, setEditTelegramTargets] = useState<Record<string, string>>({});
 
   const load = useCallback(async () => {
     try {
@@ -1453,15 +1670,71 @@ function PublishPage() {
     return acc ? `${acc.channel} · ${acc.displayName ?? acc.externalId}` : id;
   };
 
-  const toggle = (id: string) => {
-    setSelected((prev) => {
+  const toggleIn = (setter: Dispatch<SetStateAction<Set<string>>>) => (id: string) => {
+    setter((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   };
+  const toggle = toggleIn(setSelected);
+  const toggleEdit = toggleIn(setEditSelected);
+
+  /**
+   * Build API targets from a selection: telegram accounts additionally
+   * carry their channel-chat destination (item H). Returns null when a
+   * selected telegram target has no destination yet.
+   */
+  const buildTargets = (
+    ids: Set<string>,
+    destinations: Record<string, string>,
+  ): Array<{ channelAccountId: string; targetExternalId?: string }> | null => {
+    const targets: Array<{ channelAccountId: string; targetExternalId?: string }> = [];
+    for (const id of ids) {
+      const acc = accounts.find((a) => a.id === id);
+      if (acc?.channel === "telegram") {
+        const dest = (destinations[id] ?? "").trim();
+        if (!dest) return null;
+        targets.push({ channelAccountId: id, targetExternalId: dest });
+      } else {
+        targets.push({ channelAccountId: id });
+      }
+    }
+    return targets;
+  };
+
+  /** One destination input per selected telegram account (item H). */
+  const telegramInputs = (
+    ids: Set<string>,
+    values: Record<string, string>,
+    setValues: Dispatch<SetStateAction<Record<string, string>>>,
+  ) => {
+    const telegramIds = [...ids].filter((id) => accounts.find((a) => a.id === id)?.channel === "telegram");
+    if (telegramIds.length === 0) return null;
+    return (
+      <div className="space-y-3">
+        {telegramIds.map((id) => (
+          <div key={id}>
+            <label className={labelCls}>{t("publish.telegramTargetLabel")} · {accountLabel(id)}</label>
+            <input
+              value={values[id] ?? ""}
+              onChange={(e) => setValues((prev) => ({ ...prev, [id]: e.target.value }))}
+              placeholder="@yourchannel or -1001234567890"
+              className={inputCls}
+            />
+            <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">{t("publish.telegramTargetHelp")}</p>
+          </div>
+        ))}
+      </div>
+    );
+  };
 
   const create = async () => {
+    const targets = buildTargets(selected, telegramTargets);
+    if (!targets) {
+      setError(t("publish.telegramTargetRequired"));
+      return;
+    }
     setBusy(true);
     setError(null);
     setNotice(null);
@@ -1469,16 +1742,55 @@ function PublishPage() {
       await api.createPost({
         text: text.trim() || undefined,
         mediaUrls: mediaUrl.trim() ? [mediaUrl.trim()] : undefined,
-        targets: [...selected].map((channelAccountId) => ({ channelAccountId })),
+        targets,
         scheduledAt: scheduledAt ? new Date(scheduledAt).toISOString() : undefined,
       });
       setText("");
       setMediaUrl("");
+      setTelegramTargets({});
       setNotice(scheduledAt ? t("publish.scheduledNotice") : t("publish.draftNotice"));
       setScheduledAt("");
       await load();
     } catch (err) {
       setError(errText(err, t("publish.createFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const startEdit = (post: ScheduledPost) => {
+    setEditingPost(post);
+    setEditText(post.text ?? "");
+    setEditMediaUrl(post.mediaUrls[0] ?? "");
+    setEditScheduledAt(post.scheduledAt ? toLocalInputValue(post.scheduledAt) : "");
+    setEditSelected(new Set(post.targets.map((tg) => tg.channelAccountId)));
+    setEditTelegramTargets(Object.fromEntries(
+      post.targets.filter((tg) => tg.targetExternalId).map((tg) => [tg.channelAccountId, tg.targetExternalId!]),
+    ));
+    setError(null);
+  };
+
+  const saveEdit = async () => {
+    if (!editingPost) return;
+    const targets = buildTargets(editSelected, editTelegramTargets);
+    if (!targets) {
+      setError(t("publish.telegramTargetRequired"));
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.updatePost(editingPost.id, {
+        text: editText,
+        mediaUrls: editMediaUrl.trim() ? [editMediaUrl.trim()] : [],
+        targets,
+        scheduledAt: editScheduledAt ? new Date(editScheduledAt).toISOString() : null,
+      });
+      pushToast("ok", t("publish.updated"));
+      setEditingPost(null);
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("publish.updateFailed")));
     } finally {
       setBusy(false);
     }
@@ -1542,6 +1854,7 @@ function PublishPage() {
             </div>
           )}
         </div>
+        {telegramInputs(selected, telegramTargets, setTelegramTargets)}
         <div className="max-w-xs">
           <label className={labelCls}>{t("publish.schedule")}</label>
           <input type="datetime-local" value={scheduledAt} onChange={(e) => setScheduledAt(e.target.value)} className={inputCls} />
@@ -1550,6 +1863,46 @@ function PublishPage() {
           {scheduledAt ? t("publish.scheduleButton") : t("publish.draftButton")}
         </button>
       </div>
+
+      {editingPost && (
+        <div className={`mt-6 max-w-3xl ${cardCls} p-4 space-y-4`}>
+          <div className="font-medium text-sm">{t("publish.editTitle")}</div>
+          <div>
+            <label className={labelCls}>{t("publish.content")}</label>
+            <textarea value={editText} onChange={(e) => setEditText(e.target.value)} rows={3} placeholder={t("publish.contentPlaceholder")} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("publish.mediaUrl")}</label>
+            <input value={editMediaUrl} onChange={(e) => setEditMediaUrl(e.target.value)} placeholder="https://media.example.com/photo.jpg" className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("publish.targets")}</label>
+            <div className="flex flex-wrap gap-2">
+              {publishable.map((acc) => (
+                <label key={acc.id} className={`flex items-center gap-2 rounded-full border px-3 py-1.5 text-sm cursor-pointer ${editSelected.has(acc.id)
+                  ? "border-slate-900 bg-slate-900 text-white dark:border-slate-100 dark:bg-slate-100 dark:text-slate-900"
+                  : "border-slate-300 bg-white dark:border-slate-700 dark:bg-slate-900"}`}>
+                  <input type="checkbox" checked={editSelected.has(acc.id)} onChange={() => toggleEdit(acc.id)} className="hidden" />
+                  {acc.channel} · {acc.displayName ?? acc.externalId}
+                </label>
+              ))}
+            </div>
+          </div>
+          {telegramInputs(editSelected, editTelegramTargets, setEditTelegramTargets)}
+          <div className="max-w-xs">
+            <label className={labelCls}>{t("publish.schedule")}</label>
+            <input type="datetime-local" value={editScheduledAt} onChange={(e) => setEditScheduledAt(e.target.value)} className={inputCls} />
+          </div>
+          <div className="flex gap-2">
+            <button onClick={() => void saveEdit()} disabled={busy || editSelected.size === 0} className={primaryBtn}>
+              {busy ? t("common.saving") : t("common.save")}
+            </button>
+            <button onClick={() => setEditingPost(null)} disabled={busy} className={outlineBtn}>
+              {t("common.cancel")}
+            </button>
+          </div>
+        </div>
+      )}
 
       <div className="mt-6 max-w-3xl space-y-3">
         <div className="font-medium text-sm">{t("publish.listTitle")}</div>
@@ -1576,6 +1929,7 @@ function PublishPage() {
                       ? "border-red-300 bg-red-50 text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-300"
                       : "border-slate-200 bg-slate-50 text-slate-600 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-300"}`}>
                     {accountLabel(target.channelAccountId)}
+                    {target.targetExternalId && ` → ${target.targetExternalId}`}
                     {result?.status === "sent" && ` ✓ ${result.externalPostId ?? ""}`}
                     {result?.status === "failed" && ` ✗ ${result.error ?? t("publish.failedShort")}`}
                     {!result && ` · ${t("publish.pending")}`}
@@ -1587,6 +1941,11 @@ function PublishPage() {
               {post.status !== "published" && post.status !== "cancelled" && (
                 <button onClick={() => void publishNow(post)} disabled={busy} className="rounded-md bg-slate-900 text-white text-xs px-3 py-1.5 disabled:opacity-50 dark:bg-slate-100 dark:text-slate-900">
                   {t("publish.publishNow")}
+                </button>
+              )}
+              {(post.status === "draft" || post.status === "scheduled") && (
+                <button onClick={() => startEdit(post)} disabled={busy} className="rounded-md border border-slate-300 text-slate-600 text-xs px-3 py-1.5 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300">
+                  {t("common.edit")}
                 </button>
               )}
               <button onClick={() => void remove(post)} disabled={busy} className="rounded-md border border-slate-300 text-slate-600 text-xs px-3 py-1.5 disabled:opacity-50 dark:border-slate-700 dark:text-slate-300">
