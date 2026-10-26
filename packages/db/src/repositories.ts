@@ -8,7 +8,7 @@ import {
   processedComments,
   savedReplies,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
-  users, webchatSessions, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
+  users, webchatSessions, webhookDeliveries, webhookEndpoints, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
 } from "./schema";
 
 /**
@@ -754,6 +754,8 @@ export async function advanceBroadcastRecipient(
  * knows only the provider message id, so the row is matched on
  * (workspace, provider_message_id). A provider "sent" echo arriving
  * while the row is still pending also advances (and backfills sentAt).
+ * Returns the advanced row's identity (package #10's message.status
+ * emission reports it), or null when no row moved.
  */
 export async function advanceBroadcastRecipientByProviderId(
   db: Database,
@@ -764,7 +766,7 @@ export async function advanceBroadcastRecipientByProviderId(
     at?: Date;
     error?: string | null;
   },
-): Promise<boolean> {
+): Promise<{ recipientId: string; broadcastId: string; contactId: string } | null> {
   const rows = await db
     .select()
     .from(broadcastRecipients)
@@ -773,9 +775,11 @@ export async function advanceBroadcastRecipientByProviderId(
       eq(broadcastRecipients.providerMessageId, input.providerMessageId),
     ));
   for (const row of rows) {
-    if (await applyRecipientTransition(db, row, input.to, input.at ?? new Date(), input)) return true;
+    if (await applyRecipientTransition(db, row, input.to, input.at ?? new Date(), input)) {
+      return { recipientId: row.id, broadcastId: row.broadcastId, contactId: row.contactId };
+    }
   }
-  return false;
+  return null;
 }
 
 // ------------------------------------------------- message status (inbox)
@@ -821,7 +825,9 @@ export function messageStatusTransition(
  * the workspace through the owning conversation and restricted to
  * outbound rows - receipts never exist for inbound traffic. Unknown ids
  * are a no-op (broadcast sends carry their own recipient rows and may
- * not have a message row at all). Returns true when a row advanced.
+ * not have a message row at all). Returns the advanced row's identity
+ * (package #10's message.status emission reports it), or null when no
+ * row moved.
  */
 export async function advanceMessageStatusByProviderId(
   db: Database,
@@ -830,9 +836,9 @@ export async function advanceMessageStatusByProviderId(
     providerMessageId: string;
     to: MessageStatusAdvance;
   },
-): Promise<boolean> {
+): Promise<{ messageId: string; conversationId: string } | null> {
   const rows = await db
-    .select({ id: messages.id, status: messages.status })
+    .select({ id: messages.id, status: messages.status, conversationId: messages.conversationId })
     .from(messages)
     .innerJoin(conversations, eq(messages.conversationId, conversations.id))
     .where(and(
@@ -844,9 +850,9 @@ export async function advanceMessageStatusByProviderId(
     const next = messageStatusTransition(row.status, input.to);
     if (!next) continue;
     await db.update(messages).set({ status: next }).where(eq(messages.id, row.id));
-    return true;
+    return { messageId: row.id, conversationId: row.conversationId };
   }
-  return false;
+  return null;
 }
 
 /**
@@ -1463,7 +1469,17 @@ export function isUniqueViolation(err: unknown): boolean {
   return false;
 }
 
-export async function createConversation(
+/**
+ * Insert one conversation, reporting whether the row is genuinely NEW.
+ * The race backstop for the one-open-thread invariant (package #0): two
+ * concurrent inbound events can both miss the find-open lookup; the
+ * partial unique index lets exactly one insert win, and the loser lands
+ * in the catch - it reuses the winner's thread and `created` is false,
+ * so callers that announce creations (outbound webhooks, package #10)
+ * never claim a creation that was really a reuse. Resolved inserts are
+ * outside the partial index, so they never take the fallback branch.
+ */
+export async function insertConversation(
   db: Database,
   input: {
     workspaceId: string;
@@ -1473,7 +1489,7 @@ export async function createConversation(
     /** Provider conversation id (TikTok) when the first event carries one. */
     externalId?: string;
   },
-): Promise<ConversationRow> {
+): Promise<{ row: ConversationRow; created: boolean }> {
   try {
     const [row] = await db
       .insert(conversations)
@@ -1485,21 +1501,28 @@ export async function createConversation(
         ...(input.externalId ? { externalId: input.externalId } : {}),
       })
       .returning();
-    return row!;
+    return { row: row!, created: true };
   } catch (err) {
-    // Race backstop for the one-open-thread invariant: two concurrent
-    // inbound events can both miss the find-open lookup; the partial
-    // unique index lets exactly one insert win, and the loser lands here.
-    // Reuse the winner's thread instead of failing the event (the same
-    // treatment findOrCreateContact gives contacts in the dispatcher).
-    // Resolved inserts are outside the partial index, so they never
-    // take this branch.
     if (isUniqueViolation(err) && (input.status ?? "open") !== "resolved") {
       const existing = await findOpenConversation(db, input);
-      if (existing) return existing;
+      if (existing) return { row: existing, created: false };
     }
     throw err;
   }
+}
+
+export async function createConversation(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channelAccountId: string;
+    contactId: string;
+    status?: string;
+    /** Provider conversation id (TikTok) when the first event carries one. */
+    externalId?: string;
+  },
+): Promise<ConversationRow> {
+  return (await insertConversation(db, input)).row;
 }
 
 /**
@@ -4283,4 +4306,260 @@ export async function listWorkspaceActivity(
     .orderBy(desc(auditLog.createdAt))
     .limit(limit);
   return rows.map((r) => ({ ...r, details: (r.details ?? {}) as Record<string, unknown> }));
+}
+
+// ------------------------------------------------- outbound webhooks (#10)
+
+export type WebhookEndpointRow = typeof webhookEndpoints.$inferSelect;
+export type WebhookDeliveryRow = typeof webhookDeliveries.$inferSelect;
+
+export async function createWebhookEndpoint(
+  db: Database,
+  input: { workspaceId: string; name: string; url: string; secretSealed: string; events: string[] },
+): Promise<WebhookEndpointRow> {
+  const [row] = await db
+    .insert(webhookEndpoints)
+    .values({
+      workspaceId: input.workspaceId,
+      name: input.name,
+      url: input.url,
+      secretSealed: input.secretSealed,
+      events: input.events,
+    })
+    .returning();
+  return row!;
+}
+
+export async function listWebhookEndpoints(
+  db: Database,
+  workspaceId: string,
+): Promise<WebhookEndpointRow[]> {
+  return db
+    .select()
+    .from(webhookEndpoints)
+    .where(eq(webhookEndpoints.workspaceId, workspaceId))
+    .orderBy(asc(webhookEndpoints.createdAt));
+}
+
+export async function getWebhookEndpoint(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<WebhookEndpointRow | null> {
+  const [row] = await db
+    .select()
+    .from(webhookEndpoints)
+    .where(and(eq(webhookEndpoints.workspaceId, workspaceId), eq(webhookEndpoints.id, id)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Unscoped by workspace: the worker resolves a delivery's endpoint by id alone. */
+export async function getWebhookEndpointById(
+  db: Database,
+  id: string,
+): Promise<WebhookEndpointRow | null> {
+  const [row] = await db
+    .select()
+    .from(webhookEndpoints)
+    .where(eq(webhookEndpoints.id, id))
+    .limit(1);
+  return row ?? null;
+}
+
+export async function updateWebhookEndpoint(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: {
+    name?: string;
+    url?: string;
+    events?: string[];
+    secretSealed?: string;
+    enabled?: boolean;
+    consecutiveFailures?: number;
+    disabledAt?: Date | null;
+    disabledBySystem?: boolean | null;
+  },
+): Promise<WebhookEndpointRow | null> {
+  const [row] = await db
+    .update(webhookEndpoints)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(and(eq(webhookEndpoints.workspaceId, workspaceId), eq(webhookEndpoints.id, id)))
+    .returning();
+  return row ?? null;
+}
+
+/** Delete an endpoint and its delivery history (FK is no-action, so children first). */
+export async function deleteWebhookEndpoint(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<boolean> {
+  const existing = await getWebhookEndpoint(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(webhookDeliveries).where(eq(webhookDeliveries.endpointId, id));
+  await db
+    .delete(webhookEndpoints)
+    .where(and(eq(webhookEndpoints.workspaceId, workspaceId), eq(webhookEndpoints.id, id)));
+  return true;
+}
+
+/**
+ * Enabled endpoints of a workspace (the emission fan-out reads these and
+ * filters subscriptions in code - endpoint counts per workspace are
+ * small, and the events jsonb has no portable containment query the
+ * test fake could run).
+ */
+export async function listEnabledWebhookEndpoints(
+  db: Database,
+  workspaceId: string,
+): Promise<WebhookEndpointRow[]> {
+  return db
+    .select()
+    .from(webhookEndpoints)
+    .where(and(eq(webhookEndpoints.workspaceId, workspaceId), eq(webhookEndpoints.enabled, true)))
+    .orderBy(asc(webhookEndpoints.createdAt));
+}
+
+export async function createWebhookDelivery(
+  db: Database,
+  input: { endpointId: string; workspaceId: string; event: string; payload: Record<string, unknown> },
+): Promise<WebhookDeliveryRow> {
+  const [row] = await db
+    .insert(webhookDeliveries)
+    .values({
+      endpointId: input.endpointId,
+      workspaceId: input.workspaceId,
+      event: input.event,
+      payload: input.payload,
+    })
+    .returning();
+  return row!;
+}
+
+export async function getWebhookDelivery(
+  db: Database,
+  id: string,
+): Promise<WebhookDeliveryRow | null> {
+  const [row] = await db
+    .select()
+    .from(webhookDeliveries)
+    .where(eq(webhookDeliveries.id, id))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Latest deliveries of one endpoint (the settings drawer), newest first. */
+export async function listWebhookDeliveries(
+  db: Database,
+  workspaceId: string,
+  endpointId: string,
+  limit = 50,
+): Promise<WebhookDeliveryRow[]> {
+  return db
+    .select()
+    .from(webhookDeliveries)
+    .where(and(
+      eq(webhookDeliveries.workspaceId, workspaceId),
+      eq(webhookDeliveries.endpointId, endpointId),
+    ))
+    .orderBy(desc(webhookDeliveries.createdAt))
+    .limit(limit);
+}
+
+/**
+ * Count one send attempt on a delivery (success or failure): attempts
+ * always reflects tries actually made, and the LAST attempt's outcome
+ * (response status / error) is what the row keeps.
+ */
+export async function recordWebhookDeliveryAttempt(
+  db: Database,
+  deliveryId: string,
+  outcome: { responseStatus?: number | null; error?: string | null },
+): Promise<WebhookDeliveryRow | null> {
+  const current = await getWebhookDelivery(db, deliveryId);
+  if (!current) return null;
+  const [row] = await db
+    .update(webhookDeliveries)
+    .set({
+      attempts: current.attempts + 1,
+      responseStatus: outcome.responseStatus ?? null,
+      lastError: outcome.error ?? null,
+    })
+    .where(eq(webhookDeliveries.id, deliveryId))
+    .returning();
+  return row ?? null;
+}
+
+export async function markWebhookDeliveryDelivered(
+  db: Database,
+  deliveryId: string,
+  at: Date,
+): Promise<void> {
+  await db
+    .update(webhookDeliveries)
+    .set({ status: "delivered", deliveredAt: at, lastError: null })
+    .where(eq(webhookDeliveries.id, deliveryId));
+}
+
+export async function markWebhookDeliveryFailed(
+  db: Database,
+  deliveryId: string,
+  error: string,
+): Promise<void> {
+  await db
+    .update(webhookDeliveries)
+    .set({ status: "failed", lastError: error })
+    .where(eq(webhookDeliveries.id, deliveryId));
+}
+
+/** A successful delivery clears the endpoint's failure streak. */
+export async function resetWebhookEndpointFailures(
+  db: Database,
+  endpointId: string,
+): Promise<void> {
+  await db
+    .update(webhookEndpoints)
+    .set({ consecutiveFailures: 0, updatedAt: new Date() })
+    .where(and(eq(webhookEndpoints.id, endpointId), gte(webhookEndpoints.consecutiveFailures, 1)));
+}
+
+/**
+ * Register one terminally failed delivery against its endpoint: bump
+ * the consecutive-failure streak and, at the threshold, auto-disable
+ * the endpoint (enabled=false, stamped, audited). Returns the new
+ * streak and whether THIS call disabled the endpoint. A delivery that
+ * fails against an already-disabled endpoint still counts (its streak
+ * is the operator-visible health signal) but cannot re-disable.
+ */
+export async function registerWebhookEndpointFailure(
+  db: Database,
+  endpoint: WebhookEndpointRow,
+  input: { threshold: number; at: Date },
+): Promise<{ consecutiveFailures: number; autoDisabled: boolean }> {
+  const next = endpoint.consecutiveFailures + 1;
+  const autoDisabled = endpoint.enabled && next >= input.threshold;
+  await db
+    .update(webhookEndpoints)
+    .set({
+      consecutiveFailures: next,
+      updatedAt: input.at,
+      ...(autoDisabled
+        ? { enabled: false, disabledAt: input.at, disabledBySystem: true }
+        : {}),
+    })
+    .where(eq(webhookEndpoints.id, endpoint.id));
+  if (autoDisabled) {
+    await insertAuditLog(db, {
+      workspaceId: endpoint.workspaceId,
+      action: "webhook_endpoint.auto_disabled",
+      details: {
+        endpointId: endpoint.id,
+        consecutiveFailures: next,
+        threshold: input.threshold,
+      },
+    });
+  }
+  return { consecutiveFailures: next, autoDisabled };
 }

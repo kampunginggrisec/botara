@@ -819,3 +819,67 @@ export const deals = pgTable("deals", {
   index("deals_pipeline_stage_idx").on(t.pipelineId, t.stageId),
   index("deals_contact_idx").on(t.contactId),
 ]);
+
+/**
+ * Outbound event webhooks (adoption package #10): a workspace endpoint
+ * subscribes to a closed set of lifecycle events (message.received,
+ * message.status, conversation.created) and Botara POSTs signed
+ * envelopes to it from the worker's outbound-webhooks queue.
+ *
+ * Secret hygiene mirrors platform_settings: the signing secret is
+ * generated server-side (32 random bytes), stored ONLY as an
+ * AES-256-GCM sealed blob (`secret_sealed` - the vault's SealedSecret
+ * JSON, same scheme as platform settings), and the raw value is shown
+ * exactly once, at creation and at rotation.
+ *
+ * Auto-disable: every terminally failed delivery increments
+ * `consecutive_failures`; at the threshold the delivery pipeline itself
+ * flips `enabled` off and stamps `disabled_at` + `disabled_by_system`,
+ * with an audit_log row. A successful delivery resets the counter, and
+ * a human re-enabling the endpoint resets it too.
+ */
+export const webhookEndpoints = pgTable("webhook_endpoints", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  name: varchar("name", { length: 200 }).notNull(),
+  url: text("url").notNull(),
+  /** AES-256-GCM sealed signing secret (SealedSecret JSON) - never the raw secret. */
+  secretSealed: text("secret_sealed").notNull(),
+  /** Subscribed event names (closed set, validated on write). */
+  events: jsonb("events").notNull().default([]),
+  enabled: boolean("enabled").notNull().default(true),
+  /** Consecutive terminally-failed deliveries; reset by any success or a manual re-enable. */
+  consecutiveFailures: integer("consecutive_failures").notNull().default(0),
+  /** When the endpoint was auto-disabled by the delivery pipeline (null = never). */
+  disabledAt: timestamp("disabled_at", { withTimezone: true }),
+  /** True when the disable was the pipeline's auto-disable, false/null when a human toggled it off. */
+  disabledBySystem: boolean("disabled_by_system"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("webhook_endpoints_ws_idx").on(t.workspaceId)]);
+
+/**
+ * One delivery attempt series for one (endpoint, event): the exact
+ * envelope POSTed is stored in `payload` (so retries resend identical
+ * bytes and the deliveries view can show precisely what was sent).
+ * `attempts` counts tries actually made; `status` leaves `pending` only
+ * at a terminal outcome (delivered on a 2xx, failed after the last
+ * attempt or a non-retryable refusal).
+ */
+export const webhookDeliveries = pgTable("webhook_deliveries", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  endpointId: uuid("endpoint_id").notNull().references(() => webhookEndpoints.id),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  /** OutboundWebhookEvent name, or "webhook.test" for the settings ping. */
+  event: varchar("event", { length: 60 }).notNull(),
+  payload: jsonb("payload").notNull(),
+  status: varchar("status", { length: 20 }).notNull().default("pending"), // pending|delivered|failed
+  responseStatus: integer("response_status"),
+  attempts: integer("attempts").notNull().default(0),
+  lastError: text("last_error"),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+}, (t) => [
+  index("webhook_deliveries_endpoint_created_idx").on(t.endpointId, t.createdAt),
+  index("webhook_deliveries_ws_idx").on(t.workspaceId),
+]);
