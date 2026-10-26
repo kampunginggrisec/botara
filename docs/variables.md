@@ -57,8 +57,14 @@ exposes that same bag under the `vars.` root:
 `set_field` still writes **contact custom fields** (persisted), not the
 run bag — a value written by `set_field` is readable as
 `{{contact.<field>}}` in later runs, not as `{{vars.<field>}}` in the
-same run. A dedicated collect-input step is package #3 of the adoption
-program.
+same run.
+
+The `collect_input` step writes the **run bag**: when the contact
+replies, the run resumes with the answer stored as
+`{{vars.<variable>}}` for the remaining steps (and, when the step sets
+`saveToContactField`, the answer is ALSO persisted to that contact
+custom field, making it readable as `{{contact.<field>}}` in later
+runs). A timeout or a media-only reply resumes with an empty value.
 
 ## Semantics
 
