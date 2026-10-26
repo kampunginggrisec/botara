@@ -195,8 +195,12 @@ export interface Conversation {
   channel: string;
   channelAccountId: string;
   status: string;
+  /** The contact behind this conversation (contact editing, F1). */
+  contactId: string;
   contactExternalId: string;
   contactDisplayName: string | null;
+  /** The contact's tags, shown as chips in the inbox header (B4). */
+  contactTags: string[];
   lastUserMessageAt: string | null;
   windowOpen: boolean;
   assignedUserId: string | null;
@@ -296,6 +300,61 @@ export interface BroadcastEstimate {
   ratesEffectiveDate: string;
 }
 
+/** One row of GET /broadcasts (history list, F5). */
+export interface BroadcastSummary {
+  id: string;
+  channelAccountId: string;
+  templateId: string | null;
+  name: string | null;
+  tag: string | null;
+  country: string | null;
+  recipientCount: number;
+  status: string;
+  sentCount: number;
+  failedCount: number;
+  estimatedCostUsd: number;
+  /** Realized cost from the ledger (0 until sends are recorded). */
+  totalCostUsd: number;
+  ratesVersion: string;
+  createdAt: string;
+}
+
+/** GET /broadcasts/{id}: the broadcast plus its realized cost detail. */
+export interface BroadcastDetail extends BroadcastSummary {
+  costEntries: number;
+  costUnits: number;
+}
+
+/** One registered sending domain (Channels → Email, F2). */
+export interface WorkspaceDomain {
+  id: string;
+  domain: string;
+  channelAccountId: string | null;
+  resendDomainId: string | null;
+  status: string;
+  createdAt: string;
+}
+
+/** GET /segments row: a tag with its contact count (F8). */
+export interface SegmentInfo {
+  tag: string;
+  contactCount: number;
+}
+
+/** GET /admin/connection-info (F11): callback URLs + token KEY NAMES. */
+export interface ConnectionWebhook {
+  id: string;
+  url: string;
+  verifyTokenKey: string | null;
+  autoConfigured: boolean;
+}
+
+export interface ConnectionInfo {
+  base: string;
+  webhooks: ConnectionWebhook[];
+  oauthRedirects: Array<{ id: string; url: string }>;
+}
+
 export interface ChannelAccount {
   id: string;
   channel: string;
@@ -322,7 +381,7 @@ export interface ScheduledPost {
   id: string;
   text: string | null;
   mediaUrls: string[];
-  targets: Array<{ channelAccountId: string; channel: string }>;
+  targets: Array<{ channelAccountId: string; channel: string; targetExternalId?: string }>;
   scheduledAt: string | null;
   status: string;
   results: Record<string, PostTargetResult>;
@@ -654,9 +713,39 @@ export const api = {
       body: JSON.stringify(body),
     });
   },
+  /** AI reply suggestion for the composer (F4): fills the draft, never sends. 503 when no AI provider is configured. */
+  aiSuggest(conversationId: string): Promise<{ suggestion: string; model: string; kbChunksUsed: number }> {
+    return request(`/conversations/${conversationId}/ai-suggest`, { method: "POST", body: "{}" });
+  },
+  /** Local flag-list moderation verdict for a draft (F9). */
+  moderationCheck(text: string): Promise<{ flagged: boolean; matches: Array<{ term: string; index: number }> }> {
+    return request("/moderation/check", { method: "POST", body: JSON.stringify({ text }) });
+  },
   listContacts(tag?: string): Promise<{ contacts: Contact[] }> {
     const suffix = tag ? `?tag=${encodeURIComponent(tag)}` : "";
     return request(`/contacts${suffix}`);
+  },
+  getContact(id: string): Promise<{ contact: Contact }> {
+    return request(`/contacts/${id}`);
+  },
+  createContact(body: {
+    channel: string;
+    externalId: string;
+    displayName?: string;
+    tags?: string[];
+    customFields?: Record<string, unknown>;
+  }): Promise<{ contact: Contact }> {
+    return request("/contacts", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** PATCH merges customFields key-wise; displayName/tags replace. */
+  updateContact(
+    id: string,
+    body: { displayName?: string | null; tags?: string[]; customFields?: Record<string, unknown> },
+  ): Promise<{ contact: Contact }> {
+    return request(`/contacts/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  listSegments(): Promise<{ segments: SegmentInfo[] }> {
+    return request("/segments");
   },
   importContacts(body: {
     format: "csv" | "json";
@@ -693,6 +782,23 @@ export const api = {
   listTemplates(): Promise<{ templates: Template[] }> {
     return request("/templates");
   },
+  /** Register an existing WhatsApp template with Botara (F6). */
+  createTemplate(body: {
+    channelAccountId: string;
+    name: string;
+    language?: string;
+    category?: string;
+    externalId?: string;
+  }): Promise<{ template: Template }> {
+    return request("/templates", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** Correct a template's category after a Meta category-change event (F6). */
+  updateTemplateCategory(id: string, latestCategory: string): Promise<{ template: Template }> {
+    return request(`/templates/${id}/category`, {
+      method: "PATCH",
+      body: JSON.stringify({ latestCategory }),
+    });
+  },
   estimateBroadcast(body: {
     category: string;
     countryMix: Array<{ country: string; recipients: number }>;
@@ -709,6 +815,20 @@ export const api = {
   }): Promise<{ broadcast: { id: string; status: string }; estimate: BroadcastEstimate }> {
     return request("/broadcasts", { method: "POST", body: JSON.stringify(body) });
   },
+  /** Broadcast history (F5): newest first, with delivery counts + realized cost. */
+  listBroadcasts(): Promise<{ broadcasts: BroadcastSummary[] }> {
+    return request("/broadcasts");
+  },
+  getBroadcast(id: string): Promise<{
+    broadcast: BroadcastDetail;
+    sentCount: number;
+    failedCount: number;
+    totalCostUsd: number;
+    costEntries: number;
+    costUnits: number;
+  }> {
+    return request(`/broadcasts/${id}`);
+  },
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
     return request("/channels/accounts");
   },
@@ -717,6 +837,20 @@ export const api = {
     purge = false,
   ): Promise<{ mode: "deleted" | "disconnected" | "purged" }> {
     return request(`/channels/accounts/${id}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
+  },
+  // ------------------------------------------------- email domains (F2)
+  listEmailDomains(): Promise<{ domains: WorkspaceDomain[] }> {
+    return request("/channels/email/domains");
+  },
+  addEmailDomain(body: {
+    domain: string;
+    channelAccountId?: string;
+    resendDomainId?: string;
+  }): Promise<{ domain: WorkspaceDomain }> {
+    return request("/channels/email/domains", { method: "POST", body: JSON.stringify(body) });
+  },
+  deleteEmailDomain(id: string): Promise<{ deleted: boolean }> {
+    return request(`/channels/email/domains/${id}`, { method: "DELETE" });
   },
   // ------------------------------------------------- Meta catalog sync
   listCatalogProducts(
@@ -745,10 +879,23 @@ export const api = {
   createPost(body: {
     text?: string;
     mediaUrls?: string[];
-    targets: Array<{ channelAccountId: string }>;
+    targets: Array<{ channelAccountId: string; targetExternalId?: string }>;
     scheduledAt?: string;
   }): Promise<{ post: ScheduledPost }> {
     return request("/posts", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** Edit a draft/scheduled post (F10); telegram targets round-trip their destination (item H). */
+  updatePost(
+    id: string,
+    body: {
+      text?: string;
+      mediaUrls?: string[];
+      targets?: Array<{ channelAccountId: string; targetExternalId?: string }>;
+      scheduledAt?: string | null;
+      status?: "draft" | "scheduled" | "cancelled";
+    },
+  ): Promise<{ post: ScheduledPost }> {
+    return request(`/posts/${id}`, { method: "PATCH", body: JSON.stringify(body) });
   },
   publishPostNow(postId: string): Promise<{ post: ScheduledPost }> {
     return request(`/posts/${postId}/publish-now`, { method: "POST", body: "{}" });
@@ -876,5 +1023,9 @@ export const api = {
   },
   adminAudit(limit: number): Promise<{ entries: AdminAuditItem[] }> {
     return request(`/admin/audit?limit=${limit}`);
+  },
+  /** Callback-URL connection reference for provider dashboards (F11). */
+  adminConnectionInfo(): Promise<ConnectionInfo> {
+    return request("/admin/connection-info");
   },
 };

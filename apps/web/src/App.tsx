@@ -3,11 +3,13 @@ import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
   type AdminUserItem, type AdminWorkspaceItem,
-  type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type CatalogProduct, type CatalogSummary,
-  type ChannelAccount, type Contact,
+  type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastSummary,
+  type CatalogProduct, type CatalogSummary,
+  type ChannelAccount, type ConnectionInfo, type Contact,
   type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
-  type Member, type Message, type PublicConfig, type RichBlock, type ScheduledPost, type Sequence,
-  type SequenceStep, type StatsOverview, type Template, type WorkspaceSummary,
+  type Member, type Message, type PublicConfig, type RichBlock, type ScheduledPost, type SegmentInfo,
+  type Sequence, type SequenceStep, type StatsOverview, type Template, type WorkspaceDomain,
+  type WorkspaceSummary,
 } from "./api";
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
 import {
@@ -248,6 +250,13 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const [accountProducts, setAccountProducts] = useState<CatalogProduct[]>([]);
   const [productCatalogId, setProductCatalogId] = useState("");
   const [productRetailerId, setProductRetailerId] = useState("");
+  // Contact editing from the thread header (F1): the modal needs the
+  // full contact (custom fields), fetched on open via GET /contacts/{id}.
+  const [editingContact, setEditingContact] = useState<Contact | null>(null);
+  // Composer assist (F4/F9): AI suggestion fills the draft; the
+  // moderation check only reports a verdict - neither ever sends.
+  const [aiBusy, setAiBusy] = useState(false);
+  const [checkBusy, setCheckBusy] = useState(false);
 
   const showButtons = richKind === "buttons";
 
@@ -300,6 +309,63 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
     })();
     return () => { cancelled = true; };
   }, [selectedId, selectedChannel, selectedAccountId]);
+
+  const openContactEditor = async (conv: Conversation) => {
+    try {
+      const res = await api.getContact(conv.contactId);
+      setEditingContact(res.contact);
+    } catch (err) {
+      pushToast("err", errText(err, t("contacts.loadFailed")));
+    }
+  };
+
+  const onContactSaved = (updated: Contact) => {
+    const patch = (c: Conversation): Conversation =>
+      c.contactId === updated.id
+        ? { ...c, contactDisplayName: updated.displayName, contactTags: updated.tags ?? [] }
+        : c;
+    setConversations((prev) => prev.map(patch));
+    setSelected((prev) => (prev ? patch(prev) : prev));
+  };
+
+  const runAiSuggest = async () => {
+    if (!selected) return;
+    setAiBusy(true);
+    try {
+      const res = await api.aiSuggest(selected.id);
+      setReplyText(res.suggestion);
+      pushToast("ok", t("inbox.aiSuggested"));
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 503) {
+        pushToast("err", t("inbox.aiUnavailable"));
+      } else {
+        pushToast("err", errText(err, t("inbox.aiFailed")));
+      }
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const runModerationCheck = async () => {
+    if (!replyText.trim()) {
+      pushToast("err", t("inbox.moderationEmpty"));
+      return;
+    }
+    setCheckBusy(true);
+    try {
+      const res = await api.moderationCheck(replyText);
+      if (res.flagged) {
+        const terms = [...new Set(res.matches.map((m) => m.term))].join(", ");
+        pushToast("err", t("inbox.moderationFlagged", { terms }));
+      } else {
+        pushToast("ok", t("inbox.moderationClean"));
+      }
+    } catch (err) {
+      pushToast("err", errText(err, t("inbox.moderationFailed")));
+    } finally {
+      setCheckBusy(false);
+    }
+  };
 
   const changeAssignee = async (conv: Conversation, userId: string | null) => {
     try {
@@ -420,6 +486,13 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
     <div>
       <PageTitle title={t("inbox.title")} subtitle={t("inbox.subtitle")} />
       {error && <div className="mt-4"><ErrorBox error={error} /></div>}
+      {editingContact && (
+        <ContactEditModal
+          contact={editingContact}
+          onClose={() => setEditingContact(null)}
+          onSaved={onContactSaved}
+        />
+      )}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="space-y-2">
           <div className="flex flex-wrap gap-2">
@@ -500,9 +573,22 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
           ) : (
             <>
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 dark:border-slate-800 px-4 py-3">
-                <span className="font-medium text-sm">
-                  {selected.contactDisplayName ?? selected.contactExternalId} · {selected.channel}
-                </span>
+                <div className="min-w-0">
+                  <span className="font-medium text-sm">
+                    {selected.contactDisplayName ?? selected.contactExternalId} · {selected.channel}
+                  </span>
+                  <div className="mt-1 flex flex-wrap items-center gap-1">
+                    {(selected.contactTags ?? []).map((tag) => (
+                      <span key={tag} className={chipCls}>{tag}</span>
+                    ))}
+                    <button
+                      onClick={() => void openContactEditor(selected)}
+                      className="text-xs text-slate-600 underline dark:text-slate-300"
+                    >
+                      {t("inbox.editContact")}
+                    </button>
+                  </div>
+                </div>
                 <div className="flex flex-wrap items-center gap-3">
                   <label className="flex items-center gap-2 text-xs text-slate-500 dark:text-slate-400">
                     {t("inbox.statusLabel")}
@@ -569,6 +655,22 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                   />
                   <button onClick={() => void sendReply()} disabled={sending || !replyText.trim()} className={`self-end ${primaryBtn}`}>
                     {sending ? t("common.sending") : t("common.send")}
+                  </button>
+                </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    onClick={() => void runAiSuggest()}
+                    disabled={aiBusy}
+                    className="rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+                  >
+                    {aiBusy ? t("inbox.aiSuggesting") : t("inbox.aiSuggest")}
+                  </button>
+                  <button
+                    onClick={() => void runModerationCheck()}
+                    disabled={checkBusy}
+                    className="rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+                  >
+                    {checkBusy ? t("inbox.checking") : t("inbox.checkDraft")}
                   </button>
                 </div>
                 <div className="mt-2 flex items-center gap-2">
@@ -697,11 +799,289 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
 
 // ---------------------------------------------------------------- Contacts
 
+/** Tag editor: chips with per-chip remove + an add input (Enter/comma). */
+function TagChipEditor({ tags, onChange }: { tags: string[]; onChange: (tags: string[]) => void }) {
+  const { t } = useI18n();
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const value = draft.trim().replace(/,+$/, "");
+    if (value && !tags.includes(value)) onChange([...tags, value]);
+    setDraft("");
+  };
+  return (
+    <div>
+      <div className="flex flex-wrap gap-1">
+        {tags.map((tag) => (
+          <span key={tag} className={`${chipCls} inline-flex items-center gap-1`}>
+            {tag}
+            <button
+              type="button"
+              aria-label={`remove ${tag}`}
+              onClick={() => onChange(tags.filter((x) => x !== tag))}
+              className="leading-none text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(); }
+        }}
+        onBlur={add}
+        placeholder={t("contacts.tagPlaceholder")}
+        className={`mt-2 ${inputCls}`}
+      />
+      <p className="mt-1 text-xs text-slate-400 dark:text-slate-500">{t("contacts.tagsHint")}</p>
+    </div>
+  );
+}
+
+/**
+ * Shared contact editor (F1): name, tags, and custom fields as editable
+ * key/value rows — the imported `field:` data used to be write-only.
+ * Used by the Contacts table and the Inbox conversation header; saving
+ * goes through PATCH /contacts/{id} (custom fields merge key-wise, so
+ * removing a row here does not delete that key server-side).
+ */
+function ContactEditModal({
+  contact,
+  onClose,
+  onSaved,
+}: {
+  contact: Contact;
+  onClose: () => void;
+  onSaved: (updated: Contact) => void;
+}) {
+  const { t } = useI18n();
+  const [name, setName] = useState(contact.displayName ?? "");
+  const [tags, setTags] = useState<string[]>(contact.tags ?? []);
+  const [fields, setFields] = useState<Array<{ key: string; value: string }>>(() =>
+    Object.entries(contact.customFields ?? {}).map(([key, value]) => ({
+      key,
+      value: typeof value === "string" ? value : JSON.stringify(value),
+    })),
+  );
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const customFields: Record<string, unknown> = {};
+      for (const row of fields) {
+        const key = row.key.trim();
+        if (key) customFields[key] = row.value;
+      }
+      const res = await api.updateContact(contact.id, {
+        displayName: name.trim() ? name.trim() : null,
+        tags,
+        customFields,
+      });
+      pushToast("ok", t("contacts.saved"));
+      onSaved(res.contact);
+      onClose();
+    } catch (err) {
+      pushToast("err", errText(err, t("contacts.saveFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("contacts.editTitle")}
+        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-4">
+          <h2 className="text-base font-semibold">{t("contacts.editTitle")}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t("common.close")}
+            className="-mr-1 -mt-1 rounded-full px-2.5 py-1 text-lg leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+          >
+            ×
+          </button>
+        </div>
+        <div className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+          {contact.channel} · {contact.externalId}
+        </div>
+        <div className="mt-4 space-y-4">
+          <div>
+            <label className={labelCls}>{t("common.name")}</label>
+            <input value={name} onChange={(e) => setName(e.target.value)} className={inputCls} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("contacts.tags")}</label>
+            <TagChipEditor tags={tags} onChange={setTags} />
+          </div>
+          <div>
+            <label className={labelCls}>{t("contacts.customFields")}</label>
+            <div className="space-y-2">
+              {fields.map((row, i) => (
+                <div key={i} className="flex gap-2">
+                  <input
+                    value={row.key}
+                    onChange={(e) => setFields((prev) => prev.map((x, j) => (j === i ? { ...x, key: e.target.value } : x)))}
+                    placeholder={t("contacts.fieldKeyPlaceholder")}
+                    className="w-2/5 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  />
+                  <input
+                    value={row.value}
+                    onChange={(e) => setFields((prev) => prev.map((x, j) => (j === i ? { ...x, value: e.target.value } : x)))}
+                    placeholder={t("contacts.fieldValuePlaceholder")}
+                    className="flex-1 rounded-md border border-slate-300 bg-white px-2 py-1.5 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setFields((prev) => prev.filter((_, j) => j !== i))}
+                    className="text-xs text-red-600 underline dark:text-red-400"
+                  >
+                    {t("common.remove")}
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() => setFields((prev) => [...prev, { key: "", value: "" }])}
+                className="text-xs text-slate-600 underline dark:text-slate-300"
+              >
+                {t("contacts.addField")}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className={outlineBtn}>{t("common.cancel")}</button>
+          <button type="button" onClick={() => void save()} disabled={busy} className={primaryBtn}>
+            {busy ? t("common.saving") : t("common.save")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Manual add-contact form (F3): channel + external ID, optional name/tags. */
+function ContactAddModal({ onClose, onAdded }: { onClose: () => void; onAdded: () => void }) {
+  const { t } = useI18n();
+  const [channel, setChannel] = useState<string>("whatsapp");
+  const [externalId, setExternalId] = useState("");
+  const [name, setName] = useState("");
+  const [tags, setTags] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const submit = async () => {
+    setBusy(true);
+    try {
+      await api.createContact({
+        channel,
+        externalId: externalId.trim(),
+        ...(name.trim() ? { displayName: name.trim() } : {}),
+        ...(tags.length > 0 ? { tags } : {}),
+      });
+      pushToast("ok", t("contacts.added"));
+      onAdded();
+      onClose();
+    } catch (err) {
+      pushToast("err", errText(err, t("contacts.addFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4" onClick={onClose}>
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("contacts.addTitle")}
+        className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-4">
+          <h2 className="text-base font-semibold">{t("contacts.addTitle")}</h2>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label={t("common.close")}
+            className="-mr-1 -mt-1 rounded-full px-2.5 py-1 text-lg leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+          >
+            ×
+          </button>
+        </div>
+        <div className="mt-4 space-y-4">
+          <div>
+            <label className={labelCls}>{t("common.channel")}</label>
+            <select value={channel} onChange={(e) => setChannel(e.target.value)} className={inputCls}>
+              {CONTACT_CHANNELS.map((ch) => (
+                <option key={ch} value={ch}>{channelMeta(ch).label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className={labelCls}>{t("contacts.externalId")}</label>
+            <input
+              value={externalId}
+              onChange={(e) => setExternalId(e.target.value)}
+              placeholder={t("contacts.externalIdPlaceholder")}
+              className={inputCls}
+            />
+          </div>
+          <div>
+            <label className={labelCls}>{t("common.name")}</label>
+            <input
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder={t("contacts.namePlaceholder")}
+              className={inputCls}
+            />
+          </div>
+          <div>
+            <label className={labelCls}>{t("contacts.tags")}</label>
+            <TagChipEditor tags={tags} onChange={setTags} />
+          </div>
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" onClick={onClose} className={outlineBtn}>{t("common.cancel")}</button>
+          <button type="button" onClick={() => void submit()} disabled={busy || !externalId.trim()} className={primaryBtn}>
+            {busy ? t("common.saving") : t("contacts.addButton")}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ContactsPage() {
   const { t } = useI18n();
   const [contacts, setContacts] = useState<Contact[]>([]);
   const [tag, setTag] = useState("");
   const [error, setError] = useState<string | null>(null);
+  // Segments (F8): tag chips with per-tag contact counts from GET /segments.
+  const [segments, setSegments] = useState<SegmentInfo[]>([]);
+  // Contact editing (F1) + manual add (F3).
+  const [editing, setEditing] = useState<Contact | null>(null);
+  const [showAdd, setShowAdd] = useState(false);
   // Import/export (adopted features).
   const [showImport, setShowImport] = useState(false);
   const [importText, setImportText] = useState("");
@@ -721,7 +1101,20 @@ function ContactsPage() {
     }
   }, [t]);
 
+  const loadSegments = useCallback(async () => {
+    try {
+      const data = await api.listSegments();
+      setSegments(data.segments);
+    } catch { /* segment chips are an assist; the free-text filter still works */ }
+  }, []);
+
   useEffect(() => { void load(""); }, [load]);
+  useEffect(() => { void loadSegments(); }, [loadSegments]);
+
+  const pickSegment = (next: string) => {
+    setTag(next);
+    void load(next);
+  };
 
   const onImportFile = async (file: File | undefined) => {
     if (!file) return;
@@ -769,7 +1162,28 @@ function ContactsPage() {
         <button onClick={() => setShowImport((v) => !v)} className={outlineBtn}>{t("contacts.import")}</button>
         <button onClick={() => void runExport("csv")} disabled={exportBusy} className={outlineBtn}>{t("contacts.exportCsv")}</button>
         <button onClick={() => void runExport("json")} disabled={exportBusy} className={outlineBtn}>{t("contacts.exportJson")}</button>
+        <button onClick={() => setShowAdd(true)} className={primaryBtn}>{t("contacts.addButton")}</button>
       </div>
+      {segments.length > 0 && (
+        <div className="mt-3 flex flex-wrap items-center gap-1.5">
+          <span className="text-xs font-medium text-slate-500 dark:text-slate-400">{t("contacts.segmentsLabel")}:</span>
+          <button
+            onClick={() => pickSegment("")}
+            className={tag === "" ? "text-xs px-2 py-0.5 rounded-full bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900" : chipCls}
+          >
+            {t("contacts.allContacts")}
+          </button>
+          {segments.map((s) => (
+            <button
+              key={s.tag}
+              onClick={() => pickSegment(s.tag)}
+              className={tag === s.tag ? "text-xs px-2 py-0.5 rounded-full bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900" : chipCls}
+            >
+              {s.tag} · {s.contactCount}
+            </button>
+          ))}
+        </div>
+      )}
       {showImport && (
         <div className={`mt-4 ${cardCls} p-4 space-y-3 max-w-3xl`}>
           <div className="font-medium text-sm">{t("contacts.importTitle")}</div>
@@ -834,6 +1248,7 @@ function ContactsPage() {
                 <th className="px-4 py-2 font-medium">{t("common.channel")}</th>
                 <th className="px-4 py-2 font-medium">{t("contacts.externalId")}</th>
                 <th className="px-4 py-2 font-medium">{t("contacts.tags")}</th>
+                <th className="px-4 py-2 font-medium">{t("common.actions")}</th>
               </tr>
             </thead>
             <tbody>
@@ -849,12 +1264,33 @@ function ContactsPage() {
                       ))}
                     </span>
                   </td>
+                  <td className="px-4 py-2">
+                    <button onClick={() => setEditing(ct)} className="text-xs text-slate-600 underline dark:text-slate-300">
+                      {t("common.edit")}
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
       </div>
+      {editing && (
+        <ContactEditModal
+          contact={editing}
+          onClose={() => setEditing(null)}
+          onSaved={(updated) => {
+            setContacts((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+            void loadSegments();
+          }}
+        />
+      )}
+      {showAdd && (
+        <ContactAddModal
+          onClose={() => setShowAdd(false)}
+          onAdded={() => { void load(tag); void loadSegments(); }}
+        />
+      )}
     </div>
   );
 }
@@ -1811,6 +2247,9 @@ const CHANNEL_META: Record<string, { label: string; glyph: string; accent: strin
 };
 
 const CHANNEL_ORDER = ["whatsapp", "telegram", "instagram", "threads", "messenger", "tiktok", "webchat"] as const;
+
+/** Channels a contact can belong to (canonical list + email). */
+const CONTACT_CHANNELS: string[] = [...CHANNEL_ORDER, "email"];
 
 function channelMeta(channel: string): { label: string; glyph: string; accent: string } {
   return CHANNEL_META[channel] ?? { label: channel, glyph: channel.charAt(0).toUpperCase(), accent: "bg-slate-500" };
