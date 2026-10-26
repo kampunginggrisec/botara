@@ -179,6 +179,13 @@ export const broadcasts = pgTable("broadcasts", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
   channelAccountId: uuid("channel_account_id").notNull().references(() => channelAccounts.id),
   templateId: uuid("template_id").references(() => templates.id),
+  /**
+   * Ordered body positional parameter templates (variables package #1).
+   * Each entry is a literal/variable string interpolated PER RECIPIENT at
+   * send time (e.g. "{{contact.name}}") and passed to the provider as
+   * the template's body components. Null = no parameters.
+   */
+  templateParams: jsonb("template_params").$type<string[]>(),
   name: varchar("name", { length: 200 }),
   /** Targeting: contacts carrying this tag (null = caller-supplied recipientCount only). */
   tag: varchar("tag", { length: 120 }),

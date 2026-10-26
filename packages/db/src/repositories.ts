@@ -391,6 +391,8 @@ export async function createBroadcast(
     workspaceId: string;
     channelAccountId: string;
     templateId?: string;
+    /** Ordered per-recipient body parameter templates (variables #1). */
+    templateParams?: string[];
     name?: string;
     tag?: string;
     country?: string;
@@ -406,6 +408,7 @@ export async function createBroadcast(
       workspaceId: input.workspaceId,
       channelAccountId: input.channelAccountId,
       templateId: input.templateId,
+      templateParams: input.templateParams ?? null,
       name: input.name,
       tag: input.tag,
       country: input.country,
@@ -1198,7 +1201,16 @@ export type SequenceEnrollmentRow = typeof sequenceEnrollments.$inferSelect;
 export interface SequenceStep {
   delaySeconds: number;
   text?: string;
-  template?: { name: string; language: string; latestCategory: string };
+  template?: {
+    name: string;
+    language: string;
+    latestCategory: string;
+    /**
+     * Ordered body positional parameter templates (variables #1),
+     * interpolated per recipient at send time like broadcast params.
+     */
+    templateParams?: string[];
+  };
 }
 
 export async function createSequence(
@@ -1287,6 +1299,13 @@ export interface DueEnrollmentSnapshot {
   channel: string;
   accountExternalId: string;
   tokenVaultRef?: string;
+  /** Variable-interpolation context (variables package #1). */
+  contactDisplayName?: string | null;
+  contactChannel: string;
+  contactTags: string[];
+  contactCustomFields: Record<string, unknown>;
+  workspaceName?: string | null;
+  channelDisplayName?: string | null;
 }
 
 /** Enrollments due to advance, fully joined for the sequence processor. */
@@ -1297,11 +1316,13 @@ export async function listDueEnrollments(db: Database, now: Date): Promise<DueEn
       sequence: sequences,
       contact: contacts,
       account: channelAccounts,
+      workspace: workspaces,
     })
     .from(sequenceEnrollments)
     .innerJoin(sequences, eq(sequenceEnrollments.sequenceId, sequences.id))
     .innerJoin(contacts, eq(sequenceEnrollments.contactId, contacts.id))
     .innerJoin(channelAccounts, eq(sequences.channelAccountId, channelAccounts.id))
+    .innerJoin(workspaces, eq(sequences.workspaceId, workspaces.id))
     .where(
       and(
         eq(sequenceEnrollments.status, "active"),
@@ -1323,6 +1344,12 @@ export async function listDueEnrollments(db: Database, now: Date): Promise<DueEn
     channel: r.account.channel,
     accountExternalId: r.account.externalId,
     tokenVaultRef: r.account.tokenVaultRef ?? undefined,
+    contactDisplayName: r.contact.displayName,
+    contactChannel: r.contact.channel,
+    contactTags: (r.contact.tags as string[]) ?? [],
+    contactCustomFields: (r.contact.customFields as Record<string, unknown>) ?? {},
+    workspaceName: r.workspace.name,
+    channelDisplayName: r.account.displayName,
   }));
 }
 
