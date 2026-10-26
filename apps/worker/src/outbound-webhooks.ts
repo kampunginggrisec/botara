@@ -1,7 +1,7 @@
 import {
   WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_HTTP_TIMEOUT_MS, WEBHOOK_TEST_EVENT,
 } from "@botara/shared";
-import { checkOutboundWebhookUrl } from "@botara/shared/ssrf";
+import { checkOutboundWebhookUrl, type DnsLookupFn } from "@botara/shared/ssrf";
 import { webhookSignatureHeader } from "@botara/shared/webhook-signing";
 
 /**
@@ -52,6 +52,8 @@ export interface OutboundWebhookPorts {
   registerEndpointFailure(endpointId: string): Promise<void>;
   /** Injectable fetch (tests stub it; production uses global fetch). */
   fetchFn?: typeof fetch;
+  /** Injectable DNS lookup for the SSRF guard (tests simulate rebinding). */
+  lookupFn?: DnsLookupFn;
   /** Injectable clock for signature timestamps. */
   now?: () => Date;
   log?: (line: Record<string, unknown>) => void;
@@ -109,7 +111,7 @@ export async function processOutboundWebhookDelivery(
   // SSRF guard, re-run before EVERY attempt: the DNS answer that was
   // fine at creation (or on attempt N) may have flipped by retry time.
   // A refusal is permanent for this delivery - no BullMQ retry.
-  const check = await checkOutboundWebhookUrl(endpoint.url);
+  const check = await checkOutboundWebhookUrl(endpoint.url, ports.lookupFn);
   if (!check.ok) return fail(`ssrf_refused: ${check.reason}`, null);
 
   const secret = await ports.getEndpointSecret(endpoint.id);

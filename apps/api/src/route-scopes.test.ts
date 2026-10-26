@@ -40,6 +40,11 @@ describe("requiredScopeForRoute", () => {
     expect(requiredScopeForRoute("GET", "/kb/documents")).toEqual({ kind: "scope", scope: "kb:read" });
     expect(requiredScopeForRoute("POST", "/posts")).toEqual({ kind: "scope", scope: "posts:write" });
     expect(requiredScopeForRoute("POST", "/moderation/check")).toEqual({ kind: "scope", scope: "settings:write" });
+    // Package #10: outbound webhooks live under /settings -> settings resource.
+    expect(requiredScopeForRoute("GET", "/settings/webhooks")).toEqual({ kind: "scope", scope: "settings:read" });
+    expect(requiredScopeForRoute("POST", "/settings/webhooks")).toEqual({ kind: "scope", scope: "settings:write" });
+    expect(requiredScopeForRoute("POST", "/settings/webhooks/abc/rotate-secret")).toEqual({ kind: "scope", scope: "settings:write" });
+    expect(requiredScopeForRoute("GET", "/settings/webhooks/abc/deliveries")).toEqual({ kind: "scope", scope: "settings:read" });
     // Package #6: pipelines are the deals board's frame - same resource.
     expect(requiredScopeForRoute("GET", "/deals")).toEqual({ kind: "scope", scope: "deals:read" });
     expect(requiredScopeForRoute("POST", "/deals")).toEqual({ kind: "scope", scope: "deals:write" });

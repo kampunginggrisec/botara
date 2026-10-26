@@ -31,9 +31,9 @@ classification entry goes stale (route deleted, or a UI caller appeared).
    its classification entry (the guard's stale-entry checks fail until
    you do).
 
-## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27)
+## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27, #10 rows added 2026-10-27)
 
-141 routes: 113 UI · 18 WEBHOOK · 10 API-ONLY.
+148 routes: 120 UI · 18 WEBHOOK · 10 API-ONLY.
 
 ### Auth & session
 
@@ -249,6 +249,23 @@ widget, not the operator SPA.
 | GET /stats/overview | UI | Dashboard |
 | GET /stats/insights | UI | Analytics |
 | GET /config/public | UI | Channels connect gating (configured app ids) |
+
+### Outbound webhooks (package #10)
+
+| Route | Class | UI location / reason |
+|---|---|---|
+| GET /settings/webhooks | UI | Settings → Outbound webhooks (endpoint list) |
+| POST /settings/webhooks | UI | Settings → Outbound webhooks → "Add endpoint" (response carries the one-time signing secret) |
+| PATCH /settings/webhooks/{} | UI | Settings → Outbound webhooks → enabled switch (rename/URL/events via API) |
+| DELETE /settings/webhooks/{} | UI | Settings → Outbound webhooks → Delete |
+| POST /settings/webhooks/{}/rotate-secret | UI | Settings → Outbound webhooks → Rotate secret (new secret shown once) |
+| POST /settings/webhooks/{}/test | UI | Settings → Outbound webhooks → Send test (`webhook.test` ping through the delivery pipeline) |
+| GET /settings/webhooks/{}/deliveries | UI | Settings → Outbound webhooks → Deliveries table (latest 50) |
+
+> Adoption #10 (outbound event webhooks): the `/settings` prefix maps
+> to the `settings` scope resource for API tokens (`settings:read` for
+> GET, `settings:write` otherwise); route handlers additionally require
+> the owner/admin workspace role. Semantics: [outbound-webhooks.md](outbound-webhooks.md).
 
 ### Platform admin
 
