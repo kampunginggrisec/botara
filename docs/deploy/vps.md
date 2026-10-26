@@ -54,12 +54,26 @@ openssl rand -hex 32   # contoh: TELEGRAM_WEBHOOK_SECRET, TOKEN_VAULT_KEY, SESSI
 `WHATSAPP_VERIFY_TOKEN` boleh string acak buatan sendiri — nilainya harus
 sama dengan yang dimasukkan di konfigurasi webhook aplikasi Meta.
 
-### 5. Jalankan stack
+### 5. Jalankan Postgres, terapkan migrasi skema, lalu jalankan stack
+
+Skema database diterapkan lewat **migrasi Drizzle yang ter-commit**
+(`packages/db/drizzle/`), bukan lagi `drizzle-kit push`. Urutannya:
 
 ```bash
+# 1) Postgres saja dulu (port-nya ter-bind ke 127.0.0.1:5432 di host)
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d postgres
+
+# 2) Terapkan migrasi ke database baru (baseline membuat semua tabel)
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production run --rm api \
+  bun run --cwd packages/db db:migrate
+
+# 3) Baru jalankan seluruh stack
 docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
 docker compose -f infra/docker/docker-compose.prod.yml ps
 ```
+
+Detail aturan migrasi (termasuk database lama dari era push, seperti
+trial/staging) ada di bagian **Skema database & migrasi** di bawah.
 
 ### 6. Verifikasi
 
@@ -159,12 +173,53 @@ Aktifkan dengan `docker compose ... --profile mcp up -d mcp`. Jangan
 mengekspos port MCP ke publik tanpa TLS + auth di reverse proxy:
 token di dalamnya setara akses API penuh milik user tersebut.
 
+## Skema database & migrasi
+
+Satu-satunya jalur perubahan skema di produksi adalah **migrasi Drizzle**
+yang dihasilkan `drizzle-kit generate` dan ter-commit di
+`packages/db/drizzle/` (SQL + `meta/_journal.json` + snapshot):
+
+- **Install baru (database kosong):** jalankan
+  `bun run --cwd packages/db db:migrate` dengan `DATABASE_URL` menunjuk
+  database target (langkah 5 di atas memakai container sekali-pakai dari
+  image api; di layout native/systemd perintah yang sama dijalankan dari
+  checkout di server). Migrasi baseline `0000_baseline` membuat seluruh
+  tabel; migrasi berikutnya diterapkan berurutan dan tercatat di tabel
+  `drizzle.__drizzle_migrations`.
+- **Database lama dari era push** (skema dibuat `drizzle-kit push` atau DDL
+  manual — contohnya database trial/staging): skemanya SUDAH sama dengan
+  baseline, jadi baseline tidak boleh dijalankan ulang. Tandai sekali saja
+  sebagai sudah-terpasang ("stamp"), lalu migrasi menjadi no-op:
+
+  ```bash
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f packages/db/drizzle/stamp-baseline.sql
+  bun run --cwd packages/db db:migrate   # harus melaporkan tidak ada yang diterapkan
+  ```
+
+  Jangan pernah menjalankan stamp ke database kosong — database baru wajib
+  lewat `db:migrate` sungguhan.
+- **Perubahan skema berikutnya:** ubah `packages/db/src/schema.ts`, jalankan
+  `bun run --cwd packages/db db:generate`, commit file migrasi barunya,
+  lalu deploy menjalankan `db:migrate` (lihat bagian Update).
+- **`drizzle-kit push` (`db:push`) HANYA untuk development lokal.**
+  Jangan pernah menjalankannya ke produksi atau staging yang berisi data:
+  push tidak berversi, tidak bisa di-rollback, dan pernah gagal di tengah
+  jalan di server trial (Postgres 42P16) sampai database harus dibangun
+  ulang dari nol — baseline migrasi ini ada untuk mengakhiri praktik itu.
+
 ## Update (rilis baru)
 
 ```bash
 cd botara
 git pull
-docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d --build
+# Build image baru TANPA menyalakan ulang aplikasi dulu:
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production build
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d postgres
+# Terapkan migrasi yang ikut rilis ini SEBELUM aplikasi versi baru melayani trafik:
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production run --rm api \
+  bun run --cwd packages/db db:migrate
+# Baru nyalakan seluruh stack dengan image + skema baru:
+docker compose -f infra/docker/docker-compose.prod.yml --env-file .env.production up -d
 ```
 
 ## Rollback

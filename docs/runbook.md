@@ -46,9 +46,15 @@ Health checks:
 1. `bun scripts/check-deprecations.ts` — know what Meta is about to remove.
 2. `git pull` (or check out the target tag) on the server.
 3. `bun install` at the repo root.
-4. Apply pending Drizzle migrations (`bun run --cwd packages/db migrate`
+4. Apply pending Drizzle migrations (`bun run --cwd packages/db db:migrate`
    per the deploy doc) — schema changes are additive in Fase 3
    (new tables/columns only), so old and new code can overlap briefly.
+   Databases created before the migrations baseline (push era — e.g. the
+   trial DB) must be stamped ONCE first with
+   `packages/db/drizzle/stamp-baseline.sql`, after which `db:migrate`
+   no-ops on the baseline (see docs/deploy/vps.md, "Skema database &
+   migrasi"). NEVER run `drizzle-kit push` against production or any
+   database holding real data — push is local-dev-only.
 5. Rebuild web: `bun run build`.
 6. Restart api, worker, realtime (in that order); watch /health/ready
    until it returns 200, then check the structured logs for a minute.
