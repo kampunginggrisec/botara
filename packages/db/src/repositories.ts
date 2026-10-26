@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
@@ -774,6 +774,77 @@ export async function advanceBroadcastRecipientByProviderId(
     ));
   for (const row of rows) {
     if (await applyRecipientTransition(db, row, input.to, input.at ?? new Date(), input)) return true;
+  }
+  return false;
+}
+
+// ------------------------------------------------- message status (inbox)
+
+/** Delivery rank of an inbox message status; forward-only advancement. */
+const MESSAGE_STATUS_RANK: Record<string, number> = {
+  queued: 0,
+  sent: 1,
+  delivered: 2,
+  read: 3,
+};
+
+export type MessageStatusAdvance = "sent" | "delivered" | "read" | "failed";
+
+/**
+ * Pure lifecycle guard for one inbox message row (package #8), mirroring
+ * broadcastRecipientTransition: happy-path statuses advance strictly by
+ * rank (a late "delivered" receipt never regresses a "read" row, and a
+ * "read" arriving first implies the earlier steps), while "failed" is
+ * reachable only from queued/sent - a provider cannot un-deliver a
+ * message. Returns the next status, or null when the receipt must not
+ * change the row.
+ */
+export function messageStatusTransition(
+  current: string,
+  to: MessageStatusAdvance,
+): MessageStatusAdvance | null {
+  if (to === "failed") {
+    return current === "queued" || current === "sent" || current === "failed" ? "failed" : null;
+  }
+  if (current === "failed") return null;
+  const from = MESSAGE_STATUS_RANK[current];
+  const target = MESSAGE_STATUS_RANK[to];
+  if (from === undefined || target === undefined || target <= from) return null;
+  return to;
+}
+
+/**
+ * Advance the INBOX message row a provider status webhook refers to
+ * (package #8). The webhook knows only the provider message id, which
+ * outbound sends store on messages.external_id when the provider accepts
+ * them (updateMessageStatus at the send seam); the match is scoped to
+ * the workspace through the owning conversation and restricted to
+ * outbound rows - receipts never exist for inbound traffic. Unknown ids
+ * are a no-op (broadcast sends carry their own recipient rows and may
+ * not have a message row at all). Returns true when a row advanced.
+ */
+export async function advanceMessageStatusByProviderId(
+  db: Database,
+  input: {
+    workspaceId: string;
+    providerMessageId: string;
+    to: MessageStatusAdvance;
+  },
+): Promise<boolean> {
+  const rows = await db
+    .select({ id: messages.id, status: messages.status })
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .where(and(
+      eq(conversations.workspaceId, input.workspaceId),
+      eq(messages.externalId, input.providerMessageId),
+      eq(messages.direction, "out"),
+    ));
+  for (const row of rows) {
+    const next = messageStatusTransition(row.status, input.to);
+    if (!next) continue;
+    await db.update(messages).set({ status: next }).where(eq(messages.id, row.id));
+    return true;
   }
   return false;
 }
@@ -1936,6 +2007,8 @@ export interface WorkspaceMembershipView {
   workspaceName: string;
   slug: string;
   defaultCurrency: string;
+  /** Reply target in minutes (package #8) - the insights service goal. */
+  replyTargetMinutes: number;
   role: string;
   createdAt: Date;
 }
@@ -1948,6 +2021,7 @@ export async function listWorkspacesForUser(db: Database, userId: string): Promi
       workspaceName: workspaces.name,
       slug: workspaces.slug,
       defaultCurrency: workspaces.defaultCurrency,
+      replyTargetMinutes: workspaces.replyTargetMinutes,
       role: workspaceMembers.role,
       createdAt: workspaces.createdAt,
     })
@@ -2587,6 +2661,15 @@ export async function updateWorkspaceDefaultCurrency(
   currency: string,
 ): Promise<void> {
   await db.update(workspaces).set({ defaultCurrency: currency }).where(eq(workspaces.id, workspaceId));
+}
+
+/** Workspace reply target in minutes (package #8): the insights service goal. */
+export async function updateWorkspaceReplyTarget(
+  db: Database,
+  workspaceId: string,
+  minutes: number,
+): Promise<void> {
+  await db.update(workspaces).set({ replyTargetMinutes: minutes }).where(eq(workspaces.id, workspaceId));
 }
 
 // ------------------------------------------------------- dashboard stats
@@ -3782,4 +3865,249 @@ export async function getPipelineSummary(
     won: { count: won.count, value: cents(won.value) },
     lost: { count: lost.count, value: cents(lost.value) },
   };
+}
+
+// ------------------------------------------------------- insights (#8)
+
+/**
+ * Analytics depth, phase 1 (adoption package #8). Everything here is
+ * QUERY-TIME aggregation over the real messages/conversations/audit_log
+ * tables - no rollup tables. The price of that honesty is bounded by
+ * construction: period metrics read only messages inside a two-period
+ * window (<= 60 days, one indexed created_at range through the
+ * conversations workspace join), and the waiting block reads the slim
+ * (conversationId, direction, kind, createdAt) projection of messages
+ * belonging to this workspace's conversations, because a waiting
+ * thread's last inbound can be arbitrarily old. Definitions live in
+ * docs/analytics.md - the formulas below are the implementation of them.
+ */
+
+export interface InsightsChannelRow {
+  channel: string;
+  conversationsOpened: number;
+  messagesIn: number;
+  messagesOut: number;
+}
+
+export interface InsightsResponseBlock {
+  /** Open (non-resolved) conversations whose latest customer message is unanswered. */
+  waitingCount: number;
+  /** Minutes the longest-waiting conversation has waited; null when none wait. */
+  oldestWaitingMinutes: number | null;
+  /** Waiting conversations past the workspace reply target. */
+  overTargetCount: number;
+  medianFirstResponseMinutes: { human: number | null; ai: number | null };
+  previousMedianFirstResponseMinutes: { human: number | null; ai: number | null };
+}
+
+export interface WorkspaceInsights {
+  days: number;
+  /** ISO start of the current period (now - days). */
+  periodStart: string;
+  /** ISO start of the previous period (now - 2*days). */
+  previousPeriodStart: string;
+  replyTargetMinutes: number;
+  channels: InsightsChannelRow[];
+  response: InsightsResponseBlock;
+}
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  const value = sorted.length % 2 === 1 ? sorted[mid]! : (sorted[mid - 1]! + sorted[mid]!) / 2;
+  return round1(value);
+}
+
+interface TimedMessage {
+  conversationId: string;
+  direction: string;
+  kind: string;
+  authorKind: string;
+  createdAt: Date;
+}
+
+/**
+ * Median first response for one conversation cohort (conversations
+ * created inside [start, end)): per conversation, the gap between its
+ * first inbound message and the first outbound message after it. The
+ * bucket (human vs ai) is decided by the FIRST outbound's author_kind.
+ * Conversations never answered - or never written to by the customer -
+ * do not count.
+ */
+function firstResponseMedians(
+  cohortIds: Set<string>,
+  timed: TimedMessage[],
+): { human: number | null; ai: number | null } {
+  const byConversation = new Map<string, TimedMessage[]>();
+  for (const m of timed) {
+    if (!cohortIds.has(m.conversationId) || m.kind !== "message") continue;
+    const list = byConversation.get(m.conversationId) ?? [];
+    list.push(m);
+    byConversation.set(m.conversationId, list);
+  }
+  const gaps: { human: number[]; ai: number[] } = { human: [], ai: [] };
+  for (const list of byConversation.values()) {
+    const sorted = [...list].sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+    const firstIn = sorted.find((m) => m.direction === "in");
+    if (!firstIn) continue;
+    const firstOut = sorted.find(
+      (m) => m.direction === "out" && m.createdAt.getTime() > firstIn.createdAt.getTime(),
+    );
+    if (!firstOut) continue;
+    const gap = (firstOut.createdAt.getTime() - firstIn.createdAt.getTime()) / 60000;
+    gaps[firstOut.authorKind === "ai" ? "ai" : "human"].push(gap);
+  }
+  return { human: median(gaps.human), ai: median(gaps.ai) };
+}
+
+export async function getWorkspaceInsights(
+  db: Database,
+  workspaceId: string,
+  opts: { days: number; now: Date; replyTargetMinutes: number },
+): Promise<WorkspaceInsights> {
+  const { days, now, replyTargetMinutes } = opts;
+  const periodStart = new Date(now.getTime() - days * 24 * 3600 * 1000);
+  const previousPeriodStart = new Date(now.getTime() - 2 * days * 24 * 3600 * 1000);
+  const inWindow = (d: Date, start: Date, end: Date) => d.getTime() >= start.getTime() && d.getTime() < end.getTime();
+
+  // Every conversation of the workspace, with its account's channel.
+  const convRows = await db
+    .select({ conversation: conversations, channel: channelAccounts.channel })
+    .from(conversations)
+    .innerJoin(channelAccounts, eq(conversations.channelAccountId, channelAccounts.id))
+    .where(eq(conversations.workspaceId, workspaceId));
+
+  // Messages of the last two periods (the aggregation window).
+  const periodRows = await db
+    .select({ message: messages, channel: channelAccounts.channel })
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .innerJoin(channelAccounts, eq(conversations.channelAccountId, channelAccounts.id))
+    .where(and(
+      eq(conversations.workspaceId, workspaceId),
+      gte(messages.createdAt, previousPeriodStart),
+    ));
+  const timed: TimedMessage[] = periodRows.map((r) => ({
+    conversationId: r.message.conversationId,
+    direction: r.message.direction,
+    kind: r.message.kind ?? "message",
+    authorKind: r.message.authorKind ?? "human",
+    createdAt: r.message.createdAt,
+  }));
+
+  // ---- per-channel rows (current period only) --------------------------
+  const channelMap = new Map<string, InsightsChannelRow>();
+  const channelRow = (channel: string): InsightsChannelRow => {
+    const row = channelMap.get(channel) ?? { channel, conversationsOpened: 0, messagesIn: 0, messagesOut: 0 };
+    channelMap.set(channel, row);
+    return row;
+  };
+  for (const r of convRows) {
+    if (inWindow(r.conversation.createdAt, periodStart, now)) channelRow(r.channel).conversationsOpened += 1;
+  }
+  for (const r of periodRows) {
+    if (r.message.kind !== "message" && r.message.kind != null) continue;
+    if (!inWindow(r.message.createdAt, periodStart, now)) continue;
+    if (r.message.direction === "in") channelRow(r.channel).messagesIn += 1;
+    else if (r.message.direction === "out") channelRow(r.channel).messagesOut += 1;
+  }
+  const channels = [...channelMap.values()].sort((a, b) => a.channel.localeCompare(b.channel));
+
+  // ---- first response medians (cohort = conversation creation) ---------
+  const currentCohort = new Set<string>();
+  const previousCohort = new Set<string>();
+  for (const r of convRows) {
+    if (inWindow(r.conversation.createdAt, periodStart, now)) currentCohort.add(r.conversation.id);
+    else if (inWindow(r.conversation.createdAt, previousPeriodStart, periodStart)) previousCohort.add(r.conversation.id);
+  }
+
+  // ---- waiting block (point-in-time, not period-scoped) -----------------
+  // A conversation waits when it is not resolved and its latest customer
+  // message is newer than its latest outbound message (or it has none).
+  const openIds = new Set(
+    convRows.filter((r) => r.conversation.status !== "resolved").map((r) => r.conversation.id),
+  );
+  const openMessageRows = await db
+    .select({
+      conversationId: messages.conversationId,
+      direction: messages.direction,
+      kind: messages.kind,
+      createdAt: messages.createdAt,
+    })
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .where(eq(conversations.workspaceId, workspaceId));
+  const lastByConversation = new Map<string, { lastIn: Date | null; lastOut: Date | null }>();
+  for (const m of openMessageRows) {
+    if (!openIds.has(m.conversationId) || m.kind !== "message") continue;
+    const entry = lastByConversation.get(m.conversationId) ?? { lastIn: null, lastOut: null };
+    if (m.direction === "in" && (!entry.lastIn || m.createdAt > entry.lastIn)) entry.lastIn = m.createdAt;
+    if (m.direction === "out" && (!entry.lastOut || m.createdAt > entry.lastOut)) entry.lastOut = m.createdAt;
+    lastByConversation.set(m.conversationId, entry);
+  }
+  let waitingCount = 0;
+  let overTargetCount = 0;
+  let oldestWaitingMinutes: number | null = null;
+  for (const entry of lastByConversation.values()) {
+    if (!entry.lastIn) continue;
+    if (entry.lastOut && entry.lastOut.getTime() >= entry.lastIn.getTime()) continue;
+    const waited = (now.getTime() - entry.lastIn.getTime()) / 60000;
+    waitingCount += 1;
+    if (waited > replyTargetMinutes) overTargetCount += 1;
+    if (oldestWaitingMinutes === null || waited > oldestWaitingMinutes) oldestWaitingMinutes = waited;
+  }
+
+  return {
+    days,
+    periodStart: periodStart.toISOString(),
+    previousPeriodStart: previousPeriodStart.toISOString(),
+    replyTargetMinutes,
+    channels,
+    response: {
+      waitingCount,
+      oldestWaitingMinutes: oldestWaitingMinutes === null ? null : round1(oldestWaitingMinutes),
+      overTargetCount,
+      medianFirstResponseMinutes: firstResponseMedians(currentCohort, timed),
+      previousMedianFirstResponseMinutes: firstResponseMedians(previousCohort, timed),
+    },
+  };
+}
+
+export interface WorkspaceActivityRow {
+  id: string;
+  userId: string | null;
+  action: string;
+  details: Record<string, unknown>;
+  createdAt: Date;
+}
+
+/**
+ * The workspace activity feed (package #8): the newest audit_log entries
+ * OF THIS WORKSPACE ONLY, capped. Only event types the audit writers
+ * already emit - the feed invents no new sources. Actor display identity
+ * is resolved by the caller (member list), exactly like conversation
+ * assignees, so a departed actor degrades to a bare id, never a leak of
+ * another workspace's data.
+ */
+export async function listWorkspaceActivity(
+  db: Database,
+  workspaceId: string,
+  limit = 50,
+): Promise<WorkspaceActivityRow[]> {
+  const rows = await db
+    .select({
+      id: auditLog.id,
+      userId: auditLog.userId,
+      action: auditLog.action,
+      details: auditLog.details,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .where(eq(auditLog.workspaceId, workspaceId))
+    .orderBy(desc(auditLog.createdAt))
+    .limit(limit);
+  return rows.map((r) => ({ ...r, details: (r.details ?? {}) as Record<string, unknown> }));
 }

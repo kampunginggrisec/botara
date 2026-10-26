@@ -23,6 +23,13 @@ export const workspaces = pgTable("workspaces", {
    * and a deal created without an explicit currency lands here.
    */
   defaultCurrency: varchar("default_currency", { length: 3 }).notNull().default("IDR"),
+  /**
+   * Reply target in minutes (package #8): an open conversation whose
+   * latest inbound message has waited longer than this counts as
+   * over-target in GET /stats/insights. Workspace-level service goal,
+   * edited by workspace admins next to the default currency.
+   */
+  replyTargetMinutes: integer("reply_target_minutes").notNull().default(60),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex("workspaces_slug_idx").on(t.slug)]);
 

@@ -1,0 +1,1 @@
+ALTER TABLE "workspaces" ADD COLUMN "reply_target_minutes" integer DEFAULT 60 NOT NULL;
