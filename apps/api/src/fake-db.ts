@@ -1,5 +1,5 @@
 import {
-  auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, flows, flowWaits, growthLinks,
+  auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, flows, flowWaits, growthLinks,
   kbChunks, kbDocuments,
   messages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains, workspaces,
@@ -299,6 +299,7 @@ export interface FakeDatabase {
     webchatSessions: Row[];
     catalogProducts: Row[];
     broadcasts: Row[];
+    broadcastRecipients: Row[];
     templates: Row[];
     sequences: Row[];
     sequenceEnrollments: Row[];
@@ -327,6 +328,7 @@ export function createFakeDatabase(): FakeDatabase {
     webchatSessions: [] as Row[],
     catalogProducts: [] as Row[],
     broadcasts: [] as Row[],
+    broadcastRecipients: [] as Row[],
     templates: [] as Row[],
     sequences: [] as Row[],
     sequenceEnrollments: [] as Row[],
@@ -351,6 +353,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(webchatSessions, store.webchatSessions);
   core.register(catalogProducts, store.catalogProducts);
   core.register(broadcasts, store.broadcasts);
+  core.register(broadcastRecipients, store.broadcastRecipients);
   core.register(templates, store.templates);
   core.register(sequences, store.sequences);
   core.register(sequenceEnrollments, store.sequenceEnrollments);

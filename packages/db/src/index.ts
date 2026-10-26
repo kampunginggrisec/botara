@@ -1,7 +1,7 @@
 export * as schema from "./schema";
 export {
   workspaces, users, workspaceMembers, channelAccounts, contacts,
-  conversations, messages, savedReplies, templates, broadcasts, costLedger,
+  conversations, messages, savedReplies, templates, broadcasts, broadcastRecipients, costLedger,
   webchatSessions, scheduledPosts, sequences, sequenceEnrollments,
   tokenVault, workspaceDomains, auditLog, kbDocuments, kbChunks,
   dataDeletionRequests, flows, flowWaits, apiTokens, processedComments, growthLinks,

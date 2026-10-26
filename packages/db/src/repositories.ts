@@ -1,7 +1,7 @@
 import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
-  apiTokens, auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
+  apiTokens, auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
   dataDeletionRequests, flows, flowWaits, growthLinks, kbChunks, kbDocuments, messages,
   platformSettings,
   processedComments,
@@ -559,6 +559,285 @@ export async function incrementBroadcastCounts(
     .where(eq(broadcasts.id, id));
 }
 
+// ------------------------------------------------- broadcast recipients
+
+export type BroadcastRecipientRow = typeof broadcastRecipients.$inferSelect;
+export type BroadcastRecipientStatus =
+  | "pending" | "sent" | "delivered" | "read" | "replied" | "failed";
+
+/** Forward-only ordering of the happy-path lifecycle (failed sits outside it). */
+const RECIPIENT_RANK: Record<string, number> = {
+  pending: 0, sent: 1, delivered: 2, read: 3, replied: 4,
+};
+
+export interface BroadcastRecipientStamps {
+  status: string;
+  sentAt: Date | null;
+  deliveredAt: Date | null;
+  readAt: Date | null;
+  repliedAt: Date | null;
+}
+
+/**
+ * Pure lifecycle guard for one recipient row (package #4): given the
+ * current status + stamps and a desired transition, return the stamp
+ * patch to apply, or null when the transition must not happen.
+ *  - happy-path statuses advance strictly by rank (a late "delivered"
+ *    webhook never regresses a "read" row; earlier unset stamps are
+ *    backfilled with the same instant, e.g. delivered implies sent);
+ *  - "replied" is the top rank and is stamped once - a second inbound
+ *    message finds rank already maximal and changes nothing;
+ *  - "failed" is reachable only from pending/sent (a provider cannot
+ *    un-deliver a message) and a retry/resend success ("sent") is the
+ *    one exit from it besides the explicit resend reset.
+ */
+export function broadcastRecipientTransition(
+  current: BroadcastRecipientStamps,
+  to: BroadcastRecipientStatus,
+  at: Date,
+): Partial<BroadcastRecipientStamps> | null {
+  if (to === "failed") {
+    if (current.status === "pending" || current.status === "sent" || current.status === "failed") {
+      return { status: "failed" };
+    }
+    return null;
+  }
+  if (to === "sent") {
+    if (current.status === "pending" || current.status === "failed") {
+      return { status: "sent", sentAt: current.sentAt ?? at };
+    }
+    return null;
+  }
+  if (current.status === "failed") return null;
+  const from = RECIPIENT_RANK[current.status];
+  const target = RECIPIENT_RANK[to];
+  if (from === undefined || target === undefined || target <= from) return null;
+  const patch: Partial<BroadcastRecipientStamps> = { status: to };
+  if (target >= 1) patch.sentAt = current.sentAt ?? at;
+  if (target >= 2) patch.deliveredAt = current.deliveredAt ?? at;
+  if (target >= 3) patch.readAt = current.readAt ?? at;
+  if (to === "replied") patch.repliedAt = at;
+  return patch;
+}
+
+/**
+ * Fan-out bookkeeping: one pending row per (broadcast, contact),
+ * created BEFORE the sends are enqueued. Safe to re-run (job retry,
+ * crash recovery): existing rows are kept untouched.
+ */
+export async function ensureBroadcastRecipients(
+  db: Database,
+  input: { broadcastId: string; workspaceId: string; contactIds: string[] },
+): Promise<void> {
+  for (const contactId of input.contactIds) {
+    const [existing] = await db
+      .select({ id: broadcastRecipients.id })
+      .from(broadcastRecipients)
+      .where(and(eq(broadcastRecipients.broadcastId, input.broadcastId), eq(broadcastRecipients.contactId, contactId)))
+      .limit(1);
+    if (existing) continue;
+    try {
+      await db.insert(broadcastRecipients).values({
+        broadcastId: input.broadcastId,
+        workspaceId: input.workspaceId,
+        contactId,
+        status: "pending",
+      });
+    } catch (err) {
+      // A concurrent fan-out won the insert; the unique index is the
+      // arbiter and the row now exists, which is all this needs.
+      if (!isUniqueViolation(err)) throw err;
+    }
+  }
+}
+
+async function applyRecipientTransition(
+  db: Database,
+  row: BroadcastRecipientRow,
+  to: BroadcastRecipientStatus,
+  at: Date,
+  extra: { providerMessageId?: string; error?: string | null },
+): Promise<boolean> {
+  const patch = broadcastRecipientTransition(row, to, at);
+  if (!patch) return false;
+  const set: Record<string, unknown> = { ...patch, updatedAt: at };
+  if (extra.providerMessageId) set.providerMessageId = extra.providerMessageId;
+  if (to === "failed") set.error = extra.error ?? null;
+  if (to === "sent") set.error = null;
+  await db.update(broadcastRecipients).set(set).where(eq(broadcastRecipients.id, row.id));
+  return true;
+}
+
+/**
+ * Advance the recipient of one broadcast send, keyed by (broadcast,
+ * contact) - the send processor's outcome seam. Returns true when the
+ * transition was applied.
+ */
+export async function advanceBroadcastRecipient(
+  db: Database,
+  input: {
+    broadcastId: string;
+    contactId: string;
+    to: BroadcastRecipientStatus;
+    at?: Date;
+    providerMessageId?: string;
+    error?: string | null;
+  },
+): Promise<boolean> {
+  const [row] = await db
+    .select()
+    .from(broadcastRecipients)
+    .where(and(eq(broadcastRecipients.broadcastId, input.broadcastId), eq(broadcastRecipients.contactId, input.contactId)))
+    .limit(1);
+  if (!row) return false;
+  return applyRecipientTransition(db, row, input.to, input.at ?? new Date(), input);
+}
+
+/**
+ * Advance a recipient from a provider status webhook: the webhook
+ * knows only the provider message id, so the row is matched on
+ * (workspace, provider_message_id). A provider "sent" echo arriving
+ * while the row is still pending also advances (and backfills sentAt).
+ */
+export async function advanceBroadcastRecipientByProviderId(
+  db: Database,
+  input: {
+    workspaceId: string;
+    providerMessageId: string;
+    to: "sent" | "delivered" | "read" | "failed";
+    at?: Date;
+    error?: string | null;
+  },
+): Promise<boolean> {
+  const rows = await db
+    .select()
+    .from(broadcastRecipients)
+    .where(and(
+      eq(broadcastRecipients.workspaceId, input.workspaceId),
+      eq(broadcastRecipients.providerMessageId, input.providerMessageId),
+    ));
+  for (const row of rows) {
+    if (await applyRecipientTransition(db, row, input.to, input.at ?? new Date(), input)) return true;
+  }
+  return false;
+}
+
+/**
+ * Mark a contact's LATEST still-open broadcast recipient as replied:
+ * when a contact answers, the reply is attributed to the most recent
+ * broadcast they actually received (sent/delivered/read) - older
+ * broadcasts keep their state. Already-replied rows are untouched, so
+ * only the first reply is ever stamped.
+ */
+export async function markBroadcastRecipientReplied(
+  db: Database,
+  input: { workspaceId: string; contactId: string; at?: Date },
+): Promise<boolean> {
+  const rows = await db
+    .select()
+    .from(broadcastRecipients)
+    .where(and(
+      eq(broadcastRecipients.workspaceId, input.workspaceId),
+      eq(broadcastRecipients.contactId, input.contactId),
+    ));
+  const open = rows
+    .filter((r) => r.status === "sent" || r.status === "delivered" || r.status === "read")
+    .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  const latest = open[0];
+  if (!latest) return false;
+  return applyRecipientTransition(db, latest, "replied", input.at ?? new Date(), {});
+}
+
+export interface BroadcastRecipientWithContact extends BroadcastRecipientRow {
+  contactDisplayName: string | null;
+  contactExternalId: string;
+  contactChannel: string;
+}
+
+/** All recipient rows of one broadcast (workspace-scoped), oldest first, with contact display info. */
+export async function listBroadcastRecipients(
+  db: Database,
+  workspaceId: string,
+  broadcastId: string,
+): Promise<BroadcastRecipientWithContact[]> {
+  const rows = await db
+    .select({
+      id: broadcastRecipients.id,
+      broadcastId: broadcastRecipients.broadcastId,
+      workspaceId: broadcastRecipients.workspaceId,
+      contactId: broadcastRecipients.contactId,
+      status: broadcastRecipients.status,
+      providerMessageId: broadcastRecipients.providerMessageId,
+      messageId: broadcastRecipients.messageId,
+      error: broadcastRecipients.error,
+      sentAt: broadcastRecipients.sentAt,
+      deliveredAt: broadcastRecipients.deliveredAt,
+      readAt: broadcastRecipients.readAt,
+      repliedAt: broadcastRecipients.repliedAt,
+      createdAt: broadcastRecipients.createdAt,
+      updatedAt: broadcastRecipients.updatedAt,
+      contactDisplayName: contacts.displayName,
+      contactExternalId: contacts.externalId,
+      contactChannel: contacts.channel,
+    })
+    .from(broadcastRecipients)
+    .innerJoin(contacts, eq(broadcastRecipients.contactId, contacts.id))
+    .where(and(
+      eq(broadcastRecipients.workspaceId, workspaceId),
+      eq(broadcastRecipients.broadcastId, broadcastId),
+    ))
+    .orderBy(asc(broadcastRecipients.createdAt));
+  return rows as BroadcastRecipientWithContact[];
+}
+
+/** Contact ids of one broadcast's recipients currently in `failed` (resend targeting). */
+export async function listFailedBroadcastRecipientContactIds(
+  db: Database,
+  workspaceId: string,
+  broadcastId: string,
+): Promise<string[]> {
+  const rows = await db
+    .select({ contactId: broadcastRecipients.contactId })
+    .from(broadcastRecipients)
+    .where(and(
+      eq(broadcastRecipients.workspaceId, workspaceId),
+      eq(broadcastRecipients.broadcastId, broadcastId),
+      eq(broadcastRecipients.status, "failed"),
+    ));
+  return rows.map((r) => r.contactId);
+}
+
+/**
+ * Resend bookkeeping: move specific recipients back to `pending` for a
+ * fresh attempt (stale provider id + delivery stamps of the failed
+ * attempt are cleared), or - when the resend enqueue itself failed -
+ * back to `failed` with the reason.
+ */
+export async function resetBroadcastRecipients(
+  db: Database,
+  input: {
+    broadcastId: string;
+    contactIds: string[];
+    to: "pending" | "failed";
+    error?: string | null;
+  },
+): Promise<void> {
+  for (const contactId of input.contactIds) {
+    await db
+      .update(broadcastRecipients)
+      .set(input.to === "pending"
+        ? {
+            status: "pending", error: null, providerMessageId: null,
+            sentAt: null, deliveredAt: null, readAt: null, updatedAt: new Date(),
+          }
+        : { status: "failed", error: input.error ?? null, updatedAt: new Date() })
+      .where(and(
+        eq(broadcastRecipients.broadcastId, input.broadcastId),
+        eq(broadcastRecipients.contactId, contactId),
+      ));
+  }
+}
+
 // ------------------------------------------------------------- cost ledger
 
 export async function insertCostLedger(
@@ -830,6 +1109,10 @@ export async function purgeChannelAccount(
     }
     await txDb.delete(sequences).where(eq(sequences.channelAccountId, id));
 
+    const bcs = await txDb.select().from(broadcasts).where(eq(broadcasts.channelAccountId, id));
+    for (const bc of bcs) {
+      await txDb.delete(broadcastRecipients).where(eq(broadcastRecipients.broadcastId, bc.id));
+    }
     await txDb.delete(broadcasts).where(eq(broadcasts.channelAccountId, id));
     await txDb.delete(templates).where(eq(templates.channelAccountId, id));
     await txDb.delete(processedComments).where(eq(processedComments.channelAccountId, id));
@@ -2915,6 +3198,7 @@ export async function purgeExternalUserData(
     }
     await db.delete(webchatSessions).where(eq(webchatSessions.contactId, contact.id));
     await db.delete(sequenceEnrollments).where(eq(sequenceEnrollments.contactId, contact.id));
+    await db.delete(broadcastRecipients).where(eq(broadcastRecipients.contactId, contact.id));
     await db.delete(conversations).where(eq(conversations.contactId, contact.id));
     await db.delete(contacts).where(eq(contacts.id, contact.id));
   }

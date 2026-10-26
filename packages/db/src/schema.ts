@@ -240,6 +240,43 @@ export const broadcasts = pgTable("broadcasts", {
 }, (t) => [index("broadcasts_ws_idx").on(t.workspaceId)]);
 
 /**
+ * Per-recipient delivery truth for one broadcast (package #4): the
+ * broadcasts row keeps only aggregate counters, so the lifecycle of each
+ * individual send lives here - pending at fan-out, sent/failed from the
+ * send processor's outcome, delivered/read mirrored from provider status
+ * webhooks (matched on provider_message_id inside the workspace), and
+ * replied from the contact's next inbound message. Transitions never
+ * move backwards; failed is terminal except via an explicit resend,
+ * which resets the row to pending for a fresh attempt. Like every other
+ * FK in this schema the references are NO ACTION - the purge paths
+ * delete recipient rows before their broadcast/contact (see
+ * purgeChannelAccount / purgeExternalUserData).
+ */
+export const broadcastRecipients = pgTable("broadcast_recipients", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  broadcastId: uuid("broadcast_id").notNull().references(() => broadcasts.id),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  status: varchar("status", { length: 40 }).notNull().default("pending"), // pending|sent|delivered|read|replied|failed
+  /** Provider message id of the accepted send (WhatsApp wamid etc.). */
+  providerMessageId: varchar("provider_message_id", { length: 200 }),
+  /** Persisted inbox message row for this send, when the send path creates one. */
+  messageId: uuid("message_id").references(() => messages.id),
+  /** Last failure detail (send processor error or provider status error). */
+  error: text("error"),
+  sentAt: timestamp("sent_at", { withTimezone: true }),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  readAt: timestamp("read_at", { withTimezone: true }),
+  repliedAt: timestamp("replied_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("broadcast_recipients_broadcast_contact_idx").on(t.broadcastId, t.contactId),
+  index("broadcast_recipients_ws_idx").on(t.workspaceId),
+  index("broadcast_recipients_provider_idx").on(t.providerMessageId),
+]);
+
+/**
  * Webchat visitor sessions (Fase 2). A session binds a secret token (issued
  * by the public widget API, presented by the visitor's browser on every
  * poll/send) to a contact + conversation. The contact's externalId is
