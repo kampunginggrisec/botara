@@ -33,7 +33,7 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 
 ## Parity table (post-fix state, 2026-10-26)
 
-119 routes: 92 UI · 18 WEBHOOK · 9 API-ONLY.
+120 routes: 93 UI · 18 WEBHOOK · 9 API-ONLY.
 
 ### Auth & session
 
@@ -172,6 +172,7 @@ is the channel chat.
 | POST /sequences/{}/enroll | UI | Sequences → Enroll by tag |
 | GET /kb/documents | UI | Knowledge Base list |
 | POST /kb/documents | UI | Knowledge Base → Add document |
+| POST /kb/documents/upload | UI | Knowledge Base → Upload a file (PDF/DOCX/TXT/MD, text extracted server-side) |
 | GET /kb/documents/{} | API-ONLY | Single-document fetch for API consumers; the SPA lists + deletes |
 | DELETE /kb/documents/{} | UI | Knowledge Base → Delete |
 | GET /growth-links | UI | Growth Links list |

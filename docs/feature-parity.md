@@ -58,7 +58,7 @@ not started; *Not planned* = deliberately out of scope for now.
 | Feature | ChatbotX | Botara | Botara location / notes |
 |---|---|---|---|
 | AI agents (BYOK: OpenAI, Claude, Gemini, DeepSeek, OpenRouter, local LLMs, …) | All plans (unlimited agents, BYOK) | **Implemented** | OpenAI-compatible provider behind one interface — any compatible endpoint (incl. gateways for non-compatible providers) works by base-URL + key; `ai_reply` flow node + Inbox AI suggestions |
-| Knowledge bases for agents (RAG) | Claimed (docs API overview) | **Implemented** | KB documents → chunks → embeddings; top-3 cosine retrieval grounds `ai_reply` and suggestions |
+| Knowledge bases for agents (RAG) | Claimed (docs API overview) | **Implemented** | KB documents → chunks → embeddings; top-3 cosine retrieval grounds `ai_reply` and suggestions. Documents can be typed or uploaded as files (PDF/DOCX/TXT/MD via `POST /kb/documents/upload`): text is extracted server-side (10 MB file cap, 200k stored chars, truncation flagged), only the text + source filename are kept — originals are never stored and there is no OCR, so scanned PDFs without a text layer are rejected |
 | Agentic inbox copilot (summaries, smart replies, intent scoring) | Claimed (homepage marketing) | **Partial** | AI reply suggestions implemented; conversation summaries / intent scoring not built |
 | MCP server (tools for Claude/ChatGPT/Cursor/…) | All plans | **Implemented** | `apps/mcp` (`@botara/mcp`, official MCP SDK): Streamable HTTP (stateless, `PORT_MCP` 3003) + stdio; 11 safe tools over the REST API authenticated by a personal `bta_` token (Settings → API tokens); see `docs/mcp.md` |
 | Agent frameworks (OpenClaw, Hermes, Claude agents) | Claimed | **Not planned** | — |

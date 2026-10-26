@@ -1968,6 +1968,10 @@ function KnowledgePage() {
   const [content, setContent] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadTitle, setUploadTitle] = useState("");
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -2004,18 +2008,48 @@ function KnowledgePage() {
     }
   };
 
+  const upload = async () => {
+    if (!uploadFile) return;
+    setUploadBusy(true);
+    try {
+      const result = await api.uploadKbDocument(uploadFile, uploadTitle);
+      pushToast("ok", result.extraction.truncated
+        ? t("knowledge.uploadDoneTruncated", { chars: result.extraction.chars, filename: result.extraction.sourceFilename })
+        : t("knowledge.uploadDone", { chars: result.extraction.chars, filename: result.extraction.sourceFilename }));
+      setUploadFile(null);
+      setUploadTitle("");
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("knowledge.uploadFailed")));
+    } finally {
+      setUploadBusy(false);
+    }
+  };
+
   return (
     <div>
       <PageTitle title={t("knowledge.title")} subtitle={t("knowledge.subtitle")} />
       {error && <div className="mt-4 max-w-xl"><ErrorBox error={error} /></div>}
       <div className="mt-6 grid grid-cols-1 lg:grid-cols-2 gap-4 max-w-4xl">
-        <div className={`${cardCls} p-4 space-y-3`}>
-          <div className="font-medium text-sm">{t("knowledge.addTitle")}</div>
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t("knowledge.titlePlaceholder")} className={inputCls} />
-          <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={8} placeholder={t("knowledge.contentPlaceholder")} className={inputCls} />
-          <button onClick={() => void create()} disabled={busy || !title.trim() || !content.trim()} className={primaryBtn}>
-            {busy ? t("common.saving") : t("knowledge.saveButton")}
-          </button>
+        <div className="space-y-4">
+          <div className={`${cardCls} p-4 space-y-3`}>
+            <div className="font-medium text-sm">{t("knowledge.addTitle")}</div>
+            <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder={t("knowledge.titlePlaceholder")} className={inputCls} />
+            <textarea value={content} onChange={(e) => setContent(e.target.value)} rows={8} placeholder={t("knowledge.contentPlaceholder")} className={inputCls} />
+            <button onClick={() => void create()} disabled={busy || !title.trim() || !content.trim()} className={primaryBtn}>
+              {busy ? t("common.saving") : t("knowledge.saveButton")}
+            </button>
+          </div>
+          <div className={`${cardCls} p-4 space-y-3`}>
+            <div className="font-medium text-sm">{t("knowledge.uploadTitle")}</div>
+            <input ref={fileInputRef} type="file" accept=".pdf,.docx,.txt,.md" onChange={(e) => setUploadFile(e.target.files?.[0] ?? null)} className={inputCls} />
+            <input value={uploadTitle} onChange={(e) => setUploadTitle(e.target.value)} placeholder={t("knowledge.uploadTitlePlaceholder")} className={inputCls} />
+            <p className="text-xs text-slate-500 dark:text-slate-400">{t("knowledge.uploadHelp")}</p>
+            <button onClick={() => void upload()} disabled={uploadBusy || !uploadFile} className={primaryBtn}>
+              {uploadBusy ? t("common.saving") : t("knowledge.uploadButton")}
+            </button>
+          </div>
         </div>
         <div className="space-y-2">
           {documents.length === 0 && !error && <EmptyState>{t("knowledge.empty")}</EmptyState>}
@@ -2026,6 +2060,11 @@ function KnowledgePage() {
                 <div className="text-xs text-slate-500 dark:text-slate-400">
                   {t("common.status")}: {d.status} · {d.chunkCount} {t("knowledge.chunks")}{d.error ? ` · ${d.error}` : ""}
                 </div>
+                {d.sourceFilename && (
+                  <div className="text-xs text-slate-500 dark:text-slate-400">
+                    {t("knowledge.fromFile", { filename: d.sourceFilename })}
+                  </div>
+                )}
               </div>
               <button onClick={() => void remove(d.id)} className="text-xs text-red-600 dark:text-red-400 underline">{t("common.delete")}</button>
             </div>

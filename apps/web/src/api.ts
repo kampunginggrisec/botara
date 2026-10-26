@@ -80,7 +80,10 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     res = await fetch(`${BASE_URL}${path}`, {
       ...init,
       headers: {
-        "content-type": "application/json",
+        // FormData bodies (file uploads) must NOT get a manual
+        // content-type: the browser sets multipart/form-data with the
+        // boundary itself.
+        ...(init.body instanceof FormData ? {} : { "content-type": "application/json" }),
         ...(token ? { authorization: `Bearer ${token}` } : {}),
         ...(workspaceId ? { "x-workspace-id": workspaceId } : {}),
         ...(init.headers ?? {}),
@@ -181,7 +184,15 @@ export interface KbDocument {
   status: string;
   chunkCount: number;
   error?: string;
+  /** Original filename for uploaded documents (provenance; the file itself is never stored). */
+  sourceFilename?: string;
   createdAt: string;
+}
+
+/** POST /kb/documents/upload result: the document + extraction metadata. */
+export interface KbUploadResult {
+  document: KbDocument;
+  extraction: { format: string; chars: number; truncated: boolean; sourceFilename: string };
 }
 
 export interface ConversationAssignee {
@@ -669,6 +680,13 @@ export const api = {
   },
   createKbDocument(body: { title: string; content: string }): Promise<{ document: KbDocument }> {
     return request("/kb/documents", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** Upload a document file (PDF/DOCX/TXT/MD); the API extracts the text server-side. */
+  uploadKbDocument(file: File, title?: string): Promise<KbUploadResult> {
+    const form = new FormData();
+    form.append("file", file);
+    if (title?.trim()) form.append("title", title.trim());
+    return request("/kb/documents/upload", { method: "POST", body: form });
   },
   deleteKbDocument(id: string): Promise<{ deleted: boolean }> {
     return request(`/kb/documents/${id}`, { method: "DELETE" });

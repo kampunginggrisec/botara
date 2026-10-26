@@ -194,7 +194,9 @@ needs the external items in the checklist below):
   via the admin panel, per-product webhook/OAuth steps, Embedded
   Signup, the WhatsApp test number, troubleshooting, final checklist.
 - **Web:** login/register, token-based API client, workspace switcher,
-  Knowledge Base page, and public `/privacy` + `/terms` template pages.
+  Knowledge Base page (typed documents or file upload — PDF/DOCX/TXT/MD
+  with server-side text extraction; originals are never stored and there
+  is no OCR), and public `/privacy` + `/terms` template pages.
 
 ## Completion package status (post Fase 4)
 
