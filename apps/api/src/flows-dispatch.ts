@@ -481,10 +481,19 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       }
       return existing;
     }
-    return deps.store.createConversation({
+    const created = await deps.store.createConversation({
       workspaceId, channelAccountId: accountId, contactId,
       ...(conversationExternalId ? { externalId: conversationExternalId } : {}),
     });
+    // The repository backstops the one-open-thread invariant with a
+    // partial unique index: when a concurrent event won the create race,
+    // createConversation returns THAT thread instead of a fresh row - in
+    // which case it may still lack the provider id this event carries,
+    // so run the same backfill as the existing-thread branch above.
+    if (conversationExternalId && !created.externalId && deps.store.setConversationExternalId) {
+      await deps.store.setConversationExternalId(created.id, conversationExternalId).catch(() => undefined);
+    }
+    return created;
   }
 
   /**

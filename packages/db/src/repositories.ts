@@ -897,6 +897,24 @@ export async function findOrCreateWebchatAccount(db: Database, workspaceId: stri
   });
 }
 
+/**
+ * True when `err` is, or wraps, a Postgres unique_violation (SQLSTATE
+ * 23505). The postgres-js driver surfaces it as a PostgresError carrying
+ * `code`; drizzle may wrap it, so the `cause` chain is walked. An insert
+ * into `conversations` can only ever hit the partial unique index
+ * `conversations_open_unique_idx` (the PK is a random uuid), so a 23505
+ * from a conversation insert unambiguously means "a non-resolved thread
+ * for this (account, contact) already exists".
+ */
+export function isUniqueViolation(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 5 && current !== null && typeof current === "object"; depth++) {
+    if ((current as { code?: unknown }).code === "23505") return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
+}
+
 export async function createConversation(
   db: Database,
   input: {
@@ -908,17 +926,32 @@ export async function createConversation(
     externalId?: string;
   },
 ): Promise<ConversationRow> {
-  const [row] = await db
-    .insert(conversations)
-    .values({
-      workspaceId: input.workspaceId,
-      channelAccountId: input.channelAccountId,
-      contactId: input.contactId,
-      status: input.status ?? "open",
-      ...(input.externalId ? { externalId: input.externalId } : {}),
-    })
-    .returning();
-  return row!;
+  try {
+    const [row] = await db
+      .insert(conversations)
+      .values({
+        workspaceId: input.workspaceId,
+        channelAccountId: input.channelAccountId,
+        contactId: input.contactId,
+        status: input.status ?? "open",
+        ...(input.externalId ? { externalId: input.externalId } : {}),
+      })
+      .returning();
+    return row!;
+  } catch (err) {
+    // Race backstop for the one-open-thread invariant: two concurrent
+    // inbound events can both miss the find-open lookup; the partial
+    // unique index lets exactly one insert win, and the loser lands here.
+    // Reuse the winner's thread instead of failing the event (the same
+    // treatment findOrCreateContact gives contacts in the dispatcher).
+    // Resolved inserts are outside the partial index, so they never
+    // take this branch.
+    if (isUniqueViolation(err) && (input.status ?? "open") !== "resolved") {
+      const existing = await findOpenConversation(db, input);
+      if (existing) return existing;
+    }
+    throw err;
+  }
 }
 
 /**

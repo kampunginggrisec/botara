@@ -215,6 +215,26 @@ class FakeInsert {
           ...(hasUpdatedAt ? { updatedAt: new Date() } : {}),
           ...this.valuesObj,
         };
+        // Enforce the conversations_open_unique_idx partial unique index
+        // (one NON-RESOLVED conversation per channel account + contact)
+        // the way Postgres does: a clashing insert fails with SQLSTATE
+        // 23505, so the repository's race fallback is exercised against
+        // this fake exactly as it is against a real database.
+        if (this.table === conversations && row.status !== "resolved") {
+          const clash = this.core.rowsOf(this.table).some(
+            (r) => r.channelAccountId === row.channelAccountId
+              && r.contactId === row.contactId
+              && r.status !== "resolved",
+          );
+          if (clash) {
+            const err = new Error(
+              'duplicate key value violates unique constraint "conversations_open_unique_idx"',
+            ) as Error & { code: string; constraint_name: string };
+            err.code = "23505";
+            err.constraint_name = "conversations_open_unique_idx";
+            throw err;
+          }
+        }
         this.core.rowsOf(this.table).push(row);
         return [row];
       })
