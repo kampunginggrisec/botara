@@ -1,17 +1,17 @@
 import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore, type Dispatch, type ReactNode, type SetStateAction } from "react";
 import {
-  api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
+  api, ApiError, BASE_URL, clearSession, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
   type AdminUserItem, type AdminWorkspaceItem,
   type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastRecipient,
   type BroadcastRecipientCounts, type BroadcastSummary,
   type CatalogProduct, type CatalogSummary,
   type ChannelAccount, type ConnectionInfo, type Contact,
-  type ContactImportResult, type Conversation, type Deal, type Flow, type GrowthLink, type KbDocument,
+  type ContactImportResult, type Conversation, type Deal, type Flow, type GrowthLink, type InvitePreview, type KbDocument,
   type Member, type Message, type Pipeline, type PipelineSummary, type PublicConfig,
   type RichBlock, type ScheduledPost, type SegmentInfo,
   type Sequence, type SequenceStep, type StatsInsights, type StatsOverview, type Template, type WorkspaceDomain,
-  type WorkspaceSummary,
+  type WorkspaceInviteInfo, type WorkspaceSummary,
 } from "./api";
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
 import {
@@ -5706,6 +5706,12 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const [tokenFullAccess, setTokenFullAccess] = useState(true);
   const [tokenPicks, setTokenPicks] = useState<ScopePicks>(() => emptyScopePicks());
   const [tokenExpiryDays, setTokenExpiryDays] = useState("");
+  // Invite-by-link (#9): admin-only block inside the Members card.
+  const [inviteLinks, setInviteLinks] = useState<WorkspaceInviteInfo[]>([]);
+  const [linkRole, setLinkRole] = useState("member");
+  const [linkExpiryDays, setLinkExpiryDays] = useState("");
+  const [linkMaxUses, setLinkMaxUses] = useState("");
+  const [newInviteUrl, setNewInviteUrl] = useState<string | null>(null);
 
   useEffect(() => { setWsName(workspace?.name ?? ""); }, [workspace?.name]);
   useEffect(() => { setWsReplyTarget(String(workspace?.replyTargetMinutes ?? 60)); }, [workspace?.replyTargetMinutes]);
@@ -5782,6 +5788,65 @@ function SettingsPage({ user, workspace, refreshSession }: {
     }
   }, [workspace, t]);
   useEffect(() => { void loadMembers(); }, [loadMembers]);
+
+  const canManageMembers = workspace?.role === "owner" || workspace?.role === "admin";
+
+  const loadInviteLinks = useCallback(async () => {
+    if (!workspace || !canManageMembers) return;
+    try {
+      const res = await api.listInviteLinks(workspace.id);
+      setInviteLinks(res.invites);
+    } catch (err) {
+      setError(errText(err, t("settings.inviteLinkListFailed")));
+    }
+  }, [workspace, canManageMembers, t]);
+  useEffect(() => { void loadInviteLinks(); }, [loadInviteLinks]);
+
+  const createInviteLink = async () => {
+    if (!workspace) return;
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const maxUses = linkMaxUses.trim() ? Number(linkMaxUses) : null;
+      const res = await api.createInviteLink(workspace.id, {
+        role: linkRole,
+        ...(linkExpiryDays ? { expiresInDays: Number(linkExpiryDays) } : {}),
+        maxUses,
+      });
+      // One-time display: the full URL exists only in this response.
+      setNewInviteUrl(`${window.location.origin}${res.invitePath}`);
+      await loadInviteLinks();
+    } catch (err) {
+      setError(errText(err, t("settings.inviteLinkFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const revokeInviteLink = async (invite: WorkspaceInviteInfo) => {
+    if (!workspace || !window.confirm(t("settings.inviteLinkRevokeConfirm"))) return;
+    try {
+      await api.revokeInviteLink(workspace.id, invite.id);
+      if (newInviteUrl && newInviteUrl.includes(invite.prefix)) setNewInviteUrl(null);
+      await loadInviteLinks();
+    } catch (err) {
+      setError(errText(err, t("settings.inviteLinkListFailed")));
+    }
+  };
+
+  const transferOwnership = async (member: Member) => {
+    if (!workspace) return;
+    const label = member.name ?? member.email;
+    if (!window.confirm(t("settings.transferConfirm", { name: label }))) return;
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      await api.transferOwnership(workspace.id, member.userId);
+      setNotice(t("settings.transferDone"));
+      // Roles changed hands - the session (and this page's role gates)
+      // must be re-read before anything else renders.
+      refreshSession();
+      await loadMembers();
+    } catch (err) {
+      setError(errText(err, t("settings.transferFailed")));
+    } finally { setBusy(false); }
+  };
 
   const canRename = workspace && (workspace.role === "owner" || workspace.role === "admin");
 
@@ -6144,7 +6209,13 @@ function SettingsPage({ user, workspace, refreshSession }: {
           <tbody>
             {members.map((m) => (
               <tr key={m.userId} className="border-t border-slate-100 dark:border-slate-800">
-                <td className="px-3 py-2">{m.email}</td>
+                <td className="px-3 py-2">
+                  <span
+                    title={m.online ? t("settings.online") : t("settings.offline")}
+                    className={`mr-2 inline-block h-2 w-2 rounded-full align-middle ${m.online ? "bg-emerald-500" : "bg-slate-300 dark:bg-slate-600"}`}
+                  />
+                  {m.email}
+                </td>
                 <td className="px-3 py-2">{m.name ?? "-"}</td>
                 <td className="px-3 py-2">
                   <select
@@ -6157,11 +6228,102 @@ function SettingsPage({ user, workspace, refreshSession }: {
                 </td>
                 <td className="px-3 py-2">
                   <button onClick={() => void removeMember(m)} className="text-xs text-red-600 dark:text-red-400 underline">{t("settings.remove")}</button>
+                  {workspace?.role === "owner" && m.userId !== user.id && (
+                    <button onClick={() => void transferOwnership(m)} disabled={busy} className="ml-3 text-xs text-slate-600 dark:text-slate-300 underline">
+                      {t("settings.transferOwnership")}
+                    </button>
+                  )}
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
+
+        {canManageMembers && (
+          <div className="mt-6 border-t border-slate-100 pt-4 dark:border-slate-800">
+            <div className="font-medium text-sm">{t("settings.inviteLinkTitle")}</div>
+            <p className={`mt-1 ${mutedCls}`}>{t("settings.inviteLinkBody")}</p>
+            {newInviteUrl && (
+              <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950">
+                <div className="text-xs font-medium text-amber-900 dark:text-amber-200">{t("settings.inviteLinkOnce")}</div>
+                <div className="mt-1 flex items-center gap-2">
+                  <code className="flex-1 break-all rounded bg-white px-2 py-1 text-xs text-slate-900 dark:bg-slate-900 dark:text-slate-100">{newInviteUrl}</code>
+                  <button
+                    onClick={() => void navigator.clipboard.writeText(newInviteUrl)}
+                    className="text-xs text-slate-700 underline dark:text-slate-200"
+                  >
+                    {t("common.copy")}
+                  </button>
+                </div>
+              </div>
+            )}
+            <div className="mt-3 flex flex-wrap items-end gap-2">
+              <div>
+                <label className={labelCls}>{t("settings.inviteLinkRole")}</label>
+                <select value={linkRole} onChange={(e) => setLinkRole(e.target.value)} className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+                  {["admin", "member", "agent"].map((r) => <option key={r} value={r}>{r}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>{t("settings.inviteLinkExpiry")}</label>
+                <select value={linkExpiryDays} onChange={(e) => setLinkExpiryDays(e.target.value)} className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100">
+                  <option value="">{t("settings.inviteLinkNever")}</option>
+                  {[1, 7, 30, 90].map((d) => <option key={d} value={String(d)}>{t("settings.inviteLinkDays", { days: d })}</option>)}
+                </select>
+              </div>
+              <div>
+                <label className={labelCls}>{t("settings.inviteLinkMaxUses")}</label>
+                <input
+                  value={linkMaxUses}
+                  onChange={(e) => setLinkMaxUses(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))}
+                  className="w-28 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                />
+              </div>
+              <button onClick={() => void createInviteLink()} disabled={busy} className={primaryBtn}>{t("settings.inviteLinkCreate")}</button>
+            </div>
+            {inviteLinks.length > 0 && (
+              <table className="mt-4 w-full text-sm">
+                <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">{t("settings.inviteLinkTitle")}</th>
+                    <th className="px-3 py-2 font-medium">{t("common.role")}</th>
+                    <th className="px-3 py-2 font-medium">{t("settings.inviteLinkUses")}</th>
+                    <th className="px-3 py-2 font-medium">{t("settings.inviteLinkExpiry")}</th>
+                    <th className="px-3 py-2 font-medium">{t("common.actions")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {inviteLinks.map((invite) => {
+                    const expired = !invite.revokedAt && invite.expiresAt && new Date(invite.expiresAt).getTime() <= Date.now();
+                    return (
+                      <tr key={invite.id} className="border-t border-slate-100 dark:border-slate-800">
+                        <td className="px-3 py-2"><code className="text-xs">{invite.prefix}…</code></td>
+                        <td className="px-3 py-2">{invite.role}</td>
+                        <td className="px-3 py-2">{invite.usesCount} / {invite.maxUses ?? t("settings.inviteLinkUnlimited")}</td>
+                        <td className="px-3 py-2">
+                          {invite.revokedAt
+                            ? t("settings.inviteLinkRevoked")
+                            : expired
+                              ? t("settings.inviteLinkExpired")
+                              : invite.expiresAt
+                                ? new Date(invite.expiresAt).toLocaleDateString()
+                                : t("settings.inviteLinkNever")}
+                        </td>
+                        <td className="px-3 py-2">
+                          {!invite.revokedAt && (
+                            <button onClick={() => void revokeInviteLink(invite)} className="text-xs text-red-600 dark:text-red-400 underline">
+                              {t("settings.inviteLinkRevoke")}
+                            </button>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -6371,7 +6533,211 @@ function AppRoutes() {
   // never require auth - Meta App Review links straight to them.
   if (window.location.pathname === "/privacy") return <PrivacyPage />;
   if (window.location.pathname === "/terms") return <TermsPage />;
+  // Invite-by-link landing (#9): also pathname-based and reachable
+  // logged out; the page itself handles the sign-in step.
+  const inviteMatch = window.location.pathname.match(/^\/invite\/([^/]+)$/);
+  if (inviteMatch) return <InvitePage token={decodeURIComponent(inviteMatch[1]!)} />;
   return <AuthedApp />;
+}
+
+/**
+ * Invite landing page (#9). The preview is public (workspace name +
+ * role only); joining is an EXPLICIT Accept click under the visitor's
+ * own session - opening the link never joins anything. Logged-out
+ * visitors sign in / register right here (the token stays in the URL
+ * the whole time), then still have to click Accept.
+ */
+function InvitePage({ token }: { token: string }) {
+  const { t } = useI18n();
+  const [preview, setPreview] = useState<InvitePreview | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [sessionChecked, setSessionChecked] = useState(false);
+  const [mode, setMode] = useState<"login" | "register">("login");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [joined, setJoined] = useState<{ id: string; name: string } | null>(null);
+  const [alreadyMember, setAlreadyMember] = useState(false);
+  const [acceptError, setAcceptError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.previewInvite(token)
+      .then((res) => { if (!cancelled) setPreview(res); })
+      .catch((err) => { if (!cancelled) setPreviewError(errText(err, t("invite.invalid"))); });
+    return () => { cancelled = true; };
+  }, [token, t]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!getToken()) { setSessionChecked(true); return; }
+      try {
+        const me = await api.me();
+        if (!cancelled) setUser(me.user);
+      } catch {
+        // Stale token: drop it and treat the visitor as logged out.
+        clearSession();
+      } finally {
+        if (!cancelled) setSessionChecked(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const submitAuth = async () => {
+    setBusy(true);
+    setAuthError(null);
+    try {
+      const res = mode === "login"
+        ? await api.login({ email, password })
+        : await api.register({ email, password, name: name || undefined });
+      setToken(res.token);
+      setUser(res.user);
+    } catch {
+      setAuthError(t("invite.authFailed"));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const accept = async () => {
+    setBusy(true);
+    setAcceptError(null);
+    try {
+      const res = await api.acceptInvite(token);
+      setWorkspaceId(res.workspace.id);
+      setJoined({ id: res.workspace.id, name: res.workspace.name });
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "ALREADY_MEMBER") {
+        setAlreadyMember(true);
+      } else if (err instanceof ApiError && err.code.startsWith("INVITE_")) {
+        // The link died between preview and accept (revoked/expired/
+        // exhausted meanwhile) - re-preview so the exact state shows.
+        try { setPreview(await api.previewInvite(token)); } catch { /* keep the error below */ }
+        setAcceptError(errText(err, t("invite.acceptFailed")));
+      } else {
+        setAcceptError(errText(err, t("invite.acceptFailed")));
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openWorkspace = async () => {
+    // ALREADY_MEMBER carries no workspace id to the client (the accept
+    // route's error details are not surfaced by ApiError); resolve it
+    // by matching the preview's workspace name against the user's list.
+    try {
+      const list = await api.listWorkspaces();
+      const match = list.workspaces.find((w) => w.name === preview?.workspaceName) ?? list.workspaces[0];
+      if (match) setWorkspaceId(match.id);
+    } catch { /* the app shell falls back to the first workspace */ }
+    window.location.assign("/");
+  };
+
+  const invalidMessage = preview && !preview.valid
+    ? preview.reason === "revoked"
+      ? t("invite.revoked")
+      : preview.reason === "expired"
+        ? t("invite.expired")
+        : preview.reason === "exhausted"
+          ? t("invite.exhausted")
+          : t("invite.invalid")
+    : null;
+
+  return (
+    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex items-center justify-center p-4">
+      <div className="w-full max-w-sm">
+        <div className="mb-3 flex justify-end gap-2">
+          <LanguageSwitcher />
+          <ThemeToggle />
+        </div>
+        <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm p-6">
+          <div className="text-2xl font-bold tracking-tight">Botara</div>
+          <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">{t("invite.title")}</div>
+
+          {!preview && !previewError && (
+            <p className="mt-5 text-sm text-slate-500 dark:text-slate-400">{t("invite.loading")}</p>
+          )}
+          {previewError && <div className="mt-4"><ErrorBox error={previewError} /></div>}
+
+          {preview && invalidMessage && (
+            <div className="mt-4"><ErrorBox error={invalidMessage} /></div>
+          )}
+
+          {preview?.valid && joined && (
+            <div className="mt-5 space-y-3">
+              <NoticeBox>{t("invite.joined", { workspace: joined.name })}</NoticeBox>
+              <button onClick={() => window.location.assign("/")} className={`${primaryBtn} w-full`}>
+                {t("invite.goToWorkspace")}
+              </button>
+            </div>
+          )}
+
+          {preview?.valid && !joined && alreadyMember && (
+            <div className="mt-5 space-y-3">
+              <NoticeBox>{t("invite.alreadyMember")}</NoticeBox>
+              <button onClick={() => void openWorkspace()} className={`${primaryBtn} w-full`}>
+                {t("invite.openWorkspace")}
+              </button>
+            </div>
+          )}
+
+          {preview?.valid && !joined && !alreadyMember && (
+            <div className="mt-5 space-y-3">
+              <p className="text-sm">
+                {t("invite.invitedTo")} <strong>{preview.workspaceName}</strong>
+              </p>
+              <p className="text-sm text-slate-500 dark:text-slate-400">
+                {t("invite.roleLine", { role: preview.role ?? "member" })}
+              </p>
+              {preview.expiresAt && (
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  {t("invite.expiresLine", { date: new Date(preview.expiresAt).toLocaleString() })}
+                </p>
+              )}
+              {acceptError && <ErrorBox error={acceptError} />}
+
+              {sessionChecked && !user && (
+                <>
+                  <p className="text-sm text-slate-500 dark:text-slate-400">{t("invite.loginFirst")}</p>
+                  {authError && <ErrorBox error={authError} />}
+                  {mode === "register" && (
+                    <input value={name} onChange={(e) => setName(e.target.value)} placeholder={t("invite.name")} className={inputCls} />
+                  )}
+                  <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder={t("auth.emailPlaceholder")} className={inputCls} />
+                  <PasswordInput value={password} onChange={setPassword} placeholder={t("auth.passwordPlaceholder")} />
+                  <button
+                    onClick={() => void submitAuth()}
+                    disabled={busy || !email.trim() || password.length < 8}
+                    className={`${primaryBtn} w-full`}
+                  >
+                    {busy ? t("auth.processing") : mode === "login" ? t("invite.login") : t("invite.register")}
+                  </button>
+                  <button
+                    onClick={() => { setMode(mode === "login" ? "register" : "login"); setAuthError(null); }}
+                    className="w-full text-xs text-slate-500 underline dark:text-slate-400"
+                  >
+                    {mode === "login" ? t("auth.noAccount") : t("auth.haveAccount")}
+                  </button>
+                </>
+              )}
+
+              {user && (
+                <button onClick={() => void accept()} disabled={busy} className={`${primaryBtn} w-full`}>
+                  {busy ? t("invite.accepting") : t("invite.accept")}
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function AuthedApp() {

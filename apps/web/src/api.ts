@@ -557,6 +557,30 @@ export interface Member {
   email: string;
   name: string | null;
   role: string;
+  /** Presence (#9): a live realtime socket recently. Optional — older payloads omit it. */
+  online?: boolean;
+}
+
+/** Invite-by-link record (#9) as the admin list shows it — never the raw token or its hash. */
+export interface WorkspaceInviteInfo {
+  id: string;
+  prefix: string;
+  role: string;
+  expiresAt: string | null;
+  maxUses: number | null;
+  usesCount: number;
+  revokedAt: string | null;
+  createdAt: string;
+  createdByUserId: string;
+}
+
+/** Public invite preview (#9): workspace name + role on offer, nothing about members. */
+export interface InvitePreview {
+  valid: boolean;
+  reason: "invalid" | "revoked" | "expired" | "exhausted" | null;
+  workspaceName: string | null;
+  role: string | null;
+  expiresAt: string | null;
 }
 
 export interface PublicConfig {
@@ -1270,6 +1294,34 @@ export const api = {
   },
   removeMember(workspaceDbId: string, userId: string): Promise<{ removed: boolean }> {
     return request(`/workspaces/${workspaceDbId}/members/${userId}`, { method: "DELETE" });
+  },
+  // ------------------------------------------- invite-by-link (#9)
+  createInviteLink(
+    workspaceDbId: string,
+    body: { role: string; expiresInDays?: number; maxUses?: number | null },
+  ): Promise<{ invite: WorkspaceInviteInfo; token: string; invitePath: string }> {
+    return request(`/workspaces/${workspaceDbId}/invites`, { method: "POST", body: JSON.stringify(body) });
+  },
+  listInviteLinks(workspaceDbId: string): Promise<{ invites: WorkspaceInviteInfo[] }> {
+    return request(`/workspaces/${workspaceDbId}/invites`);
+  },
+  revokeInviteLink(workspaceDbId: string, inviteId: string): Promise<{ revoked: boolean }> {
+    return request(`/workspaces/${workspaceDbId}/invites/${inviteId}`, { method: "DELETE" });
+  },
+  transferOwnership(
+    workspaceDbId: string,
+    userId: string,
+  ): Promise<{ members: Member[]; workspace: { id: string; role: string } }> {
+    return request(`/workspaces/${workspaceDbId}/transfer-ownership`, {
+      method: "POST",
+      body: JSON.stringify({ userId }),
+    });
+  },
+  previewInvite(token: string): Promise<InvitePreview> {
+    return request(`/invites/${token}`);
+  },
+  acceptInvite(token: string): Promise<{ workspace: { id: string; name: string; slug: string; role: string }; member: Member }> {
+    return request(`/invites/${token}/accept`, { method: "POST", body: "{}" });
   },
   // ---------------------------------------------------- flows (Fase 4)
   listFlows(): Promise<{ flows: Flow[] }> {

@@ -1,6 +1,7 @@
 import IORedis from "ioredis";
+import { PRESENCE_TTL_SECONDS, presenceKey } from "@botara/shared";
 import {
-  RealtimeHub, createApiWorkspaceResolver, type RealtimeSocket,
+  RealtimeHub, createApiWorkspaceResolver, type PresenceSink, type RealtimeSocket,
 } from "./server";
 
 /**
@@ -36,9 +37,40 @@ if (!process.env.SESSION_SECRET) {
   console.error("[realtime] SESSION_SECRET is not set - every socket auth will fail closed until it is configured.");
 }
 
+/**
+ * Presence writer (#9): a DEDICATED command connection (the subscriber
+ * connection above cannot issue commands). Stamps
+ * `presence:{workspaceId}:{userId}` = "1" with the shared TTL on auth +
+ * every client ping; deletes the keys when the user's last socket
+ * closes. All operations are fire-and-forget - presence is a hint for
+ * the members list and must never disturb the socket path.
+ */
+const presenceRedis = new IORedis(redisUrl, {
+  maxRetriesPerRequest: 1,
+  retryStrategy: (times) => Math.min(times * 500, 5000),
+});
+presenceRedis.on("error", (err) => {
+  console.error(`[realtime] redis presence error: ${err.message || String(err)}`);
+});
+const presence: PresenceSink = {
+  touch(userId, workspaceIds) {
+    if (workspaceIds.length === 0) return;
+    const pipeline = presenceRedis.pipeline();
+    for (const workspaceId of workspaceIds) {
+      pipeline.set(presenceKey(workspaceId, userId), "1", "EX", PRESENCE_TTL_SECONDS);
+    }
+    pipeline.exec().catch(() => undefined);
+  },
+  clear(userId, workspaceIds) {
+    if (workspaceIds.length === 0) return;
+    presenceRedis.del(...workspaceIds.map((workspaceId) => presenceKey(workspaceId, userId))).catch(() => undefined);
+  },
+};
+
 const hub = new RealtimeHub({
   sessionSecret: process.env.SESSION_SECRET,
   resolveWorkspaces: createApiWorkspaceResolver(apiBaseUrl),
+  presence,
 });
 
 // Dedicated subscriber connection (a Redis connection in subscribe mode
@@ -97,6 +129,7 @@ console.log(`[realtime] listening on http://localhost:${server.port} (health: /h
 
 process.on("SIGTERM", () => {
   subscriber.disconnect();
+  presenceRedis.disconnect();
   server.stop(true);
   process.exit(0);
 });

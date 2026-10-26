@@ -120,6 +120,15 @@ export function isRealtimeDegraded(): boolean {
 const MAX_BACKOFF_MS = 30_000;
 const DEGRADED_AFTER_ATTEMPTS = 3;
 
+/**
+ * Presence heartbeat (#9): while the socket is ready the client pings
+ * every 30s; apps/realtime re-stamps the member's Redis presence keys
+ * (TTL 75s, contract in @botara/shared presence.ts - mirrored here
+ * because the web bundle does not import the shared package). Two
+ * missed pings of slack before a member reads offline.
+ */
+export const PRESENCE_HEARTBEAT_MS = 30_000;
+
 export function connectRealtime(options: {
   workspaceId: string;
   onInboxMessage: (event: InboxRealtimeEvent) => void;
@@ -131,6 +140,22 @@ export function connectRealtime(options: {
   let stopped = false;
   let attempts = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let pingTimer: ReturnType<typeof setInterval> | null = null;
+
+  const stopPing = () => {
+    if (pingTimer) {
+      clearInterval(pingTimer);
+      pingTimer = null;
+    }
+  };
+
+  const startPing = (ws: WebSocket) => {
+    stopPing();
+    pingTimer = setInterval(() => {
+      if (ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(JSON.stringify({ type: "ping" })); } catch { /* onclose owns reconnect */ }
+    }, PRESENCE_HEARTBEAT_MS);
+  };
 
   const sendSubscribe = () => {
     if (!socket || socket.readyState !== WebSocket.OPEN || !ready) return;
@@ -181,12 +206,14 @@ export function connectRealtime(options: {
           attempts = 0;
           degraded = false;
           sendSubscribe();
+          startPing(ws);
         }
       } catch { /* non-JSON frame - ignore */ }
     };
     ws.onclose = () => {
       ready = false;
       subscribedWorkspace = null;
+      stopPing();
       scheduleReconnect();
     };
     ws.onerror = () => {
@@ -205,6 +232,7 @@ export function connectRealtime(options: {
     },
     close() {
       stopped = true;
+      stopPing();
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;

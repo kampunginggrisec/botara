@@ -9,12 +9,19 @@ import { createHmac, timingSafeEqual } from "node:crypto";
  *     once the token verified AND the API confirmed the user's workspaces.
  *   client -> server: { "type": "subscribe", "workspaceId": "<id>" }
  *                     { "type": "unsubscribe", "workspaceId": "<id>" }
+ *                     { "type": "ping" }  (presence heartbeat, #9)
  *   server -> client: { "type": "subscribed" | "unsubscribed", "workspaceId" }
+ *                     { "type": "pong" }  (answer to a ping)
  *                     { "type": "error", "code", "message" }
  *                     inbox.message / inbox.update events from the
  *                     `botara:realtime` bus, forwarded verbatim, ONLY for
  *                     subscribed workspaces that are in the socket's
  *                     verified workspace set.
+ *
+ * Presence (#9): on auth and on every ping the hub touches the
+ * injected presence sink for the user's full verified workspace set;
+ * when the user's last socket closes the sink clears it. The members
+ * list in the API reads those keys as "online".
  *
  * Security model: the JWT is verified locally (HS256, SESSION_SECRET -
  * the same scheme the API signs with, mirrored below), and workspace
@@ -36,6 +43,23 @@ export interface RealtimeDeps {
   resolveWorkspaces: (token: string) => Promise<string[] | null>;
   /** Close unauthenticated sockets after this long (default 10s). */
   authTimeoutMs?: number;
+  /**
+   * Member presence sink (package #9): called on auth + every client
+   * ping (touch) and when a user's LAST socket closes (clear). The
+   * production sink writes Redis keys with the shared TTL; failures
+   * inside the sink must never break the hub - implementations swallow.
+   */
+  presence?: PresenceSink;
+}
+
+/**
+ * Presence writer port (see @botara/shared presence.ts for the key +
+ * TTL contract). Both calls receive the socket's FULL verified
+ * workspace set: presence is per membership, not per subscription.
+ */
+export interface PresenceSink {
+  touch(userId: string, workspaceIds: string[]): void;
+  clear(userId: string, workspaceIds: string[]): void;
 }
 
 export interface SessionClaims { userId: string; email: string }
@@ -77,6 +101,7 @@ export function verifySessionToken(
 interface ConnState {
   socket: RealtimeSocket;
   authed: boolean;
+  userId: string | null;
   workspaces: Set<string>;
   subscriptions: Set<string>;
   authTimer: ReturnType<typeof setTimeout> | null;
@@ -94,6 +119,7 @@ export class RealtimeHub {
     const state: ConnState = {
       socket,
       authed: false,
+      userId: null,
       workspaces: new Set(),
       subscriptions: new Set(),
       authTimer: setTimeout(() => {
@@ -107,6 +133,16 @@ export class RealtimeHub {
   handleClose(state: ConnState): void {
     if (state.authTimer) clearTimeout(state.authTimer);
     this.conns.delete(state);
+    // Presence: only the user's LAST open socket clears the keys - a
+    // second tab closing must not mark them offline in the first.
+    if (state.authed && state.userId && this.deps.presence) {
+      const stillConnected = [...this.conns].some(
+        (conn) => conn.authed && conn.userId === state.userId,
+      );
+      if (!stillConnected) {
+        this.deps.presence.clear(state.userId, [...state.workspaces]);
+      }
+    }
   }
 
   /** Redis bus fan-in: forward inbox.message / inbox.update payloads to subscribers. */
@@ -143,9 +179,29 @@ export class RealtimeHub {
       case "unsubscribe":
         this.handleSubscribe(state, msg.workspaceId, false);
         return;
+      case "ping":
+        this.handlePing(state);
+        return;
       default:
         this.sendError(state, "INVALID", `Unknown message type: ${String(msg.type)}`);
     }
+  }
+
+  /**
+   * Presence heartbeat (package #9): the client pings every
+   * PRESENCE_HEARTBEAT_MS; each ping re-stamps the user's presence
+   * keys before their TTL lapses and earns a pong so the client can
+   * tell a live socket from a zombie one.
+   */
+  private handlePing(state: ConnState): void {
+    if (!state.authed || !state.userId) {
+      this.sendError(state, "UNAUTHORIZED", "Authenticate before pinging.");
+      return;
+    }
+    this.deps.presence?.touch(state.userId, [...state.workspaces]);
+    try {
+      state.socket.send(JSON.stringify({ type: "pong" }));
+    } catch { /* dying socket - the close handler owns cleanup */ }
   }
 
   private async handleAuth(state: ConnState, token: string | undefined): Promise<void> {
@@ -176,11 +232,15 @@ export class RealtimeHub {
       return;
     }
     state.authed = true;
+    state.userId = claims.userId;
     state.workspaces = new Set(workspaces);
     if (state.authTimer) {
       clearTimeout(state.authTimer);
       state.authTimer = null;
     }
+    // Presence (#9): an authenticated socket makes the member online
+    // in every workspace the API verified for them.
+    this.deps.presence?.touch(claims.userId, workspaces);
     state.socket.send(JSON.stringify({ type: "ready", workspaces }));
   }
 

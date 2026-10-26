@@ -2,14 +2,16 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypt
 import { AppError, parseApiTokenScopes } from "@botara/shared";
 import {
   countPlatformAdmins, countUsers, sql,
-  createApiToken as createApiTokenRow, createUser, createWorkspace,
-  findApiTokenByHash, getUserByEmail, getUserById, getWorkspaceBySlug,
-  getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceMembers,
-  listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow,
+  acceptWorkspaceInvite, createApiToken as createApiTokenRow, createUser, createWorkspace,
+  createWorkspaceInvite, findApiTokenByHash, getUserByEmail, getUserById, getWorkspaceById, getWorkspaceBySlug,
+  getWorkspaceInviteByHash, getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceInvites,
+  listWorkspaceMembers,
+  listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow, revokeWorkspaceInvite,
   setUserPasswordHash, setUserPlatformAdmin, touchApiToken, touchUserLastLogin,
+  transferWorkspaceOwnership,
   updateUserName, updateWorkspaceDefaultCurrency, updateWorkspaceName, updateWorkspaceReplyTarget,
   upsertWorkspaceMember,
-  type Database,
+  type AcceptWorkspaceInviteOutcome, type Database, type WorkspaceInviteRow,
 } from "@botara/db";
 
 /**
@@ -63,6 +65,28 @@ export interface AuthMemberView {
   name: string | null;
   role: string;
 }
+
+/**
+ * One invite-by-link record (#9), dates as Date so the state classifier
+ * in invites.ts can work on it directly; the HTTP layer serializes.
+ * Carries the token HASH internally - the raw token never persists.
+ */
+export interface WorkspaceInviteRecord {
+  id: string;
+  workspaceId: string;
+  tokenHash: string;
+  prefix: string;
+  role: string;
+  createdByUserId: string;
+  expiresAt: Date | null;
+  maxUses: number | null;
+  usesCount: number;
+  revokedAt: Date | null;
+  createdAt: Date;
+}
+
+/** Result of an invite accept attempt - the repository's outcome union, re-exported for handlers. */
+export type AcceptInviteOutcome = AcceptWorkspaceInviteOutcome;
 
 /** Metadata view of a personal API token - never carries the raw token. */
 export interface ApiTokenView {
@@ -164,6 +188,31 @@ export interface AuthStore {
    * (unknown hash, revoked, or the owning user no longer exists).
    */
   resolveApiToken(rawToken: string): Promise<ApiTokenResolution>;
+  /** Invite-by-link (#9): mint a link for a workspace (hash stored, raw never persisted here). */
+  createInvite(input: {
+    workspaceId: string;
+    tokenHash: string;
+    prefix: string;
+    role: string;
+    createdByUserId: string;
+    expiresAt?: Date | null;
+    maxUses?: number | null;
+  }): Promise<WorkspaceInviteRecord>;
+  listInvites(workspaceId: string): Promise<WorkspaceInviteRecord[]>;
+  revokeInvite(workspaceId: string, inviteId: string): Promise<"revoked" | "already" | "missing">;
+  /** Preview + accept lookup by token hash; carries the workspace's public name/slug. */
+  findInviteByHash(tokenHash: string): Promise<(WorkspaceInviteRecord & { workspaceName: string; workspaceSlug: string }) | null>;
+  /**
+   * Atomically consume one use and add the member. An already-member
+   * outcome never consumes a use; the last use cannot be double-spent.
+   */
+  acceptInvite(invite: WorkspaceInviteRecord, userId: string): Promise<AcceptInviteOutcome>;
+  /**
+   * Ownership transfer (#9): atomically make `toUserId` the owner and
+   * demote every other owner (incl. the caller) to admin. False when
+   * the caller is not the owner or the target is not a member.
+   */
+  transferOwnership(workspaceId: string, fromUserId: string, toUserId: string): Promise<boolean>;
   audit(entry: {
     workspaceId?: string;
     userId?: string;
@@ -200,6 +249,26 @@ const toApiTokenView = (row: ApiTokenRowLike): ApiTokenView => ({
   lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
   revokedAt: row.revokedAt?.toISOString() ?? null,
   createdAt: row.createdAt.toISOString(),
+});
+
+/** workspace_invites row -> the store-level record (dates stay Dates). */
+const toInviteRecord = (row: WorkspaceInviteRow): WorkspaceInviteRecord => ({
+  id: row.id,
+  workspaceId: row.workspaceId,
+  tokenHash: row.tokenHash,
+  prefix: row.prefix,
+  role: row.role,
+  createdByUserId: row.createdByUserId,
+  expiresAt: row.expiresAt ?? null,
+  maxUses: row.maxUses ?? null,
+  usesCount: row.usesCount,
+  revokedAt: row.revokedAt ?? null,
+  createdAt: row.createdAt,
+});
+
+/** Inverse of toInviteRecord for the repository accept call. */
+const toInviteRow = (record: WorkspaceInviteRecord): WorkspaceInviteRow => ({
+  ...record,
 });
 
 /**
@@ -364,6 +433,45 @@ export class DbAuthStore implements AuthStore {
     return resolution.status === "ok" ? resolution.user : null;
   }
 
+  async createInvite(input: {
+    workspaceId: string;
+    tokenHash: string;
+    prefix: string;
+    role: string;
+    createdByUserId: string;
+    expiresAt?: Date | null;
+    maxUses?: number | null;
+  }) {
+    const row = await createWorkspaceInvite(this.getDatabase(), input);
+    return toInviteRecord(row);
+  }
+
+  async listInvites(workspaceId: string) {
+    const rows = await listWorkspaceInvites(this.getDatabase(), workspaceId);
+    return rows.map(toInviteRecord);
+  }
+
+  async revokeInvite(workspaceId: string, inviteId: string) {
+    return revokeWorkspaceInvite(this.getDatabase(), workspaceId, inviteId);
+  }
+
+  async findInviteByHash(tokenHash: string) {
+    const db = this.getDatabase();
+    const row = await getWorkspaceInviteByHash(db, tokenHash);
+    if (!row) return null;
+    const workspace = await getWorkspaceById(db, row.workspaceId);
+    if (!workspace) return null;
+    return { ...toInviteRecord(row), workspaceName: workspace.name, workspaceSlug: workspace.slug };
+  }
+
+  async acceptInvite(invite: WorkspaceInviteRecord, userId: string) {
+    return acceptWorkspaceInvite(this.getDatabase(), toInviteRow(invite), userId);
+  }
+
+  async transferOwnership(workspaceId: string, fromUserId: string, toUserId: string) {
+    return transferWorkspaceOwnership(this.getDatabase(), workspaceId, fromUserId, toUserId);
+  }
+
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
     await insertAuditLog(this.getDatabase(), entry);
   }
@@ -376,6 +484,7 @@ export class InMemoryAuthStore implements AuthStore {
   readonly members = new Map<string, { workspaceId: string; userId: string; role: string }>();
   readonly auditLog: Array<{ workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }> = [];
   readonly apiTokens = new Map<string, ApiTokenView & { userId: string; tokenHash: string }>();
+  readonly invites = new Map<string, WorkspaceInviteRecord>();
   readonly lastLogins = new Map<string, Date>();
 
   private memberKey(workspaceId: string, userId: string) {
@@ -547,6 +656,86 @@ export class InMemoryAuthStore implements AuthStore {
   async findUserByApiToken(rawToken: string) {
     const resolution = await this.resolveApiToken(rawToken);
     return resolution.status === "ok" ? resolution.user : null;
+  }
+
+  async createInvite(input: {
+    workspaceId: string;
+    tokenHash: string;
+    prefix: string;
+    role: string;
+    createdByUserId: string;
+    expiresAt?: Date | null;
+    maxUses?: number | null;
+  }) {
+    const invite: WorkspaceInviteRecord = {
+      id: crypto.randomUUID(),
+      workspaceId: input.workspaceId,
+      tokenHash: input.tokenHash,
+      prefix: input.prefix,
+      role: input.role,
+      createdByUserId: input.createdByUserId,
+      expiresAt: input.expiresAt ?? null,
+      maxUses: input.maxUses ?? null,
+      usesCount: 0,
+      revokedAt: null,
+      createdAt: new Date(),
+    };
+    this.invites.set(invite.id, invite);
+    return invite;
+  }
+
+  async listInvites(workspaceId: string) {
+    return [...this.invites.values()]
+      .filter((i) => i.workspaceId === workspaceId)
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+  }
+
+  async revokeInvite(workspaceId: string, inviteId: string) {
+    const invite = this.invites.get(inviteId);
+    if (!invite || invite.workspaceId !== workspaceId) return "missing" as const;
+    if (invite.revokedAt) return "already" as const;
+    invite.revokedAt = new Date();
+    return "revoked" as const;
+  }
+
+  async findInviteByHash(tokenHash: string) {
+    const invite = [...this.invites.values()].find((i) => i.tokenHash === tokenHash);
+    if (!invite) return null;
+    const workspace = this.workspaces.get(invite.workspaceId);
+    if (!workspace) return null;
+    return { ...invite, workspaceName: workspace.name, workspaceSlug: workspace.slug };
+  }
+
+  async acceptInvite(invite: WorkspaceInviteRecord, userId: string) {
+    // Mirror of the repository's transactional accept. This body is
+    // deliberately await-free: the membership check, the use
+    // consumption and the member insert all happen in one synchronous
+    // run, so two raced accepts cannot both spend the last use.
+    const live = this.invites.get(invite.id);
+    if (!live) return { status: "missing" as const };
+    if (this.members.has(this.memberKey(live.workspaceId, userId))) {
+      return { status: "already_member" as const };
+    }
+    const now = new Date();
+    if (live.revokedAt) return { status: "revoked" as const };
+    if (live.expiresAt && live.expiresAt.getTime() <= now.getTime()) return { status: "expired" as const };
+    if (live.maxUses !== null && live.usesCount >= live.maxUses) return { status: "exhausted" as const };
+    live.usesCount += 1;
+    this.members.set(this.memberKey(live.workspaceId, userId), {
+      workspaceId: live.workspaceId, userId, role: live.role,
+    });
+    return { status: "accepted" as const, role: live.role };
+  }
+
+  async transferOwnership(workspaceId: string, fromUserId: string, toUserId: string) {
+    const from = this.members.get(this.memberKey(workspaceId, fromUserId));
+    const to = this.members.get(this.memberKey(workspaceId, toUserId));
+    if (!from || from.role !== "owner" || !to) return false;
+    for (const m of this.members.values()) {
+      if (m.workspaceId === workspaceId && m.role === "owner") m.role = "admin";
+    }
+    to.role = "owner";
+    return true;
   }
 }
 

@@ -64,6 +64,34 @@ export const workspaceMembers = pgTable("workspace_members", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex("workspace_members_ws_user_idx").on(t.workspaceId, t.userId)]);
 
+/**
+ * Invite-by-link (adoption package #9): a workspace admin mints a
+ * shareable link; anyone with the link who signs in can accept it and
+ * join with the invite's role. Hygiene mirrors api_tokens: only the
+ * SHA-256 of the raw token is stored (`token_hash`), the raw token is
+ * returned ONCE at creation, and `prefix` is the non-secret display
+ * fragment the admin list shows. `role` can never be "owner" (ownership
+ * only moves via the transfer endpoint). Acceptance consumes a use with
+ * a conditional UPDATE so the last use cannot be double-spent by two
+ * concurrent accepts; `max_uses` NULL means unlimited.
+ */
+export const workspaceInvites = pgTable("workspace_invites", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  tokenHash: varchar("token_hash", { length: 64 }).notNull(),
+  prefix: varchar("prefix", { length: 20 }).notNull(),
+  role: varchar("role", { length: 40 }).notNull().default("member"), // admin|member|agent (never owner)
+  createdByUserId: uuid("created_by_user_id").notNull().references(() => users.id),
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
+  maxUses: integer("max_uses"),
+  usesCount: integer("uses_count").notNull().default(0),
+  revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("workspace_invites_hash_idx").on(t.tokenHash),
+  index("workspace_invites_ws_idx").on(t.workspaceId),
+]);
+
 export const channelAccounts = pgTable("channel_accounts", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),

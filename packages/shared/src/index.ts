@@ -24,3 +24,6 @@ export {
   scopeCovers, grantsAnyRead, tokenIsRestricted,
   type ApiTokenResource, type ApiTokenScope, type ApiTokenScopeLevel,
 } from "./api-tokens";
+export {
+  PRESENCE_KEY_PREFIX, PRESENCE_HEARTBEAT_MS, PRESENCE_TTL_SECONDS, presenceKey,
+} from "./presence";

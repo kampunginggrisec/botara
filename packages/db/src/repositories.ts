@@ -8,7 +8,7 @@ import {
   processedComments,
   savedReplies,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
-  users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
+  users, webchatSessions, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
 } from "./schema";
 
 /**
@@ -2066,6 +2066,179 @@ export async function removeWorkspaceMember(
     .delete(workspaceMembers)
     .where(and(eq(workspaceMembers.workspaceId, workspaceId), eq(workspaceMembers.userId, userId)));
   return true;
+}
+
+// ------------------------------------------------- workspace invites (#9)
+
+export type WorkspaceInviteRow = typeof workspaceInvites.$inferSelect;
+
+export async function createWorkspaceInvite(
+  db: Database,
+  input: {
+    workspaceId: string;
+    tokenHash: string;
+    prefix: string;
+    role: string;
+    createdByUserId: string;
+    expiresAt?: Date | null;
+    maxUses?: number | null;
+  },
+): Promise<WorkspaceInviteRow> {
+  const [row] = await db
+    .insert(workspaceInvites)
+    .values({
+      workspaceId: input.workspaceId,
+      tokenHash: input.tokenHash,
+      prefix: input.prefix,
+      role: input.role,
+      createdByUserId: input.createdByUserId,
+      expiresAt: input.expiresAt ?? null,
+      maxUses: input.maxUses ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+export async function listWorkspaceInvites(db: Database, workspaceId: string): Promise<WorkspaceInviteRow[]> {
+  return db
+    .select()
+    .from(workspaceInvites)
+    .where(eq(workspaceInvites.workspaceId, workspaceId))
+    .orderBy(desc(workspaceInvites.createdAt));
+}
+
+/** Token lookup for the public preview + accept routes (hash only, never the raw token). */
+export async function getWorkspaceInviteByHash(db: Database, tokenHash: string): Promise<WorkspaceInviteRow | null> {
+  const [row] = await db
+    .select()
+    .from(workspaceInvites)
+    .where(eq(workspaceInvites.tokenHash, tokenHash))
+    .limit(1);
+  return row ?? null;
+}
+
+/**
+ * Revoke (soft state, never a delete): stamps revoked_at. Returns
+ * "missing" when the invite is not in this workspace, "already" when it
+ * was revoked before (the route treats that as idempotent success).
+ */
+export async function revokeWorkspaceInvite(
+  db: Database,
+  workspaceId: string,
+  inviteId: string,
+): Promise<"revoked" | "already" | "missing"> {
+  const rows = await db
+    .update(workspaceInvites)
+    .set({ revokedAt: new Date() })
+    .where(and(
+      eq(workspaceInvites.id, inviteId),
+      eq(workspaceInvites.workspaceId, workspaceId),
+      isNull(workspaceInvites.revokedAt),
+    ))
+    .returning();
+  if (rows.length > 0) return "revoked";
+  const [existing] = await db
+    .select({ id: workspaceInvites.id })
+    .from(workspaceInvites)
+    .where(and(eq(workspaceInvites.id, inviteId), eq(workspaceInvites.workspaceId, workspaceId)))
+    .limit(1);
+  return existing ? "already" : "missing";
+}
+
+export type AcceptWorkspaceInviteOutcome =
+  | { status: "accepted"; role: string }
+  | { status: "already_member" }
+  | { status: "revoked" }
+  | { status: "expired" }
+  | { status: "exhausted" }
+  | { status: "missing" };
+
+/**
+ * Consume one use of an invite and add the member - atomically. The
+ * membership check, the use consumption and the member insert all run
+ * in ONE transaction, and the consumption is a single conditional
+ * UPDATE (not revoked, not expired, uses remaining): two concurrent
+ * accepts racing for the last use cannot both pass, because the second
+ * UPDATE observes the first's committed uses_count (and even under
+ * READ COMMITTED the row lock serializes them). An already-member
+ * never consumes a use.
+ */
+export async function acceptWorkspaceInvite(
+  db: Database,
+  invite: WorkspaceInviteRow,
+  userId: string,
+  now = new Date(),
+): Promise<AcceptWorkspaceInviteOutcome> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Database;
+    const existingMember = await getWorkspaceMember(txDb, invite.workspaceId, userId);
+    if (existingMember) return { status: "already_member" as const };
+    const consumed = await tx
+      .update(workspaceInvites)
+      .set({ usesCount: sql`${workspaceInvites.usesCount} + 1` })
+      .where(and(
+        eq(workspaceInvites.id, invite.id),
+        isNull(workspaceInvites.revokedAt),
+        or(isNull(workspaceInvites.expiresAt), sql`${workspaceInvites.expiresAt} > ${now}`),
+        or(isNull(workspaceInvites.maxUses), lt(workspaceInvites.usesCount, workspaceInvites.maxUses)),
+      ))
+      .returning();
+    if (consumed.length === 0) {
+      // Nothing consumed: classify the current state for the typed error.
+      const [fresh] = await tx
+        .select()
+        .from(workspaceInvites)
+        .where(eq(workspaceInvites.id, invite.id))
+        .limit(1);
+      if (!fresh) return { status: "missing" as const };
+      if (fresh.revokedAt) return { status: "revoked" as const };
+      if (fresh.expiresAt && fresh.expiresAt.getTime() <= now.getTime()) return { status: "expired" as const };
+      return { status: "exhausted" as const };
+    }
+    await tx.insert(workspaceMembers).values({
+      workspaceId: invite.workspaceId,
+      userId,
+      role: invite.role,
+    });
+    return { status: "accepted" as const, role: invite.role };
+  });
+}
+
+/**
+ * Ownership transfer (#9): one transaction swaps the roles - target
+ * becomes owner, the previous owner becomes admin, and any OTHER stale
+ * owner rows (the model tolerates several owner rows, e.g. via the
+ * role PATCH) are demoted to admin too, so exactly one owner remains.
+ * Returns false when either side is not a member / not the owner; the
+ * route pre-checks for typed errors, this is the atomic backstop.
+ */
+export async function transferWorkspaceOwnership(
+  db: Database,
+  workspaceId: string,
+  fromUserId: string,
+  toUserId: string,
+): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Database;
+    const from = await getWorkspaceMember(txDb, workspaceId, fromUserId);
+    const to = await getWorkspaceMember(txDb, workspaceId, toUserId);
+    if (!from || from.role !== "owner" || !to) return false;
+    await tx
+      .update(workspaceMembers)
+      .set({ role: "admin" })
+      .where(and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.role, "owner"),
+      ));
+    await tx
+      .update(workspaceMembers)
+      .set({ role: "owner" })
+      .where(and(
+        eq(workspaceMembers.workspaceId, workspaceId),
+        eq(workspaceMembers.userId, toUserId),
+      ));
+    return true;
+  });
 }
 
 // ------------------------------------------------------------ token vault (Fase 3)

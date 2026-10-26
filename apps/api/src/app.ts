@@ -73,8 +73,12 @@ import {
   ADMIN_ROLES, API_TOKEN_PREFIX, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
   DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
   verifySessionToken,
-  type ApiTokenGrant, type AuthContext, type AuthStore, type AuthUser,
+  type ApiTokenGrant, type AuthContext, type AuthStore, type AuthUser, type WorkspaceInviteRecord,
 } from "./auth";
+import {
+  INVITABLE_ROLES, generateInviteToken, hashInviteToken, inviteDisplayPrefix, invitePath, inviteState,
+} from "./invites";
+import { createRedisPresenceReader, offlinePresenceReader, type PresenceReader } from "./presence";
 import { WORKSPACE_ROUTE_PREFIXES, assertApiTokenRouteAccess } from "./route-scopes";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
@@ -211,6 +215,12 @@ export interface ApiDeps {
   getAiProvider: () => AIProvider | null;
   /** Fase 3: users, workspaces, memberships, audit (auth persistence). */
   authStore: AuthStore;
+  /**
+   * Member presence (#9): who currently holds a realtime socket.
+   * Optional - when absent (or when Redis is down) every member reads
+   * offline and the members list is unaffected.
+   */
+  presenceReader?: PresenceReader;
   /** Fase 3: Resend inbound routing + enqueueing. */
   emailInboundEnqueuer: EmailInboundEnqueuer;
   emailRouter: EmailRouter;
@@ -571,6 +581,7 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
       // configured - the port never throws (see inbound-media.ts).
       mediaPort: createInboundMediaPort(),
     }),
+    presenceReader: createRedisPresenceReader(redisUrl),
     vault,
     realtimePublisher,
     providerFetch: (url, init) => fetch(url, init as RequestInit),
@@ -1076,6 +1087,11 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   // authenticated does not mean unmetered (parity audit B2/R9).
   app.use("/moderation", createRateLimiter("utility", deps.rateLimits?.utilityPerMinute ?? 60));
   app.use("/moderation/*", createRateLimiter("utility", deps.rateLimits?.utilityPerMinute ?? 60));
+  // Invite links (#9): the preview endpoint is public and token-bearing
+  // URLs invite guessing - metered on the public budget. Token entropy
+  // (256 bits) does the real work; this just caps probing.
+  app.use("/invites", createRateLimiter("public", deps.rateLimits?.publicPerMinute ?? 120));
+  app.use("/invites/*", createRateLimiter("public", deps.rateLimits?.publicPerMinute ?? 120));
 
   // ------------------------------------------------------------ auth helpers
   // Session token: Authorization Bearer wins, the httpOnly cookie is the
@@ -2190,7 +2206,16 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   app.openapi(listMembersRoute, async (c) => {
     const { id } = c.req.valid("param");
     await requirePathWorkspaceRole(c, id, ROLES);
-    return c.json({ members: await deps.authStore.listMembers(id) });
+    const members = await deps.authStore.listMembers(id);
+    // Presence (#9): a live realtime socket recently = online. The
+    // reader contracts to all-offline on any Redis trouble, and the
+    // extra catch keeps even a broken custom reader from failing the
+    // members list.
+    const reader = deps.presenceReader ?? offlinePresenceReader;
+    const online = await reader
+      .onlineUserIds(id, members.map((m) => m.userId))
+      .catch(() => new Set<string>());
+    return c.json({ members: members.map((m) => ({ ...m, online: online.has(m.userId) })) });
   });
 
   const addMemberRoute = createRoute({
@@ -2318,6 +2343,217 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       action: "workspace.member.role", details: { memberUserId: userId, from: target.role, to: role },
     });
     return c.json({ member: { ...target, role } });
+  });
+
+  // ------------------------------------------- invite-by-link (#9)
+  // Shareable join links: an owner/admin mints one (the raw token is
+  // returned ONCE; only its SHA-256 is stored), anyone signed in can
+  // accept it from /invite/<token>. Revocation is a state stamp, never
+  // a delete, so the audit trail survives.
+
+  /** Public wire shape of an invite - fragment + state, never the hash. */
+  const serializeInvite = (invite: WorkspaceInviteRecord) => ({
+    id: invite.id,
+    prefix: invite.prefix,
+    role: invite.role,
+    expiresAt: iso(invite.expiresAt),
+    maxUses: invite.maxUses,
+    usesCount: invite.usesCount,
+    revokedAt: iso(invite.revokedAt),
+    createdAt: invite.createdAt.toISOString(),
+    createdByUserId: invite.createdByUserId,
+  });
+
+  const createInviteRoute = createRoute({
+    method: "post", path: "/workspaces/{id}/invites",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              // Ownership is never granted by a link - transfer only.
+              role: z.enum(INVITABLE_ROLES).default("member"),
+              expiresInDays: z.number().int().min(1).max(365).optional(),
+              maxUses: z.number().int().min(1).max(10_000).nullable().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Invite created; raw token returned once" } },
+  });
+  app.openapi(createInviteRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const body = c.req.valid("json");
+    const raw = generateInviteToken();
+    const expiresAt = body.expiresInDays
+      ? new Date(Date.now() + body.expiresInDays * 24 * 3600 * 1000)
+      : null;
+    const invite = await deps.authStore.createInvite({
+      workspaceId: id,
+      tokenHash: hashInviteToken(raw),
+      prefix: inviteDisplayPrefix(raw),
+      role: body.role,
+      createdByUserId: auth.user.id,
+      expiresAt,
+      maxUses: body.maxUses ?? null,
+    });
+    await deps.authStore.audit({
+      workspaceId: id, userId: auth.user.id,
+      action: "workspace.invite.create",
+      details: { inviteId: invite.id, prefix: invite.prefix, role: invite.role, expiresAt: iso(expiresAt), maxUses: invite.maxUses },
+    });
+    return c.json({ invite: serializeInvite(invite), token: raw, invitePath: invitePath(raw) }, 201);
+  });
+
+  const listInvitesRoute = createRoute({
+    method: "get", path: "/workspaces/{id}/invites",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Workspace invite links" } },
+  });
+  app.openapi(listInvitesRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const invites = await deps.authStore.listInvites(id);
+    return c.json({ invites: invites.map(serializeInvite) });
+  });
+
+  const revokeInviteRoute = createRoute({
+    method: "delete", path: "/workspaces/{id}/invites/{inviteId}",
+    request: { params: z.object({ id: z.string(), inviteId: z.string() }) },
+    responses: { 200: { description: "Invite revoked" } },
+  });
+  app.openapi(revokeInviteRoute, async (c) => {
+    const { id, inviteId } = c.req.valid("param");
+    const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
+    const outcome = await deps.authStore.revokeInvite(id, inviteId);
+    if (outcome === "missing") {
+      throw new AppError("NOT_FOUND", "Invite not found in this workspace.", { status: 404 });
+    }
+    // Revoking an already-revoked invite is an idempotent success.
+    if (outcome === "revoked") {
+      await deps.authStore.audit({
+        workspaceId: id, userId: auth.user.id,
+        action: "workspace.invite.revoke", details: { inviteId },
+      });
+    }
+    return c.json({ revoked: true });
+  });
+
+  // ---------------------------------------- ownership transfer (#9)
+  const transferOwnershipRoute = createRoute({
+    method: "post", path: "/workspaces/{id}/transfer-ownership",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": { schema: z.object({ userId: z.string().min(1) }) },
+        },
+        required: true,
+      },
+    },
+    responses: { 200: { description: "Ownership transferred; caller is now admin" } },
+  });
+  app.openapi(transferOwnershipRoute, async (c) => {
+    const { id } = c.req.valid("param");
+    // ONLY the current owner - admins cannot take or give ownership.
+    const auth = await requirePathWorkspaceRole(c, id, ["owner"]);
+    const { userId } = c.req.valid("json");
+    if (userId === auth.user.id) {
+      throw new AppError("VALIDATION", "You already own this workspace.", { status: 400 });
+    }
+    const members = await deps.authStore.listMembers(id);
+    const target = members.find((m) => m.userId === userId);
+    if (!target) {
+      throw new AppError("NOT_FOUND", "Target user is not a member of this workspace.", { status: 404 });
+    }
+    const done = await deps.authStore.transferOwnership(id, auth.user.id, userId);
+    if (!done) {
+      // Lost a race with another ownership change between the checks
+      // and the transaction - the one-owner invariant still holds.
+      throw new AppError("CONFLICT", "Ownership changed concurrently; reload and retry.", { status: 409 });
+    }
+    await deps.authStore.audit({
+      workspaceId: id, userId: auth.user.id,
+      action: "workspace.ownership_transferred",
+      details: { fromUserId: auth.user.id, toUserId: userId, toEmail: target.email },
+    });
+    const fresh = await deps.authStore.listMembers(id);
+    return c.json({
+      members: fresh,
+      workspace: { id, role: "admin" },
+    });
+  });
+
+  // --------------------------------- public invite preview + accept
+  // NOT workspace-header routes: the token in the path IS the
+  // capability. Preview is unauthenticated and returns only the
+  // workspace's name + the role on offer - never member data. Accept
+  // requires a session (any authenticated user) and is an explicit
+  // call - nothing joins on preview.
+
+  const invitePreviewRoute = createRoute({
+    method: "get", path: "/invites/{token}",
+    request: { params: z.object({ token: z.string() }) },
+    responses: { 200: { description: "Invite preview (public)" } },
+  });
+  app.openapi(invitePreviewRoute, async (c) => {
+    const found = await deps.authStore.findInviteByHash(hashInviteToken(c.req.valid("param").token));
+    if (!found) {
+      return c.json({
+        valid: false, reason: "invalid",
+        workspaceName: null, role: null, expiresAt: null,
+      });
+    }
+    const state = inviteState(found);
+    return c.json({
+      valid: state === "valid",
+      reason: state === "valid" ? null : state,
+      workspaceName: found.workspaceName,
+      role: found.role,
+      expiresAt: iso(found.expiresAt),
+    });
+  });
+
+  const inviteAcceptRoute = createRoute({
+    method: "post", path: "/invites/{token}/accept",
+    request: { params: z.object({ token: z.string() }) },
+    responses: { 200: { description: "Joined the workspace" } },
+  });
+  app.openapi(inviteAcceptRoute, async (c) => {
+    const user = await authenticateRequest(c);
+    const found = await deps.authStore.findInviteByHash(hashInviteToken(c.req.valid("param").token));
+    if (!found) {
+      throw new AppError("INVITE_INVALID", "This invite link is not valid.", { status: 404 });
+    }
+    const outcome = await deps.authStore.acceptInvite(found, user.id);
+    switch (outcome.status) {
+      case "accepted": {
+        await deps.authStore.audit({
+          workspaceId: found.workspaceId, userId: user.id,
+          action: "workspace.invite.accept",
+          details: { inviteId: found.id, prefix: found.prefix, role: outcome.role },
+        });
+        return c.json({
+          workspace: { id: found.workspaceId, name: found.workspaceName, slug: found.workspaceSlug, role: outcome.role },
+          member: { userId: user.id, email: user.email, name: user.name, role: outcome.role },
+        });
+      }
+      case "already_member":
+        throw new AppError("ALREADY_MEMBER", "You are already a member of this workspace.", {
+          status: 409, details: { workspaceId: found.workspaceId },
+        });
+      case "revoked":
+        throw new AppError("INVITE_REVOKED", "This invite link has been revoked.", { status: 410 });
+      case "expired":
+        throw new AppError("INVITE_EXPIRED", "This invite link has expired.", { status: 410 });
+      case "exhausted":
+        throw new AppError("INVITE_EXHAUSTED", "This invite link has no uses left.", { status: 410 });
+      default:
+        throw new AppError("INVITE_INVALID", "This invite link is not valid.", { status: 404 });
+    }
   });
 
   // ------------------------------------------------------------- flows (Fase 4)

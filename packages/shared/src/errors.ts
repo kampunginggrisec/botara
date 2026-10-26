@@ -10,6 +10,11 @@ export const ERROR_CODES = [
   "PROVIDER_ERROR",
   "AI_RESPONSE_INVALID",
   "TOKEN_EXPIRED",
+  "INVITE_INVALID",
+  "INVITE_EXPIRED",
+  "INVITE_REVOKED",
+  "INVITE_EXHAUSTED",
+  "ALREADY_MEMBER",
   "MESSAGING_WINDOW_CLOSED",
   "CONSECUTIVE_SEND_CAP",
   "CHANNEL_INITIATION_UNSUPPORTED",
@@ -41,7 +46,12 @@ function defaultStatusFor(code: ErrorCode): number {
     case "UNAUTHORIZED": return 401;
     case "FORBIDDEN": return 403;
     case "NOT_FOUND": return 404;
+    case "INVITE_INVALID": return 404;
     case "CONFLICT": return 409;
+    case "ALREADY_MEMBER": return 409;
+    case "INVITE_EXHAUSTED": return 409;
+    case "INVITE_EXPIRED": return 410;
+    case "INVITE_REVOKED": return 410;
     case "RATE_LIMITED": return 429;
     case "NOT_IMPLEMENTED": return 501;
     default: return 500;

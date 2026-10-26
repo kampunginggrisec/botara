@@ -56,6 +56,14 @@ describe("requiredScopeForRoute", () => {
     expect(requiredScopeForRoute("GET", "/workspaces/ws1/members")).toEqual({ kind: "scope", scope: "settings:read" });
     expect(requiredScopeForRoute("PATCH", "/workspaces/ws1")).toEqual({ kind: "scope", scope: "settings:write" });
     expect(requiredScopeForRoute("DELETE", "/workspaces/ws1/members/u2")).toEqual({ kind: "scope", scope: "settings:write" });
+    // Package #9: invites + ownership transfer ride the same resource.
+    expect(requiredScopeForRoute("GET", "/workspaces/ws1/invites")).toEqual({ kind: "scope", scope: "settings:read" });
+    expect(requiredScopeForRoute("POST", "/workspaces/ws1/invites")).toEqual({ kind: "scope", scope: "settings:write" });
+    expect(requiredScopeForRoute("DELETE", "/workspaces/ws1/invites/inv1")).toEqual({ kind: "scope", scope: "settings:write" });
+    expect(requiredScopeForRoute("POST", "/workspaces/ws1/transfer-ownership")).toEqual({ kind: "scope", scope: "settings:write" });
+    // The public invite surface is session/public, never a token route.
+    expect(requiredScopeForRoute("GET", "/invites/bti_x")).toEqual({ kind: "none" });
+    expect(requiredScopeForRoute("POST", "/invites/bti_x/accept")).toEqual({ kind: "none" });
   });
 
   test("oauth start (GET) requires channels:write; stats overview and insights are any-read", () => {

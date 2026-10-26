@@ -1,7 +1,7 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 import {
-  RealtimeHub, verifySessionToken, type RealtimeSocket,
+  RealtimeHub, verifySessionToken, type PresenceSink, type RealtimeSocket,
 } from "./server";
 
 /**
@@ -160,5 +160,65 @@ describe("workspace-scoped fan-out", () => {
     hub.handleBusMessage("not json either");
     hub.handleBusMessage(JSON.stringify({ type: "something.else", workspaceId: "ws-1" }));
     expect(socket.closedWith).toBeNull();
+  });
+});
+
+describe("presence (#9)", () => {
+  class FakePresenceSink implements PresenceSink {
+    touches: Array<{ userId: string; workspaceIds: string[] }> = [];
+    clears: Array<{ userId: string; workspaceIds: string[] }> = [];
+    touch(userId: string, workspaceIds: string[]): void {
+      this.touches.push({ userId, workspaceIds: [...workspaceIds] });
+    }
+    clear(userId: string, workspaceIds: string[]): void {
+      this.clears.push({ userId, workspaceIds: [...workspaceIds] });
+    }
+  }
+
+  function setupWithPresence() {
+    const sink = new FakePresenceSink();
+    const hub = new RealtimeHub({
+      sessionSecret: SECRET,
+      resolveWorkspaces: async (token) => {
+        const claims = verifySessionToken(token, SECRET);
+        return claims ? ["ws-1", "ws-2"] : null;
+      },
+      authTimeoutMs: 10_000,
+      presence: sink,
+    });
+    return { hub, sink };
+  }
+
+  test("auth touches presence for the user's full workspace set", async () => {
+    const { hub, sink } = setupWithPresence();
+    await authedSocket(hub);
+    expect(sink.touches).toEqual([{ userId: "user-1", workspaceIds: ["ws-1", "ws-2"] }]);
+    expect(sink.clears).toHaveLength(0);
+  });
+
+  test("ping renews presence and is answered with pong; unauthenticated ping is rejected", async () => {
+    const { hub, sink } = setupWithPresence();
+    const anon = new FakeSocket();
+    const anonState = hub.handleOpen(anon);
+    await hub.handleMessage(anonState, JSON.stringify({ type: "ping" }));
+    expect(anon.frames().at(-1)).toMatchObject({ type: "error", code: "UNAUTHORIZED" });
+    expect(sink.touches).toHaveLength(0);
+
+    const { socket, state } = await authedSocket(hub);
+    expect(sink.touches).toHaveLength(1);
+    await hub.handleMessage(state, JSON.stringify({ type: "ping" }));
+    expect(socket.frames().at(-1)).toEqual({ type: "pong" });
+    expect(sink.touches).toHaveLength(2);
+    expect(sink.touches[1]).toEqual({ userId: "user-1", workspaceIds: ["ws-1", "ws-2"] });
+  });
+
+  test("presence clears only when the user's LAST socket closes", async () => {
+    const { hub, sink } = setupWithPresence();
+    const first = await authedSocket(hub);
+    const second = await authedSocket(hub);
+    hub.handleClose(first.state);
+    expect(sink.clears).toHaveLength(0);
+    hub.handleClose(second.state);
+    expect(sink.clears).toEqual([{ userId: "user-1", workspaceIds: ["ws-1", "ws-2"] }]);
   });
 });

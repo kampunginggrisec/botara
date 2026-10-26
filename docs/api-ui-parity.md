@@ -31,9 +31,9 @@ classification entry goes stale (route deleted, or a UI caller appeared).
    its classification entry (the guard's stale-entry checks fail until
    you do).
 
-## Parity table (post-fix state, 2026-10-26)
+## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27)
 
-136 routes: 108 UI · 18 WEBHOOK · 10 API-ONLY.
+141 routes: 113 UI · 18 WEBHOOK · 10 API-ONLY.
 
 ### Auth & session
 
@@ -62,10 +62,23 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 | GET /workspaces | UI | Workspace switcher |
 | POST /workspaces | UI | Workspace switcher → "+ New workspace" (F7) |
 | PATCH /workspaces/{} | UI | Settings → Workspace (rename + default currency, package #6) |
-| GET /workspaces/{}/members | UI | Settings → Members; Inbox assignee picker |
+| GET /workspaces/{}/members | UI | Settings → Members (rows carry `online` presence, #9); Inbox assignee picker |
 | POST /workspaces/{}/members | UI | Settings → Members (invite) |
 | PATCH /workspaces/{}/members/{} | UI | Settings → Members (role) |
 | DELETE /workspaces/{}/members/{} | UI | Settings → Members (remove) |
+| POST /workspaces/{}/invites | UI | Settings → Members → Invite link (create; raw token returned once) |
+| GET /workspaces/{}/invites | UI | Settings → Members → Invite link (list; fragments only) |
+| DELETE /workspaces/{}/invites/{} | UI | Settings → Members → Invite link (revoke) |
+| POST /workspaces/{}/transfer-ownership | UI | Settings → Members (owner-only row action) |
+| GET /invites/{} | UI | SPA `/invite/:token` landing (public preview, no member data) |
+| POST /invites/{}/accept | UI | SPA `/invite/:token` landing (explicit Accept click) |
+
+> Adoption #9 (invite-by-link + presence + ownership transfer): the
+> invite routes are ordinary workspace routes for scoped tokens
+> (`settings:read|write` via the `/workspaces/{}` prefix rule); the two
+> public `/invites/{}` routes are session/public surface (`none` in
+> route-scopes — restricted API tokens can never preview or accept).
+> Semantics: [workspace-members.md](workspace-members.md).
 
 ### Conversations, contacts, moderation
 
