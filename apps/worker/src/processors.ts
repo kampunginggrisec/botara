@@ -282,6 +282,15 @@ export interface WorkerPorts {
   subscribeSequence?(input: { workspaceId: string; contactId: string; sequenceId: string }): Promise<boolean>;
   unsubscribeSequence?(input: { workspaceId: string; contactId: string; sequenceId: string }): Promise<void>;
   /**
+   * Open a deal for the run's contact (package #6). False = the named
+   * pipeline/stage does not exist or the pipeline has no stages (the
+   * executor warns and the run continues).
+   */
+  createDeal?(input: {
+    workspaceId: string; contactId: string; conversationId?: string;
+    pipelineId?: string; stageId?: string; title: string; value?: number;
+  }): Promise<boolean>;
+  /**
    * Persist a collect-input wait for a paused run and arrange its
    * timeout (when the step configured one). The wait row is the only
    * durable trace of the paused run - resumes claim it by deletion.
@@ -615,6 +624,14 @@ export async function processFlowRun(
       unsubscribeSequence: async ({ sequenceId }: { sequenceId: string }) => {
         await ports.unsubscribeSequence!({ workspaceId: ctx.workspaceId, contactId: ctx.contactId, sequenceId });
       },
+    } : {}),
+    ...(ports.createDeal ? {
+      createDeal: async (input: { pipelineId?: string; stageId?: string; title: string; value?: number }) =>
+        ports.createDeal!({
+          workspaceId: ctx.workspaceId, contactId: ctx.contactId,
+          ...(ctx.conversationId ? { conversationId: ctx.conversationId } : {}),
+          ...input,
+        }),
     } : {}),
     ...(ports.scheduleFlowInputWait ? {
       awaitInput: async (input: {

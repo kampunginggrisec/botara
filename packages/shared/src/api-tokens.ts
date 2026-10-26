@@ -21,6 +21,7 @@ export const API_TOKEN_RESOURCES = [
   "broadcasts",
   "flows",
   "sequences",
+  "deals",
   "templates",
   "channels",
   "kb",

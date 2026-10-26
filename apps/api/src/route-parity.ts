@@ -142,4 +142,8 @@ export const ROUTE_CLASSIFICATION: Record<string, RouteClassification> = {
     class: "API-ONLY",
     reason: "Single-link fetch for API consumers; the SPA lists links and reads the QR SVG via /growth-links/{}/qr.svg.",
   },
+  "GET /deals/{}": {
+    class: "API-ONLY",
+    reason: "Single-deal fetch for API consumers; the SPA lists deals and mutates via PATCH/DELETE on the same path (package #6).",
+  },
 };

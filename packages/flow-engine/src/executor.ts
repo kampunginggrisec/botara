@@ -37,6 +37,14 @@ export interface FlowPorts {
   subscribeSequence?(input: { sequenceId: string }): Promise<boolean>;
   unsubscribeSequence?(input: { sequenceId: string }): Promise<void>;
   /**
+   * Open a sales deal for the run's contact (package #6). pipelineId /
+   * stageId absent = the workspace default pipeline / its first stage.
+   * False = the named pipeline or stage does not exist (or the pipeline
+   * has no stages) - the executor turns it into a warning, never a
+   * failed run.
+   */
+  createDeal?(input: { pipelineId?: string; stageId?: string; title: string; value?: number }): Promise<boolean>;
+  /**
    * Persist a collect-input wait for `resumeState` (already advanced
    * past the collect node, status "waiting"): the runtime stores the
    * marker (node, conversation/contact, variable, deadline) so an
@@ -181,6 +189,23 @@ export async function runFlow(
     }
   };
 
+  /**
+   * Deal titles (package #6): the node's title renders through the
+   * same variable engine as send texts. An empty configured title - or
+   * one that renders empty - falls back to "Deal for {{contact.name}}",
+   * and if even that cannot resolve (no interpolation context), the
+   * plain "Deal": a created deal NEVER carries a raw {{...}} token or
+   * an empty title. Capped at the column width (300).
+   */
+  const resolveDealTitle = (rawTitle: string, runVars: Record<string, string>): string => {
+    let title = renderSend(rawTitle, undefined, runVars).text.trim();
+    if (!title && options.interpolation) {
+      title = renderSend("Deal for {{contact.name}}", undefined, runVars).text.trim();
+    }
+    if (!title || title === "Deal for") title = "Deal";
+    return title.slice(0, 300);
+  };
+
   for (let i = 0; i < maxSteps; i++) {
     if (current.status === "completed" || !current.currentNodeId) {
       return { state: current, executed, paused: false, warnings, actionWarnings };
@@ -264,6 +289,21 @@ export async function runFlow(
           );
           executed.push(action);
           break;
+        case "create_deal": {
+          const title = resolveDealTitle(action.title, current.variables);
+          const dealInput = {
+            ...(action.pipelineId ? { pipelineId: action.pipelineId } : {}),
+            ...(action.stageId ? { stageId: action.stageId } : {}),
+            title,
+            ...(action.value !== undefined ? { value: action.value } : {}),
+          };
+          await runActionPort(
+            `create_deal "${title}"`,
+            ports.createDeal && (() => ports.createDeal!(dealInput)),
+          );
+          executed.push({ type: "create_deal", ...dealInput });
+          break;
+        }
         case "collect_input": {
           // Send the (rendered) prompt, then hand the resume state to
           // the wait port and pause - the mirror image of delay, except

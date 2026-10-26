@@ -15,6 +15,8 @@ import {
   listDueEnrollments, updateEnrollment,
   addContactTag, removeContactTag, getWorkspaceMember, updateConversationAssignment,
   createEnrollment, getSequence, cancelActiveEnrollments,
+  getPipeline, getDefaultPipeline, getPipelineStage, listPipelineStages,
+  createDeal as createDealRow,
   createFlowWait, claimFlowWaitById, deleteFlowWaitsForConversation, updateConversationStatus,
   getContactByExternal, createContact, listConversations, findOpenConversation,
   findConversationByExternalId, getConversationById, listMessages, updateBroadcastStatus,
@@ -449,6 +451,35 @@ function buildProdPorts(db: Database): WorkerPorts {
         workspaceId, contactId,
         ...(sequenceId !== "all" ? { sequenceId } : {}),
       });
+    },
+    async createDeal({ workspaceId, contactId, conversationId, pipelineId, stageId, title, value }) {
+      // Package #6: resolve the landing spot - the node's pipeline or
+      // the workspace default, the node's stage or the pipeline's
+      // first. Anything missing is a soft false (the executor warns);
+      // a flow must never fail because the board was reorganized.
+      const pipeline = pipelineId
+        ? await getPipeline(db, workspaceId, pipelineId)
+        : await getDefaultPipeline(db, workspaceId);
+      if (!pipeline) return false;
+      let stage;
+      if (stageId) {
+        stage = await getPipelineStage(db, pipeline.id, stageId);
+        if (!stage) return false;
+      } else {
+        const stages = await listPipelineStages(db, pipeline.id);
+        stage = stages[0];
+        if (!stage) return false;
+      }
+      const workspace = await getWorkspaceById(db, workspaceId);
+      await createDealRow(db, {
+        workspaceId, pipelineId: pipeline.id, stageId: stage.id, contactId,
+        conversationId: conversationId ?? null,
+        title,
+        value: value === undefined ? null : String(value),
+        currency: workspace?.defaultCurrency ?? "IDR",
+        createdByUserId: null,
+      });
+      return true;
     },
     async scheduleFlowInputWait(job, wait) {
       const ctx = job.context;

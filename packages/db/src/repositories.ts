@@ -3574,6 +3574,7 @@ export interface DealPatch {
   title?: string;
   pipelineId?: string;
   stageId?: string;
+  contactId?: string;
   conversationId?: string | null;
   /** Decimal string, or null to clear the size. */
   value?: string | null;

@@ -29,6 +29,7 @@ export const WORKSPACE_ROUTE_PREFIXES = [
   "/conversations", "/contacts", "/segments", "/templates", "/broadcasts",
   "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows",
   "/stats", "/growth-links", "/catalog-products", "/moderation", "/saved-replies",
+  "/pipelines", "/deals",
 ] as const;
 
 /** Prefix families -> scope resource. `/workspaces/*` and `/stats` are special-cased below. */
@@ -41,6 +42,8 @@ const FAMILY_RESOURCES: ReadonlyArray<readonly [prefix: string, resource: ApiTok
   ["/flows", "flows"],
   ["/growth-links", "flows"], // growth links are flow entry points
   ["/sequences", "sequences"],
+  ["/pipelines", "deals"], // pipelines are the deals board's frame
+  ["/deals", "deals"],
   ["/templates", "templates"],
   ["/channels", "channels"],
   ["/catalog-products", "channels"], // Meta catalog data belongs to the channel

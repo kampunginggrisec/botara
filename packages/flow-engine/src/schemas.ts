@@ -129,6 +129,25 @@ export const sequenceUnsubscribeNodeSchema = z.object({
 });
 
 /**
+ * Create-deal step (adoption package #6): open a sales deal for the
+ * run's contact. Pipeline/stage are optional - omitted means the
+ * workspace default pipeline's first stage. `title` is interpolated
+ * like send_message text; empty means the runtime default
+ * "Deal for {{contact.name}}". Existence of the pipeline/stage is a
+ * runtime concern (warning, never a save-time rejection), exactly like
+ * the other action steps.
+ */
+export const createDealNodeSchema = z.object({
+  ...base,
+  type: z.literal("create_deal"),
+  pipelineId: z.string().min(1).optional(),
+  stageId: z.string().min(1).optional(),
+  title: z.string().max(300).default(""),
+  /** Deal value in the workspace default currency; omitted = unsized. */
+  value: z.number().nonnegative().optional(),
+});
+
+/**
  * Collect-input step (adoption package #3): send a prompt, PAUSE the
  * run, and resume it with the contact's next reply stored in the run
  * variable bag (readable downstream as `{{vars.<variable>}}`). The
@@ -153,6 +172,7 @@ export const flowNodeSchema = z.discriminatedUnion("type", [
   setFieldNodeSchema, aiReplyNodeSchema,
   addTagNodeSchema, removeTagNodeSchema, assignNodeSchema, setConversationStatusNodeSchema,
   sequenceSubscribeNodeSchema, sequenceUnsubscribeNodeSchema, collectInputNodeSchema,
+  createDealNodeSchema,
 ]);
 
 export type FlowNode = z.infer<typeof flowNodeSchema>;

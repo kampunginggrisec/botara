@@ -4,6 +4,7 @@ export {
   aiReplyNodeSchema,
   addTagNodeSchema, removeTagNodeSchema, assignNodeSchema, setConversationStatusNodeSchema,
   sequenceSubscribeNodeSchema, sequenceUnsubscribeNodeSchema, collectInputNodeSchema,
+  createDealNodeSchema,
   type Flow, type FlowNode,
 } from "./schemas";
 export { initialState, step, type FlowState, type FlowEvent, type FlowAction } from "./interpreter";

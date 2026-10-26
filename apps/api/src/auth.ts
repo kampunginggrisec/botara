@@ -7,7 +7,7 @@ import {
   getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceMembers,
   listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow,
   setUserPasswordHash, setUserPlatformAdmin, touchApiToken, touchUserLastLogin,
-  updateUserName, updateWorkspaceName,
+  updateUserName, updateWorkspaceDefaultCurrency, updateWorkspaceName,
   upsertWorkspaceMember,
   type Database,
 } from "@botara/db";
@@ -50,6 +50,8 @@ export interface AuthWorkspaceView {
   id: string;
   name: string;
   slug: string;
+  /** Workspace default currency (package #6) - the deal form's preset. */
+  defaultCurrency: string;
   role: string;
 }
 
@@ -144,6 +146,8 @@ export interface AuthStore {
   /** Settings (Fase 4): profile display name + workspace rename. */
   updateUserName(userId: string, name: string): Promise<void>;
   renameWorkspace(workspaceId: string, name: string): Promise<void>;
+  /** Workspace default currency (package #6). */
+  updateWorkspaceCurrency(workspaceId: string, currency: string): Promise<void>;
   /** API tokens (adopted features): create returns the raw token ONCE. */
   createApiToken(userId: string, name: string, options?: CreateApiTokenOptions): Promise<{ raw: string; token: ApiTokenView }>;
   listApiTokens(userId: string): Promise<ApiTokenView[]>;
@@ -282,7 +286,10 @@ export class DbAuthStore implements AuthStore {
 
   async listWorkspaces(userId: string) {
     const rows = await listWorkspacesForUser(this.getDatabase(), userId);
-    return rows.map((r) => ({ id: r.workspaceId, name: r.workspaceName, slug: r.slug, role: r.role }));
+    return rows.map((r) => ({
+      id: r.workspaceId, name: r.workspaceName, slug: r.slug,
+      defaultCurrency: r.defaultCurrency, role: r.role,
+    }));
   }
 
   async listMembers(workspaceId: string) {
@@ -300,6 +307,10 @@ export class DbAuthStore implements AuthStore {
 
   async renameWorkspace(workspaceId: string, name: string) {
     await updateWorkspaceName(this.getDatabase(), workspaceId, name);
+  }
+
+  async updateWorkspaceCurrency(workspaceId: string, currency: string) {
+    await updateWorkspaceDefaultCurrency(this.getDatabase(), workspaceId, currency);
   }
 
   async createApiToken(userId: string, name: string, options: CreateApiTokenOptions = {}) {
@@ -353,7 +364,7 @@ export class DbAuthStore implements AuthStore {
 /** In-memory AuthStore for tests (and only tests). */
 export class InMemoryAuthStore implements AuthStore {
   readonly users = new Map<string, AuthUser>();
-  readonly workspaces = new Map<string, { id: string; name: string; slug: string }>();
+  readonly workspaces = new Map<string, { id: string; name: string; slug: string; defaultCurrency: string }>();
   readonly members = new Map<string, { workspaceId: string; userId: string; role: string }>();
   readonly auditLog: Array<{ workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }> = [];
   readonly apiTokens = new Map<string, ApiTokenView & { userId: string; tokenHash: string }>();
@@ -409,9 +420,9 @@ export class InMemoryAuthStore implements AuthStore {
   }
 
   async createWorkspace(input: { name: string; slug: string }) {
-    const ws = { id: crypto.randomUUID(), name: input.name, slug: input.slug };
+    const ws = { id: crypto.randomUUID(), name: input.name, slug: input.slug, defaultCurrency: "IDR" };
     this.workspaces.set(ws.id, ws);
-    return ws;
+    return { id: ws.id, name: ws.name, slug: ws.slug };
   }
 
   async workspaceSlugExists(slug: string) {
@@ -432,7 +443,7 @@ export class InMemoryAuthStore implements AuthStore {
       .filter((m) => m.userId === userId)
       .map((m) => {
         const ws = this.workspaces.get(m.workspaceId)!;
-        return { id: ws.id, name: ws.name, slug: ws.slug, role: m.role };
+        return { id: ws.id, name: ws.name, slug: ws.slug, defaultCurrency: ws.defaultCurrency, role: m.role };
       });
   }
 
@@ -457,6 +468,11 @@ export class InMemoryAuthStore implements AuthStore {
   async renameWorkspace(workspaceId: string, name: string) {
     const ws = this.workspaces.get(workspaceId);
     if (ws) ws.name = name;
+  }
+
+  async updateWorkspaceCurrency(workspaceId: string, currency: string) {
+    const ws = this.workspaces.get(workspaceId);
+    if (ws) ws.defaultCurrency = currency;
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {

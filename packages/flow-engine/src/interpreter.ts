@@ -46,6 +46,19 @@ export type FlowAction =
   | { type: "sequence_subscribe"; sequenceId: string }
   | { type: "sequence_unsubscribe"; sequenceId: string }
   /**
+   * Open a deal for the run's contact (package #6). pipelineId/stageId
+   * absent = the workspace default pipeline / its first stage. The
+   * title arrives flat-substituted; the executor renders it through the
+   * full variable engine when it has a context.
+   */
+  | {
+      type: "create_deal";
+      pipelineId?: string;
+      stageId?: string;
+      title: string;
+      value?: number;
+    }
+  /**
    * Pause-and-listen: the executor sends `promptText`, persists a wait
    * via its awaitInput port, and the run resumes when the contact's
    * next reply (or the timeout) claims the wait - the answer enters
@@ -116,6 +129,19 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
       return { state: advance(node.next), actions: [{ type: "sequence_subscribe", sequenceId: node.sequenceId }] };
     case "sequence_unsubscribe":
       return { state: advance(node.next), actions: [{ type: "sequence_unsubscribe", sequenceId: node.sequenceId }] };
+    case "create_deal": {
+      const title = node.title.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
+      return {
+        state: advance(node.next),
+        actions: [{
+          type: "create_deal",
+          ...(node.pipelineId ? { pipelineId: node.pipelineId } : {}),
+          ...(node.stageId ? { stageId: node.stageId } : {}),
+          title,
+          ...(node.value !== undefined ? { value: node.value } : {}),
+        }],
+      };
+    }
     case "collect_input": {
       // Same pause shape as delay: the state is already advanced past
       // this node (status "waiting"); the resume event carries the

@@ -38,6 +38,12 @@ import {
   updateChannelAccountToken, updateChannelAccountAvatar,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
+  listPipelines, getPipeline, getDefaultPipeline, createPipeline, updatePipeline, deletePipelineCascade,
+  countPipelineDeals, listPipelineStages, getPipelineStage, createPipelineStage, updatePipelineStage,
+  deletePipelineStage, reorderPipelineStages, countStageDeals,
+  listDeals, getDeal, createDeal, updateDeal, deleteDeal, getPipelineSummary,
+  DEFAULT_PIPELINE_STAGE_NAMES,
+  type PipelineRow, type PipelineStageRow, type DealRow, type DealWithContact, type DealStatus,
   updateConversationAssignment, updateConversationStatus, CONVERSATION_STATUSES,
   upsertCatalogProduct, listCatalogProducts, listCatalogProductKeys, deleteCatalogProduct,
   PlatformSettingsService, DbPlatformSettingsStorage, tryParseVaultKey,
@@ -897,7 +903,13 @@ const changePasswordBodySchema = z.object({
 }).openapi("ChangePasswordBody");
 
 const patchMeBodySchema = z.object({ name: z.string().min(1).max(120) }).openapi("PatchMeBody");
-const renameWorkspaceBodySchema = z.object({ name: z.string().min(1).max(120) }).openapi("RenameWorkspaceBody");
+const renameWorkspaceBodySchema = z.object({
+  name: z.string().min(1).max(120).optional(),
+  /** Workspace default currency (package #6): ISO 4217, case-insensitive on input. */
+  defaultCurrency: z.string().regex(/^[A-Za-z]{3}$/).optional(),
+}).refine((b) => b.name !== undefined || b.defaultCurrency !== undefined, {
+  message: "Provide at least one of: name, defaultCurrency.",
+}).openapi("RenameWorkspaceBody");
 const memberRoleBodySchema = z.object({ role: z.enum(ROLES) }).openapi("MemberRoleBody");
 const messengerSelectPageBodySchema = z.object({ pageId: z.string().min(1) }).openapi("MessengerSelectPageBody");
 
@@ -2250,11 +2262,22 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   app.openapi(renameWorkspaceRoute, async (c) => {
     const { id } = c.req.valid("param");
     const auth = await requirePathWorkspaceRole(c, id, ADMIN_ROLES);
-    await deps.authStore.renameWorkspace(id, c.req.valid("json").name.trim());
-    await deps.authStore.audit({
-      workspaceId: id, userId: auth.user.id,
-      action: "workspace.rename", details: { name: c.req.valid("json").name },
-    });
+    const body = c.req.valid("json");
+    if (body.name !== undefined) {
+      await deps.authStore.renameWorkspace(id, body.name.trim());
+      await deps.authStore.audit({
+        workspaceId: id, userId: auth.user.id,
+        action: "workspace.rename", details: { name: body.name },
+      });
+    }
+    if (body.defaultCurrency !== undefined) {
+      const currency = body.defaultCurrency.toUpperCase();
+      await deps.authStore.updateWorkspaceCurrency(id, currency);
+      await deps.authStore.audit({
+        workspaceId: id, userId: auth.user.id,
+        action: "workspace.default_currency", details: { currency },
+      });
+    }
     const workspaces = await deps.authStore.listWorkspaces(auth.user.id);
     return c.json({ workspace: workspaces.find((w) => w.id === id) ?? null });
   });
@@ -2420,6 +2443,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       async setConversationStatus() { /* recorded */ },
       async subscribeSequence() { return true; },
       async unsubscribeSequence() { /* recorded */ },
+      async createDeal() { return true; },
       async awaitInput() { /* recorded: the run reports paused */ },
       async aiReply(input: { prompt: string }) {
         return `[test-run AI reply] ${input.prompt}`.trim();
@@ -3415,6 +3439,485 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const { id } = c.req.valid("param");
     const deleted = await deleteSavedReply(db, ws, id);
     if (!deleted) throw new AppError("NOT_FOUND", "Saved reply not found.", { status: 404 });
+    return c.json({ deleted: true });
+  });
+
+  // ------------------------------------------- sales pipelines + deals
+  // Package #6: Kanban sales pipelines. Reads are open to every member;
+  // writes are mutator-role (guardMutator), like other workspace content.
+  // Cross-workspace ids answer 404 (the row is simply not in this
+  // workspace); ids that are in the workspace but mis-composed (foreign
+  // contact, a stage from another pipeline) answer 400 VALIDATION - the
+  // caller named real things in an impossible combination.
+  const serializePipeline = (p: PipelineRow) => ({
+    ...p, createdAt: iso(p.createdAt), updatedAt: iso(p.updatedAt),
+  });
+  const serializeStage = (s: PipelineStageRow) => ({
+    ...s, createdAt: iso(s.createdAt), updatedAt: iso(s.updatedAt),
+  });
+  const serializeDeal = (d: DealRow | DealWithContact) => ({
+    ...d,
+    // numeric columns arrive as decimal strings (the broadcast money
+    // lesson): the wire shape is number | null, never a raw string.
+    value: d.value === null || d.value === undefined ? null : Number(d.value),
+    stageChangedAt: iso(d.stageChangedAt),
+    closedAt: iso(d.closedAt),
+    createdAt: iso(d.createdAt),
+    updatedAt: iso(d.updatedAt),
+  });
+  const dealValidation = (message: string) => new AppError("VALIDATION", message, { status: 400 });
+  const requirePipeline = async (db: Database, ws: string, id: string): Promise<PipelineRow> => {
+    const pipeline = await getPipeline(db, ws, id);
+    if (!pipeline) throw new AppError("NOT_FOUND", "Pipeline not found.", { status: 404 });
+    return pipeline;
+  };
+  /** The workspace's default currency, upper-cased (IDR when unset). */
+  const workspaceDefaultCurrency = async (db: Database, ws: string): Promise<string> => {
+    const workspace = await getWorkspaceById(db, ws).catch(() => null);
+    return (workspace?.defaultCurrency ?? "IDR").toUpperCase();
+  };
+
+  const listPipelinesRoute = createRoute({
+    method: "get", path: "/pipelines",
+    responses: { 200: { description: "Pipelines with their stages" } },
+  });
+  app.openapi(listPipelinesRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listPipelines(db, ws);
+    const out = [];
+    for (const p of rows) {
+      out.push({ ...serializePipeline(p), stages: (await listPipelineStages(db, p.id)).map(serializeStage) });
+    }
+    return c.json({ pipelines: out });
+  });
+
+  const createPipelineRoute = createRoute({
+    method: "post", path: "/pipelines",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              name: z.string().min(1).max(200),
+              /** Seed the standard five stages (New → Negotiation). */
+              withDefaultStages: z.boolean().optional(),
+              /** Explicit stage names, in column order (wins over withDefaultStages). */
+              stages: z.array(z.string().min(1).max(200)).max(50).optional(),
+              makeDefault: z.boolean().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Pipeline created" } },
+  });
+  app.openapi(createPipelineRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const name = body.name.trim();
+    if (!name) throw dealValidation("Pipeline name must not be empty.");
+    const stageNames = (body.stages ?? (body.withDefaultStages ? [...DEFAULT_PIPELINE_STAGE_NAMES] : []))
+      .map((s) => s.trim());
+    if (stageNames.some((s) => !s)) throw dealValidation("Stage names must not be empty.");
+    // The workspace's first pipeline becomes its default automatically.
+    const existing = await listPipelines(db, ws);
+    const isDefault = body.makeDefault ?? existing.length === 0;
+    const { pipeline, stages } = await createPipeline(db, { workspaceId: ws, name, isDefault, stageNames });
+    return c.json({ pipeline: { ...serializePipeline(pipeline), stages: stages.map(serializeStage) } }, 201);
+  });
+
+  const updatePipelineRoute = createRoute({
+    method: "patch", path: "/pipelines/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              name: z.string().min(1).max(200).optional(),
+              isDefault: z.boolean().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Pipeline updated" } },
+  });
+  app.openapi(updatePipelineRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    await requirePipeline(db, ws, id);
+    const patch: { name?: string; isDefault?: boolean } = {};
+    if (body.name !== undefined) {
+      const name = body.name.trim();
+      if (!name) throw dealValidation("Pipeline name must not be empty.");
+      patch.name = name;
+    }
+    if (body.isDefault !== undefined) patch.isDefault = body.isDefault;
+    const row = await updatePipeline(db, ws, id, patch);
+    if (!row) throw new AppError("NOT_FOUND", "Pipeline not found.", { status: 404 });
+    const stages = await listPipelineStages(db, id);
+    return c.json({ pipeline: { ...serializePipeline(row), stages: stages.map(serializeStage) } });
+  });
+
+  const deletePipelineRoute = createRoute({
+    method: "delete", path: "/pipelines/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Pipeline deleted" } },
+  });
+  app.openapi(deletePipelineRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    // Delete semantics mirror the channel-account precedent: a pipeline
+    // carrying deals is never destroyed by accident. The bare DELETE is
+    // a 409; ?force=true is the explicit, auditable override and takes
+    // the deals + stages with it.
+    const dealCount = await countPipelineDeals(db, id);
+    if (dealCount > 0 && c.req.query("force") !== "true") {
+      throw new AppError(
+        "CONFLICT",
+        `Pipeline still holds ${dealCount} deal(s). Delete it with ?force=true to remove them with it.`,
+        { status: 409, details: { reason: "pipeline_has_deals", dealCount } },
+      );
+    }
+    await deletePipelineCascade(db, ws, id);
+    return c.json({ deleted: true });
+  });
+
+  const pipelineSummaryRoute = createRoute({
+    method: "get", path: "/pipelines/{id}/summary",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Per-stage open totals + won/lost totals" } },
+  });
+  app.openapi(pipelineSummaryRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    return c.json({ summary: await getPipelineSummary(db, ws, id) });
+  });
+
+  const createStageRoute = createRoute({
+    method: "post", path: "/pipelines/{id}/stages",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: z.object({ name: z.string().min(1).max(200) }) } } },
+    },
+    responses: { 201: { description: "Stage added at the end of the pipeline" } },
+  });
+  app.openapi(createStageRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    const name = c.req.valid("json").name.trim();
+    if (!name) throw dealValidation("Stage name must not be empty.");
+    const stage = await createPipelineStage(db, id, name);
+    return c.json({ stage: serializeStage(stage) }, 201);
+  });
+
+  const updateStageRoute = createRoute({
+    method: "patch", path: "/pipelines/{id}/stages/{stageId}",
+    request: {
+      params: z.object({ id: z.string(), stageId: z.string() }),
+      body: { content: { "application/json": { schema: z.object({ name: z.string().min(1).max(200) }) } } },
+    },
+    responses: { 200: { description: "Stage renamed" } },
+  });
+  app.openapi(updateStageRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id, stageId } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    const name = c.req.valid("json").name.trim();
+    if (!name) throw dealValidation("Stage name must not be empty.");
+    const row = await updatePipelineStage(db, id, stageId, { name });
+    if (!row) throw new AppError("NOT_FOUND", "Pipeline stage not found.", { status: 404 });
+    return c.json({ stage: serializeStage(row) });
+  });
+
+  const deleteStageRoute = createRoute({
+    method: "delete", path: "/pipelines/{id}/stages/{stageId}",
+    request: { params: z.object({ id: z.string(), stageId: z.string() }) },
+    responses: { 200: { description: "Stage deleted" } },
+  });
+  app.openapi(deleteStageRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id, stageId } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    const stage = await getPipelineStage(db, id, stageId);
+    if (!stage) throw new AppError("NOT_FOUND", "Pipeline stage not found.", { status: 404 });
+    // Deals must be moved out first - a stage full of deals is never
+    // silently emptied (there is no ?force here by design).
+    const dealCount = await countStageDeals(db, stageId);
+    if (dealCount > 0) {
+      throw new AppError(
+        "CONFLICT",
+        `Stage still holds ${dealCount} deal(s). Move them to another stage before deleting it.`,
+        { status: 409, details: { reason: "stage_has_deals", dealCount } },
+      );
+    }
+    await deletePipelineStage(db, id, stageId);
+    return c.json({ deleted: true });
+  });
+
+  const reorderStagesRoute = createRoute({
+    method: "post", path: "/pipelines/{id}/stages/reorder",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: z.object({ stageIds: z.array(z.string().min(1)) }) } } },
+    },
+    responses: { 200: { description: "Stages in their new order" } },
+  });
+  app.openapi(reorderStagesRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    await requirePipeline(db, ws, id);
+    const { stageIds } = c.req.valid("json");
+    const current = await listPipelineStages(db, id);
+    const currentIds = new Set(current.map((s) => s.id));
+    if (stageIds.length !== current.length || stageIds.some((s) => !currentIds.has(s))) {
+      throw dealValidation("stageIds must list every stage of the pipeline exactly once.");
+    }
+    const stages = await reorderPipelineStages(db, id, stageIds);
+    return c.json({ stages: stages.map(serializeStage) });
+  });
+
+  const dealStatusSchema = z.enum(["open", "won", "lost"]);
+  const dealCurrencySchema = z.string().regex(/^[A-Za-z]{3}$/);
+  const dealDateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+  const listDealsRoute = createRoute({
+    method: "get", path: "/deals",
+    request: {
+      query: z.object({
+        pipelineId: z.string().optional(),
+        stageId: z.string().optional(),
+        status: dealStatusSchema.optional(),
+        contactId: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(500).optional(),
+        offset: z.coerce.number().int().min(0).optional(),
+      }),
+    },
+    responses: { 200: { description: "Deals + total" } },
+  });
+  app.openapi(listDealsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const q = c.req.valid("query");
+    const { deals, total } = await listDeals(db, ws, {
+      pipelineId: q.pipelineId, stageId: q.stageId, status: q.status,
+      contactId: q.contactId, limit: q.limit, offset: q.offset,
+    });
+    return c.json({ deals: deals.map(serializeDeal), total });
+  });
+
+  /** Compose a deal's targets from ids, all workspace-checked (400s). */
+  const resolveDealTargets = async (
+    db: Database, ws: string,
+    input: { pipelineId: string; stageId?: string; contactId: string; conversationId?: string | null },
+  ): Promise<{ pipeline: PipelineRow; stage: PipelineStageRow }> => {
+    const contact = await getContact(db, ws, input.contactId);
+    if (!contact) throw dealValidation("contactId does not reference a contact in this workspace.");
+    const pipeline = await getPipeline(db, ws, input.pipelineId);
+    if (!pipeline) throw dealValidation("pipelineId does not reference a pipeline in this workspace.");
+    let stage: PipelineStageRow | null;
+    if (input.stageId) {
+      stage = await getPipelineStage(db, pipeline.id, input.stageId);
+      if (!stage) throw dealValidation("stageId does not reference a stage of the given pipeline.");
+    } else {
+      const stages = await listPipelineStages(db, pipeline.id);
+      stage = stages[0] ?? null;
+      if (!stage) throw dealValidation("The pipeline has no stages yet - add a stage before creating deals.");
+    }
+    if (input.conversationId) {
+      const conversation = await getConversation(db, ws, input.conversationId);
+      if (!conversation) throw dealValidation("conversationId does not reference a conversation in this workspace.");
+    }
+    return { pipeline, stage };
+  };
+
+  const createDealRoute = createRoute({
+    method: "post", path: "/deals",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              pipelineId: z.string().min(1),
+              stageId: z.string().min(1).optional(),
+              contactId: z.string().min(1),
+              conversationId: z.string().min(1).nullable().optional(),
+              title: z.string().min(1).max(300),
+              value: z.number().nonnegative().nullable().optional(),
+              currency: dealCurrencySchema.optional(),
+              expectedCloseDate: dealDateSchema.nullable().optional(),
+              notes: z.string().max(5000).nullable().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Deal created" } },
+  });
+  app.openapi(createDealRoute, async (c) => {
+    guardMutator(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const title = body.title.trim();
+    if (!title) throw dealValidation("Deal title must not be empty.");
+    const { stage } = await resolveDealTargets(db, ws, body);
+    const row = await createDeal(db, {
+      workspaceId: ws,
+      pipelineId: body.pipelineId,
+      stageId: stage.id,
+      contactId: body.contactId,
+      conversationId: body.conversationId ?? null,
+      title,
+      value: body.value === undefined || body.value === null ? null : String(body.value),
+      currency: body.currency?.toUpperCase() ?? (await workspaceDefaultCurrency(db, ws)),
+      expectedCloseDate: body.expectedCloseDate ?? null,
+      notes: body.notes ?? null,
+      createdByUserId: auth.user.id,
+    });
+    const full = await getDeal(db, ws, row.id);
+    return c.json({ deal: serializeDeal(full ?? row) }, 201);
+  });
+
+  const getDealRoute = createRoute({
+    method: "get", path: "/deals/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One deal" } },
+  });
+  app.openapi(getDealRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const deal = await getDeal(db, ws, c.req.valid("param").id);
+    if (!deal) throw new AppError("NOT_FOUND", "Deal not found.", { status: 404 });
+    return c.json({ deal: serializeDeal(deal) });
+  });
+
+  const updateDealRoute = createRoute({
+    method: "patch", path: "/deals/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              title: z.string().min(1).max(300).optional(),
+              pipelineId: z.string().min(1).optional(),
+              stageId: z.string().min(1).optional(),
+              contactId: z.string().min(1).optional(),
+              conversationId: z.string().min(1).nullable().optional(),
+              value: z.number().nonnegative().nullable().optional(),
+              currency: dealCurrencySchema.optional(),
+              status: dealStatusSchema.optional(),
+              expectedCloseDate: dealDateSchema.nullable().optional(),
+              notes: z.string().max(5000).nullable().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Deal updated" } },
+  });
+  app.openapi(updateDealRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const existing = await getDeal(db, ws, id);
+    if (!existing) throw new AppError("NOT_FOUND", "Deal not found.", { status: 404 });
+
+    const patch: Parameters<typeof updateDeal>[3] = {};
+    if (body.title !== undefined) {
+      const title = body.title.trim();
+      if (!title) throw dealValidation("Deal title must not be empty.");
+      patch.title = title;
+    }
+    // Pipeline / stage composition: the stage must belong to the
+    // (possibly new) pipeline; switching pipelines without naming a
+    // stage lands the deal in the new pipeline's first stage.
+    const targetPipelineId = body.pipelineId ?? existing.pipelineId;
+    if (body.pipelineId !== undefined && body.pipelineId !== existing.pipelineId) {
+      const pipeline = await getPipeline(db, ws, body.pipelineId);
+      if (!pipeline) throw dealValidation("pipelineId does not reference a pipeline in this workspace.");
+      patch.pipelineId = body.pipelineId;
+    }
+    if (body.stageId !== undefined || patch.pipelineId !== undefined) {
+      let stage: PipelineStageRow | null;
+      if (body.stageId !== undefined) {
+        stage = await getPipelineStage(db, targetPipelineId, body.stageId);
+        if (!stage) throw dealValidation("stageId does not reference a stage of the deal's pipeline.");
+      } else {
+        const stages = await listPipelineStages(db, targetPipelineId);
+        stage = stages[0] ?? null;
+        if (!stage) throw dealValidation("The target pipeline has no stages yet.");
+      }
+      if (stage.id !== existing.stageId || patch.pipelineId !== undefined) {
+        patch.stageId = stage.id;
+        patch.stageChangedAt = new Date();
+      }
+    }
+    if (body.contactId !== undefined && body.contactId !== existing.contactId) {
+      const contact = await getContact(db, ws, body.contactId);
+      if (!contact) throw dealValidation("contactId does not reference a contact in this workspace.");
+      patch.contactId = body.contactId;
+    }
+    if (body.conversationId !== undefined) {
+      if (body.conversationId !== null) {
+        const conversation = await getConversation(db, ws, body.conversationId);
+        if (!conversation) throw dealValidation("conversationId does not reference a conversation in this workspace.");
+      }
+      patch.conversationId = body.conversationId;
+    }
+    if (body.value !== undefined) patch.value = body.value === null ? null : String(body.value);
+    if (body.currency !== undefined) patch.currency = body.currency.toUpperCase();
+    if (body.status !== undefined && body.status !== existing.status) {
+      patch.status = body.status as DealStatus;
+      // Closing stamps closedAt; reopening clears it.
+      patch.closedAt = body.status === "open" ? null : new Date();
+    }
+    if (body.expectedCloseDate !== undefined) patch.expectedCloseDate = body.expectedCloseDate;
+    if (body.notes !== undefined) patch.notes = body.notes;
+
+    const row = await updateDeal(db, ws, id, patch);
+    if (!row) throw new AppError("NOT_FOUND", "Deal not found.", { status: 404 });
+    const full = await getDeal(db, ws, row.id);
+    return c.json({ deal: serializeDeal(full ?? row) });
+  });
+
+  const deleteDealRoute = createRoute({
+    method: "delete", path: "/deals/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Deal deleted" } },
+  });
+  app.openapi(deleteDealRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const deleted = await deleteDeal(db, ws, id);
+    if (!deleted) throw new AppError("NOT_FOUND", "Deal not found.", { status: 404 });
     return c.json({ deleted: true });
   });
 
