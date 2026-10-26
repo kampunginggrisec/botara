@@ -1860,6 +1860,8 @@ function ChannelsPage() {
   const [platformFilter, setPlatformFilter] = useState<string>("all");
   const [confirmDisconnectId, setConfirmDisconnectId] = useState<string | null>(null);
   const [disconnectBusyId, setDisconnectBusyId] = useState<string | null>(null);
+  const [confirmPurgeId, setConfirmPurgeId] = useState<string | null>(null);
+  const [purgeBusyId, setPurgeBusyId] = useState<string | null>(null);
   const [connectOpen, setConnectOpen] = useState(false);
 
   const load = useCallback(async () => {
@@ -2030,14 +2032,33 @@ function ChannelsPage() {
   const disconnect = async (a: ChannelAccount) => {
     setDisconnectBusyId(a.id);
     try {
-      await api.deleteChannelAccount(a.id);
-      pushToast("ok", t("channels.disconnected", { name: a.displayName ?? a.channel }));
+      const res = await api.deleteChannelAccount(a.id);
+      // "deleted": the account had no data and is gone entirely.
+      // "disconnected": history exists - the account is soft-disconnected
+      // and its card stays (with the disconnected badge) after reload.
+      pushToast("ok", t(res.mode === "disconnected" ? "channels.disconnectedKeptData" : "channels.disconnected", {
+        name: a.displayName ?? a.channel,
+      }));
       setConfirmDisconnectId(null);
       await load();
     } catch (err) {
       pushToast("err", errText(err, t("channels.disconnectFailed")));
     } finally {
       setDisconnectBusyId(null);
+    }
+  };
+
+  const purgeAccount = async (a: ChannelAccount) => {
+    setPurgeBusyId(a.id);
+    try {
+      await api.deleteChannelAccount(a.id, true);
+      pushToast("ok", t("channels.purged", { name: a.displayName ?? a.channel }));
+      setConfirmPurgeId(null);
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("channels.purgeFailed")));
+    } finally {
+      setPurgeBusyId(null);
     }
   };
 
@@ -2173,7 +2194,40 @@ function ChannelsPage() {
                 )}
                 {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
                 <div className="mt-auto pt-4">
-                  {confirmDisconnectId === a.id ? (
+                  {a.status === "disconnected" ? (
+                    confirmPurgeId === a.id ? (
+                      <div>
+                        <p className="text-xs leading-relaxed text-red-600 dark:text-red-400">
+                          {t("channels.deletePermanentlyWarning")}
+                        </p>
+                        <div className="mt-2 flex gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void purgeAccount(a)}
+                            disabled={purgeBusyId === a.id}
+                            className="flex-1 rounded-full bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+                          >
+                            {t("channels.deletePermanentlyConfirm")}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmPurgeId(null)}
+                            className="rounded-full border border-slate-300 px-4 py-2 text-sm dark:border-slate-700"
+                          >
+                            {t("common.cancel")}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmPurgeId(a.id)}
+                        className="w-full rounded-full border border-red-300 px-4 py-2 text-sm font-medium text-red-600 hover:bg-red-50 dark:border-red-900 dark:text-red-400 dark:hover:bg-red-950"
+                      >
+                        {t("channels.deletePermanently")}
+                      </button>
+                    )
+                  ) : confirmDisconnectId === a.id ? (
                     <div className="flex gap-2">
                       <button
                         type="button"

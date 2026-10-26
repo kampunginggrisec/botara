@@ -712,8 +712,11 @@ export const api = {
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {
     return request("/channels/accounts");
   },
-  deleteChannelAccount(id: string): Promise<{ deleted: boolean }> {
-    return request(`/channels/accounts/${id}`, { method: "DELETE" });
+  deleteChannelAccount(
+    id: string,
+    purge = false,
+  ): Promise<{ mode: "deleted" | "disconnected" | "purged" }> {
+    return request(`/channels/accounts/${id}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
   },
   // ------------------------------------------------- Meta catalog sync
   listCatalogProducts(
