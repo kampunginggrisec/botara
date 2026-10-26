@@ -102,4 +102,40 @@ describe("messenger webhooks", () => {
     const ref = events[2]!;
     if (ref.type === "referral.received") expect(ref.ref).toBe("promo-ads");
   });
+
+  test("a message attachment normalizes to media with its CDN url", async () => {
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
+    const events = await msgr.parseWebhook({
+      object: "page",
+      entry: [{
+        id: "page-1",
+        messaging: [
+          {
+            sender: { id: "psid-1" }, timestamp: 1700000000000,
+            message: {
+              mid: "mid-att", text: "lihat foto ini",
+              attachments: [{ type: "image", payload: { url: "https://cdn.example.com/photo.jpg" } }],
+            },
+          },
+          {
+            sender: { id: "psid-1" }, timestamp: 1700000001000,
+            message: {
+              mid: "mid-loc",
+              attachments: [{ type: "location", payload: { coordinates: { lat: 1, long: 2 } } }],
+            },
+          },
+        ],
+      }],
+    });
+    expect(events).toHaveLength(2);
+    const withMedia = events[0]!;
+    if (withMedia.type === "message.received") {
+      expect(withMedia.media).toEqual({ type: "image", url: "https://cdn.example.com/photo.jpg" });
+      expect(withMedia.text).toBe("lihat foto ini");
+    }
+    const location = events[1]!;
+    if (location.type === "message.received") {
+      expect(location.media).toBeUndefined();
+    }
+  });
 });

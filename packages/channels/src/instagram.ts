@@ -3,8 +3,8 @@ import { mapGraphError, ProviderApiError, type GraphErrorBodyShape } from "./err
 import { evaluateLongLivedRefresh } from "./token-lifecycle";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
-  type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
-  type SendInput, type SendResult,
+  type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
+  type PublishInput, type SendInput, type SendResult,
 } from "./types";
 import { richToPlainText, type RichBlock, type RichWarning } from "./rich";
 
@@ -110,6 +110,23 @@ export function buildInstagramAuthorizeUrl(input: {
 
 const isoFromEpochSeconds = (ts: unknown): string =>
   new Date((typeof ts === "string" ? Number(ts) : (ts as number)) * 1000).toISOString();
+
+/**
+ * First attachment of a Meta messaging webhook message, normalized
+ * (same shape as Messenger's - see messenger.ts): attachments arrive
+ * as [{ type, payload: { url } }] with a self-signed CDN URL.
+ */
+function metaAttachmentMedia(attachments: unknown): { media: MessageMedia } | Record<string, never> {
+  const first = Array.isArray(attachments) ? (attachments[0] as Record<string, any> | undefined) : undefined;
+  const url = first?.payload?.url;
+  if (!first || typeof url !== "string" || !url) return {};
+  const type = first.type === "image" ? "image"
+    : first.type === "video" ? "video"
+    : first.type === "audio" ? "audio"
+    : first.type === "file" ? "document"
+    : "unknown";
+  return { media: { type, url } };
+}
 
 export class InstagramAdapter implements ChannelAdapter {
   readonly key = "instagram" as const;
@@ -552,6 +569,7 @@ export class InstagramAdapter implements ChannelAdapter {
             contactExternalId: String(item.sender?.id ?? ""),
             messageExternalId: String(item.message.mid),
             text: item.message.text,
+            ...metaAttachmentMedia(item.message.attachments),
             receivedAt: isoFromEpochSeconds(item.timestamp ?? 0),
           });
         }

@@ -199,6 +199,28 @@ describe("instagram webhooks", () => {
       expect(cmt.authorExternalId).toBe("u-2");
     }
   });
+
+  test("a message attachment normalizes to media with its CDN url", async () => {
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
+    const events = await ig.parseWebhook({
+      object: "instagram",
+      entry: [{
+        id: "ig-user-1",
+        messaging: [{
+          sender: { id: "u-9" }, recipient: { id: "ig-user-1" }, timestamp: 1700000000,
+          message: {
+            mid: "mid-att",
+            attachments: [{ type: "file", payload: { url: "https://cdn.example.com/brosur.pdf" } }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    const msg = events[0]!;
+    if (msg.type === "message.received") {
+      expect(msg.media).toEqual({ type: "document", url: "https://cdn.example.com/brosur.pdf" });
+    }
+  });
 });
 
 describe("instagram video containers (Fase 3 polling)", () => {

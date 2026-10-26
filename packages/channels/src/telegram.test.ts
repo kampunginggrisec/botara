@@ -107,6 +107,66 @@ describe("telegram adapter", () => {
     }
   });
 
+  test("parseWebhook: document message carries file_id, filename and mime type", async () => {
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
+    const events = await tg.parseWebhook({
+      update_id: 9003,
+      message: {
+        message_id: 14, date: 1760000000, caption: "ini invoice-nya",
+        chat: { id: 777, type: "private" },
+        document: { file_id: "doc-1", file_name: "invoice.pdf", mime_type: "application/pdf" },
+      },
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0]!;
+    if (ev.type === "message.received") {
+      expect(ev.media).toMatchObject({ type: "document", id: "doc-1", filename: "invoice.pdf", mimeType: "application/pdf" });
+      expect(ev.text).toBe("ini invoice-nya");
+    }
+  });
+
+  test("parseWebhook: voice note normalizes to audio media", async () => {
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
+    const events = await tg.parseWebhook({
+      update_id: 9004,
+      message: {
+        message_id: 15, date: 1760000000,
+        chat: { id: 777, type: "private" },
+        voice: { file_id: "voice-1", mime_type: "audio/ogg" },
+      },
+    });
+    const ev = events[0]!;
+    if (ev.type === "message.received") {
+      expect(ev.media).toMatchObject({ type: "audio", id: "voice-1", mimeType: "audio/ogg" });
+    }
+  });
+
+  test("downloadFile resolves getFile then downloads the file bytes", async () => {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn: FetchLike = async (input, init) => {
+      calls.push({ url: String(input), init });
+      if (String(input).endsWith("/getFile")) {
+        return new Response(JSON.stringify({
+          ok: true, result: { file_id: "doc-1", file_path: "documents/file_1.pdf", file_size: 4 },
+        }), { headers: { "Content-Type": "application/json" } });
+      }
+      return new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 });
+    };
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    const res = await tg.downloadFile(ACCOUNT, "doc-1");
+    expect(res.fileSize).toBe(4);
+    expect(new Uint8Array(res.data)).toEqual(new Uint8Array([1, 2, 3, 4]));
+    expect(calls[0]!.url).toBe("https://api.telegram.org/bot123456:TEST-TOKEN/getFile");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ file_id: "doc-1" });
+    expect(calls[1]!.url).toBe("https://api.telegram.org/file/bot123456:TEST-TOKEN/documents/file_1.pdf");
+  });
+
+  test("downloadFile throws when getFile yields no file_path", async () => {
+    const { fetchFn } = mockFetch([{ body: { ok: true, result: { file_id: "gone" } } }]);
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    await expect(tg.downloadFile(ACCOUNT, "gone")).rejects.toThrow("no file_path");
+  });
+
   test("parseWebhook ignores non-message updates", async () => {
     const tg = new TelegramAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
     expect(await tg.parseWebhook({ update_id: 1, callback_query: { id: "x" } })).toEqual([]);

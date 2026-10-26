@@ -2,8 +2,8 @@ import { AppError, NotImplementedError } from "@botara/shared";
 import { mapGraphError, ProviderApiError, type GraphErrorBodyShape } from "./errors";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
-  type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
-  type SendInput, type SendResult,
+  type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
+  type PublishInput, type SendInput, type SendResult,
 } from "./types";
 import { richToPlainText, type RichBlock, type RichButton, type RichWarning } from "./rich";
 
@@ -30,6 +30,25 @@ export interface MessengerAdapterOptions {
 
 const isoFromEpochMs = (ts: unknown): string =>
   new Date(typeof ts === "number" ? ts : Number(ts)).toISOString();
+
+/**
+ * First attachment of a Meta messaging webhook message, normalized.
+ * Meta delivers attachments as [{ type, payload: { url } }] - the URL
+ * is a self-signed CDN link (fetched without auth by the inbound media
+ * pipeline). Attachments without a URL (locations carry coordinates
+ * instead) yield no media. Shared shape with Instagram messaging.
+ */
+function metaAttachmentMedia(attachments: unknown): { media: MessageMedia } | Record<string, never> {
+  const first = Array.isArray(attachments) ? (attachments[0] as Record<string, any> | undefined) : undefined;
+  const url = first?.payload?.url;
+  if (!first || typeof url !== "string" || !url) return {};
+  const type = first.type === "image" ? "image"
+    : first.type === "video" ? "video"
+    : first.type === "audio" ? "audio"
+    : first.type === "file" ? "document"
+    : "unknown";
+  return { media: { type, url } };
+}
 
 /** Scopes requested at Facebook Login for Messenger Page onboarding. */
 export const MESSENGER_OAUTH_SCOPES = [
@@ -450,6 +469,7 @@ export class MessengerAdapter implements ChannelAdapter {
             contactExternalId,
             messageExternalId: String(item.message.mid),
             text: item.message.text,
+            ...metaAttachmentMedia(item.message.attachments),
             receivedAt,
           });
         } else if (item.postback) {

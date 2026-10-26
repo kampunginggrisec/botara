@@ -92,6 +92,14 @@ export interface MessageMedia {
   type: "image" | "video" | "document" | "audio" | "sticker" | "photo" | "unknown";
   /** Provider media id (e.g. WhatsApp media id, Telegram file_id). */
   id?: string;
+  /**
+   * Provider-hosted URL the bytes can be fetched from (Messenger /
+   * Instagram webhook attachments carry one directly; WhatsApp and
+   * Telegram media are id-based instead and resolve through the
+   * adapter). Meta CDN attachment URLs are self-signed - they are
+   * fetched WITHOUT an Authorization header.
+   */
+  url?: string;
   caption?: string;
   mimeType?: string;
   filename?: string;

@@ -2,8 +2,8 @@ import { AppError } from "@botara/shared";
 import { ProviderApiError, ProviderRateLimitError } from "./errors";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
-  type CredentialProvider, type FetchLike, type InboundEvent, type PublishInput,
-  type SendInput, type SendResult,
+  type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
+  type PublishInput, type SendInput, type SendResult,
 } from "./types";
 import { richToPlainText, type RichBlock, type RichButton, type RichWarning } from "./rich";
 
@@ -260,6 +260,47 @@ export class TelegramAdapter implements ChannelAdapter {
     return { ok: true };
   }
 
+  // --- inbound media ---------------------------------------------------------
+
+  /** Resolve a file_id to its downloadable path + size (Bot API getFile). */
+  async fetchFilePath(
+    account: ChannelAccountRef,
+    fileId: string,
+  ): Promise<{ filePath?: string; fileSize?: number }> {
+    const result = await this.call<{ file_path?: string; file_size?: number }>(
+      account, "getFile", { file_id: fileId },
+    );
+    return { filePath: result.file_path, fileSize: result.file_size };
+  }
+
+  /**
+   * Download the bytes behind an inbound file_id (the Telegram twin of
+   * WhatsApp's downloadMedia): getFile resolves the path, then the file
+   * is served from /file/bot<token>/<file_path>. Telegram caps bot
+   * downloads at 20 MB - larger files make getFile itself fail, and the
+   * caller (the inbound media pipeline) additionally enforces its own
+   * byte cap on whatever comes back.
+   */
+  async downloadFile(
+    account: ChannelAccountRef,
+    fileId: string,
+  ): Promise<{ data: ArrayBuffer; fileSize?: number }> {
+    const { filePath, fileSize } = await this.fetchFilePath(account, fileId);
+    if (!filePath) {
+      throw new ProviderApiError("Telegram getFile returned no file_path", {
+        provider: "telegram", retryable: false,
+      });
+    }
+    const botToken = await this.tokenFor(account);
+    const res = await this.fetchFn(`${this.baseUrl}/file/bot${botToken}/${filePath}`);
+    if (!res.ok) {
+      throw new ProviderApiError(`Telegram file download failed (HTTP ${res.status})`, {
+        provider: "telegram", retryable: res.status >= 500,
+      });
+    }
+    return { data: await res.arrayBuffer(), fileSize };
+  }
+
   async parseWebhook(payload: unknown): Promise<InboundEvent[]> {
     const update = payload as {
       update_id?: number;
@@ -276,16 +317,22 @@ export class TelegramAdapter implements ChannelAdapter {
       messageExternalId: String(msg.message_id),
       receivedAt,
     };
-    if (msg.photo && msg.photo.length > 0) {
-      const largest = msg.photo[msg.photo.length - 1]!;
+    const media = telegramMediaOf(msg);
+    if (media) {
       return [{
         type: "message.received", ...base,
         text: msg.caption,
-        media: { type: "photo", id: largest.file_id },
+        media,
       }];
     }
     return [{ type: "message.received", ...base, text: msg.text }];
   }
+}
+
+interface TelegramFile {
+  file_id: string;
+  file_name?: string;
+  mime_type?: string;
 }
 
 interface TelegramMessage {
@@ -296,4 +343,41 @@ interface TelegramMessage {
   chat: { id: number; type?: string; title?: string; username?: string };
   from?: { id: number; username?: string; first_name?: string };
   photo?: Array<{ file_id: string; width: number; height: number }>;
+  document?: TelegramFile;
+  video?: TelegramFile;
+  audio?: TelegramFile;
+  voice?: { file_id: string; mime_type?: string };
+  animation?: TelegramFile;
+  sticker?: { file_id: string };
+}
+
+/**
+ * The one media item a Telegram message carries, normalized. Photos
+ * arrive as a size ladder - the largest is the original. Voice notes
+ * and animations fold onto the shared audio/video types.
+ */
+function telegramMediaOf(msg: TelegramMessage): MessageMedia | undefined {
+  if (msg.photo && msg.photo.length > 0) {
+    const largest = msg.photo[msg.photo.length - 1]!;
+    return { type: "photo", id: largest.file_id };
+  }
+  if (msg.document) {
+    return { type: "document", id: msg.document.file_id, filename: msg.document.file_name, mimeType: msg.document.mime_type };
+  }
+  if (msg.video) {
+    return { type: "video", id: msg.video.file_id, filename: msg.video.file_name, mimeType: msg.video.mime_type };
+  }
+  if (msg.audio) {
+    return { type: "audio", id: msg.audio.file_id, filename: msg.audio.file_name, mimeType: msg.audio.mime_type };
+  }
+  if (msg.voice) {
+    return { type: "audio", id: msg.voice.file_id, mimeType: msg.voice.mime_type };
+  }
+  if (msg.animation) {
+    return { type: "video", id: msg.animation.file_id, filename: msg.animation.file_name, mimeType: msg.animation.mime_type };
+  }
+  if (msg.sticker) {
+    return { type: "sticker", id: msg.sticker.file_id };
+  }
+  return undefined;
 }
