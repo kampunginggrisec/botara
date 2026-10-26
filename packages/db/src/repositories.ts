@@ -529,6 +529,8 @@ export async function createChannelAccount(
     channel: string;
     externalId: string;
     displayName?: string;
+    /** Public profile-picture URL captured at connect time (never a Telegram file URL - those embed the bot token). */
+    avatarUrl?: string;
     authMode?: string;
     apiVersion?: string;
     capabilities?: Record<string, unknown>;
@@ -546,6 +548,7 @@ export async function createChannelAccount(
       channel: input.channel,
       externalId: input.externalId,
       displayName: input.displayName,
+      avatarUrl: input.avatarUrl,
       authMode: input.authMode,
       apiVersion: input.apiVersion,
       capabilities: input.capabilities ?? {},
@@ -589,6 +592,22 @@ export async function findChannelAccountByExternal(
     .where(and(eq(channelAccounts.channel, channel), eq(channelAccounts.externalId, externalId)))
     .limit(1);
   return row ?? null;
+}
+
+/**
+ * Update the stored profile-picture URL (re-connect refresh). Passing null
+ * clears it. Telegram accounts never store a URL here (token-bearing file
+ * URLs) - their avatars are proxied by the API instead.
+ */
+export async function updateChannelAccountAvatar(
+  db: Database,
+  accountId: string,
+  avatarUrl: string | null,
+): Promise<void> {
+  await db
+    .update(channelAccounts)
+    .set({ avatarUrl })
+    .where(eq(channelAccounts.id, accountId));
 }
 
 /** Persist the outcome of a token refresh (new expiry and/or vault ref, status). */

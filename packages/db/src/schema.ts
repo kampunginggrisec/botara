@@ -55,6 +55,10 @@ export const channelAccounts = pgTable("channel_accounts", {
   channel: varchar("channel", { length: 40 }).notNull(), // whatsapp|instagram|messenger|threads|telegram|email|tiktok
   externalId: varchar("external_id", { length: 200 }).notNull(), // WABA/phone id, IG id, page id, threads user id, TikTok open_id...
   displayName: varchar("display_name", { length: 200 }),
+  // Public profile-picture URL captured best-effort at connect time (Meta
+  // channels). Telegram is NEVER stored here: its file URLs embed the bot
+  // token - telegram avatars are served by an authenticated API proxy.
+  avatarUrl: text("avatar_url"),
   authMode: varchar("auth_mode", { length: 60 }), // e.g. instagram: "instagram-login" | "facebook-login"
   apiVersion: varchar("api_version", { length: 20 }), // pinned provider API version, e.g. "v26.0"
   capabilities: jsonb("capabilities").notNull().default({}), // CapabilitySet snapshot at connect time
