@@ -93,7 +93,7 @@ describe("tiktok OAuth connect flow", () => {
       displayName: "Toko Berkah", authMode: "oauth", status: "connected",
     });
     const ref = String(rows[0]!.tokenVaultRef);
-    const sealed = vault.get(ref);
+    const sealed = await vault.get(ref);
     expect(sealed).toBeTruthy();
     const pair = JSON.parse(sealed!) as { accessToken: string; refreshToken: string; openId: string };
     expect(pair.accessToken).toBe("acc-tt-1");

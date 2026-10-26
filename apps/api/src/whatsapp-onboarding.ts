@@ -22,6 +22,8 @@ import { CHANNEL_CAPABILITIES, type FetchLike } from "@botara/channels";
 export interface TokenVaultPort {
   /** Persist a secret and return an opaque reference for channel_accounts.token_vault_ref. */
   store(input: { channel: string; workspaceId: string; label: string; secret: string }): Promise<string>;
+  /** Resolve a vault ref back to its secret (server-side only, e.g. the Telegram avatar proxy); null when unknown. */
+  get(ref: string): Promise<string | null>;
   /** Remove the secret behind a vault ref; unknown refs are a no-op. */
   delete(ref: string): Promise<void>;
 }
@@ -49,9 +51,9 @@ export class InMemoryVault implements TokenVaultPort {
     this.entries.delete(ref);
   }
 
-  /** Test/dev only: read a secret back by ref. Never exposed over HTTP. */
-  get(ref: string): string | undefined {
-    return this.entries.get(ref);
+  /** Read a secret back by ref; null when unknown. Never exposed over HTTP. */
+  async get(ref: string): Promise<string | null> {
+    return this.entries.get(ref) ?? null;
   }
 }
 
@@ -109,6 +111,8 @@ export interface WhatsAppOnboardingDeps {
     channel: "whatsapp";
     externalId: string;
     displayName?: string;
+    /** Public profile-picture URL captured best-effort during the exchange. */
+    avatarUrl?: string;
     apiVersion: string;
     capabilities: Record<string, unknown>;
     isCoexistence: boolean;
@@ -213,7 +217,28 @@ export async function exchangeEmbeddedSignup(
     secret: accessToken,
   });
 
-  // 5) Persist one channel account per phone number.
+  // 5) Persist one channel account per phone number. The business profile
+  // picture is captured best-effort per number first: the profile GET
+  // answers either a flat object or a { data: [profile] } envelope
+  // depending on the surface, so both shapes are accepted; any failure
+  // just leaves the account without an avatar.
+  const fetchProfilePictureUrl = async (phoneNumberId: string): Promise<string | undefined> => {
+    try {
+      const url = new URL(`${base}/${version}/${phoneNumberId}/whatsapp_business_profile`);
+      url.searchParams.set("fields", "profile_picture_url");
+      const res = await deps.fetchFn(url.toString(), {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!res.ok) return undefined;
+      const json = (await res.json().catch(() => ({}))) as {
+        profile_picture_url?: string;
+        data?: Array<{ profile_picture_url?: string }>;
+      };
+      return json.profile_picture_url ?? json.data?.[0]?.profile_picture_url;
+    } catch {
+      return undefined;
+    }
+  };
   const accounts: OnboardedPhoneNumber[] = [];
   for (const number of selected) {
     const persisted = await deps.persistAccount({
@@ -221,6 +246,7 @@ export async function exchangeEmbeddedSignup(
       channel: "whatsapp",
       externalId: number.id,
       displayName: number.verified_name ?? number.display_phone_number,
+      avatarUrl: await fetchProfilePictureUrl(number.id),
       apiVersion: version,
       capabilities: CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>,
       isCoexistence,

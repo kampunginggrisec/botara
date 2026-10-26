@@ -67,6 +67,9 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
       "/v26.0/oauth/access_token",
       "/v26.0/debug_token",
       "/v26.0/waba-1/phone_numbers",
+      // Best-effort business-profile picture lookup per number.
+      "/v26.0/pn-1/whatsapp_business_profile",
+      "/v26.0/pn-2/whatsapp_business_profile",
       // Coexistence session: contacts + history sync requested per number.
       "/v26.0/pn-1/smb_app_data",
       "/v26.0/pn-1/smb_app_data",
@@ -86,7 +89,53 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
     // The persisted rows carry ONLY the vault ref; the vault holds the token.
     const ref = persisted[0]!.tokenVaultRef;
     expect(ref).toStartWith("vault:memory:");
-    expect(vault.get(ref)).toBe(BUSINESS_TOKEN);
+    expect(await vault.get(ref)).toBe(BUSINESS_TOKEN);
+  });
+
+  test("captures the business profile picture url (envelope shape) into the persisted account", async () => {
+    const base = mockGraph();
+    const fetchFn: FetchLike = async (input, init) => {
+      if (String(input).includes("/whatsapp_business_profile")) {
+        return new Response(JSON.stringify({
+          data: [{ profile_picture_url: "https://cdn.example.com/wa-profile.jpg", messaging_product: "whatsapp" }],
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      return base.fetchFn(input, init);
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.accounts).toHaveLength(2);
+    expect(persisted[0]!.avatarUrl).toBe("https://cdn.example.com/wa-profile.jpg");
+    expect(persisted[1]!.avatarUrl).toBe("https://cdn.example.com/wa-profile.jpg");
+  });
+
+  test("captures the business profile picture url (flat shape) too", async () => {
+    const base = mockGraph();
+    const fetchFn: FetchLike = async (input, init) => {
+      if (String(input).includes("/whatsapp_business_profile")) {
+        return new Response(JSON.stringify({ profile_picture_url: "https://cdn.example.com/flat.jpg" }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      return base.fetchFn(input, init);
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(persisted[0]!.avatarUrl).toBe("https://cdn.example.com/flat.jpg");
+  });
+
+  test("a failing profile-picture lookup never fails the onboarding", async () => {
+    const base = mockGraph();
+    const fetchFn: FetchLike = async (input, init) => {
+      if (String(input).includes("/whatsapp_business_profile")) {
+        return new Response(JSON.stringify({ error: { message: "no profile" } }), { status: 400 });
+      }
+      return base.fetchFn(input, init);
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.accounts).toHaveLength(2);
+    expect(persisted[0]!.avatarUrl).toBeUndefined();
   });
 
   test("the returned summary contains NO token material anywhere", async () => {

@@ -30,7 +30,7 @@ import {
   listKbChunks, listKbChunksByWorkspace,
   createFlow, listFlows, getFlow, updateFlow, deleteFlow,
   deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
-  updateChannelAccountToken,
+  updateChannelAccountToken, updateChannelAccountAvatar,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
   updateConversationAssignment, updateConversationStatus, CONVERSATION_STATUSES,
@@ -413,7 +413,7 @@ export function createReadinessChecker(
  */
 export function createDefaultVault(): TokenVaultPort {
   const memory = new InMemoryVault();
-  let real: { store: TokenVaultPort["store"]; delete: TokenVaultPort["delete"] } | null | undefined;
+  let real: { store: TokenVaultPort["store"]; get: TokenVaultPort["get"]; delete: TokenVaultPort["delete"] } | null | undefined;
   const resolveReal = () => {
     if (real !== undefined) return real;
     if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
@@ -423,6 +423,7 @@ export function createDefaultVault(): TokenVaultPort {
       });
       real = {
         store: (input) => vault.store(input),
+        get: (ref) => vault.get(ref),
         delete: (ref) => vault.delete(ref),
       };
     } else {
@@ -434,6 +435,16 @@ export function createDefaultVault(): TokenVaultPort {
     async store(input) {
       const vault = resolveReal();
       return vault ? vault.store(input) : memory.store(input);
+    },
+    async get(ref) {
+      const vault = resolveReal();
+      // A stored ref lives in exactly one vault: the real vault returns
+      // null for refs it does not own, so fall through to memory.
+      if (vault) {
+        const secret = await vault.get(ref);
+        if (secret !== null) return secret;
+      }
+      return memory.get(ref);
     },
     async delete(ref) {
       const vault = resolveReal();
@@ -1636,6 +1647,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   /** Persist (or re-connect) a channel account whose token lives in the vault. */
   async function persistConnectedAccount(input: {
     workspaceId: string; channel: string; externalId: string; displayName?: string;
+    avatarUrl?: string;
     authMode?: string; tokenVaultRef: string; tokenExpiresAt?: Date;
     capabilities?: Record<string, unknown>; isCoexistence?: boolean;
   }): Promise<{ id: string; created: boolean }> {
@@ -1648,6 +1660,11 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         tokenExpiresAt: input.tokenExpiresAt ?? null,
         status: "connected",
       });
+      // Re-connect refreshes the picture when the provider gave one; a
+      // missing picture keeps the previously captured URL.
+      if (input.avatarUrl) {
+        await updateChannelAccountAvatar(db, existing.id, input.avatarUrl);
+      }
       return { id: existing.id, created: false };
     }
     const row = await createChannelAccount(db, input);
@@ -1678,18 +1695,20 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       // exchange's user id is only a fallback if the profile call fails.
       let externalId = short.userId;
       let username: string | undefined;
+      let avatarUrl: string | undefined;
       try {
         const profile = await adapter.getProfile({ accessToken: long.accessToken });
         if (profile.userId) externalId = profile.userId;
         username = profile.username;
-      } catch { /* identity/display name are best-effort only */ }
+        avatarUrl = profile.avatarUrl;
+      } catch { /* identity/display name/avatar are best-effort only */ }
       const ref = await deps.vault.store({
         channel: "threads", workspaceId: state.w,
         label: username ? `@${username}` : externalId, secret: long.accessToken,
       });
       await persistConnectedAccount({
         workspaceId: state.w, channel: "threads", externalId,
-        displayName: username ? `@${username}` : externalId, authMode: "threads-oauth",
+        displayName: username ? `@${username}` : externalId, avatarUrl, authMode: "threads-oauth",
         tokenVaultRef: ref, tokenExpiresAt: new Date(long.expiresAt),
       });
       await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "threads" } })
@@ -1725,12 +1744,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       if (mode === "instagram-login") {
         if (!exchanged.externalUserId) return oauthFail(c, "instagram", "oauth_failed");
         let username: string | undefined;
+        let avatarUrl: string | undefined;
         try {
           const res = await deps.providerFetch(
-            `https://graph.instagram.com/${adapter.apiVersion}/me?fields=username&access_token=${encodeURIComponent(exchanged.accessToken)}`,
+            `https://graph.instagram.com/${adapter.apiVersion}/me?fields=username,profile_picture_url&access_token=${encodeURIComponent(exchanged.accessToken)}`,
           );
-          const json = (await res.json().catch(() => ({}))) as { username?: string };
+          const json = (await res.json().catch(() => ({}))) as { username?: string; profile_picture_url?: string };
           username = json.username;
+          avatarUrl = json.profile_picture_url;
         } catch { /* best-effort */ }
         const ref = await deps.vault.store({
           channel: "instagram", workspaceId: state.w,
@@ -1739,6 +1760,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         await persistConnectedAccount({
           workspaceId: state.w, channel: "instagram", externalId: exchanged.externalUserId,
           displayName: username ? `@${username}` : exchanged.externalUserId,
+          avatarUrl,
           authMode: "instagram-login", tokenVaultRef: ref,
           tokenExpiresAt: exchanged.expiresAt ? new Date(exchanged.expiresAt) : undefined,
         });
@@ -1746,10 +1768,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         // Facebook Login: the user token must reach a Page that has an
         // Instagram business account linked; the PAGE token is what sends.
         const pagesRes = await deps.providerFetch(
-          `https://graph.facebook.com/${adapter.apiVersion}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username}&access_token=${encodeURIComponent(exchanged.accessToken)}`,
+          `https://graph.facebook.com/${adapter.apiVersion}/me/accounts?fields=id,name,access_token,instagram_business_account{id,username,profile_picture_url}&access_token=${encodeURIComponent(exchanged.accessToken)}`,
         );
         const pagesJson = (await pagesRes.json().catch(() => ({}))) as {
-          data?: Array<{ id: string; name: string; access_token: string; instagram_business_account?: { id: string; username?: string } }>;
+          data?: Array<{
+            id: string; name: string; access_token: string;
+            instagram_business_account?: { id: string; username?: string; profile_picture_url?: string };
+          }>;
           error?: unknown;
         };
         if (!pagesRes.ok || pagesJson.error) return oauthFail(c, "instagram", "oauth_failed");
@@ -1763,6 +1788,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         await persistConnectedAccount({
           workspaceId: state.w, channel: "instagram", externalId: ig.id,
           displayName: ig.username ? `@${ig.username}` : page.name,
+          avatarUrl: ig.profile_picture_url,
           authMode: "facebook-login", tokenVaultRef: ref,
         });
       }
@@ -1797,9 +1823,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         const ref = await deps.vault.store({
           channel: "messenger", workspaceId: state.w, label: page.name, secret: page.accessToken,
         });
+        const avatarUrl = await adapter.fetchPagePictureUrl({ pageId: page.id, pageAccessToken: page.accessToken }) ?? undefined;
         await persistConnectedAccount({
           workspaceId: state.w, channel: "messenger", externalId: page.id,
-          displayName: page.name, authMode: "facebook-login", tokenVaultRef: ref,
+          displayName: page.name, avatarUrl, authMode: "facebook-login", tokenVaultRef: ref,
         });
         await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "messenger" } })
           .catch(() => undefined);
@@ -3107,6 +3134,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         const { tokenVaultRef: _vaultRef, ...safe } = r;
         return {
           ...safe,
+          // Public profile-picture URL (Meta channels); null when absent -
+          // telegram never stores one (token-bearing URLs), its avatar is
+          // served by the /channels/accounts/{id}/avatar proxy instead.
+          avatarUrl: r.avatarUrl ?? null,
           hasCredential: Boolean(r.tokenVaultRef),
           createdAt: iso(r.createdAt),
           tokenExpiresAt: iso(r.tokenExpiresAt),
@@ -3162,6 +3193,41 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       details: { channel: account.channel, externalId: account.externalId },
     }).catch(() => undefined);
     return c.json({ deleted: true });
+  });
+
+  // Telegram account avatar, proxied: Telegram file URLs embed the bot
+  // token, so they are never stored on the account row or handed to a
+  // client. This endpoint resolves the vault token server-side and
+  // streams the bot's profile photo bytes instead. Meta/webchat accounts
+  // carry a public avatarUrl (rendered directly by the SPA) - anything
+  // that is not a telegram account with a resolvable photo is a 404 and
+  // the SPA falls back to its initial chip.
+  app.get("/channels/accounts/:id/avatar", async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const account = await getChannelAccount(db, ws, c.req.param("id"));
+    if (!account || account.channel !== "telegram" || !account.tokenVaultRef) {
+      throw new AppError("NOT_FOUND", "No avatar available for this account.", { status: 404 });
+    }
+    const botToken = await deps.vault.get(account.tokenVaultRef).catch(() => null);
+    if (!botToken) {
+      throw new AppError("NOT_FOUND", "No avatar available for this account.", { status: 404 });
+    }
+    const adapter = new TelegramAdapter({
+      credentials: new StaticCredentialProvider({ botToken }),
+      fetchFn: deps.providerFetch,
+    });
+    const avatar = await adapter.fetchOwnAvatar({ botToken, botId: account.externalId });
+    if (!avatar) {
+      throw new AppError("NOT_FOUND", "No avatar available for this account.", { status: 404 });
+    }
+    return new Response(avatar.bytes, {
+      status: 200,
+      headers: {
+        "Content-Type": avatar.contentType,
+        "Cache-Control": "private, max-age=3600",
+      },
+    });
   });
 
   // ------------------------------------------------- Meta catalog sync
@@ -3380,9 +3446,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const ref = await deps.vault.store({
       channel: "messenger", workspaceId: wsId, label: page.name, secret: page.t,
     });
+    const adapter = new MessengerAdapter({
+      credentials: new StaticCredentialProvider({}), fetchFn: deps.providerFetch,
+    });
+    const avatarUrl = await adapter.fetchPagePictureUrl({ pageId: page.id, pageAccessToken: page.t }) ?? undefined;
     const persisted = await persistConnectedAccount({
       workspaceId: wsId, channel: "messenger", externalId: page.id,
-      displayName: page.name, authMode: "facebook-login", tokenVaultRef: ref,
+      displayName: page.name, avatarUrl, authMode: "facebook-login", tokenVaultRef: ref,
     });
     deleteCookie(c, MESSENGER_PENDING_COOKIE, { path: "/" });
     await deps.authStore.audit({

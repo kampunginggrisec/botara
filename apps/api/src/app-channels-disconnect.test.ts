@@ -87,7 +87,7 @@ describe("DELETE /channels/accounts/{id}", () => {
 
     expect(await getChannelAccount(fake.db, owner.workspaceId, account.id)).toBeNull();
     expect(vaultDeleteCalls).toEqual([ref]);
-    expect(vault.get(ref)).toBeUndefined();
+    expect(await vault.get(ref)).toBeNull();
   });
 
   test("an account in another workspace is 404 and the row still exists", async () => {
