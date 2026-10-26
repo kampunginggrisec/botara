@@ -31,6 +31,47 @@ export const storedGraphSchema = z.object({
   startNodeId: z.string().min(1),
   nodes: z.array(storedNodeSchema).min(1),
   edges: z.array(flowEdgeSchema),
+}).superRefine((graph, ctx) => {
+  // Cross-reference integrity (write boundary): the node schemas above
+  // validate each node in isolation, so without these checks a graph
+  // whose pointers dangle - a startNodeId naming no node, a `next` /
+  // `whenTrue` / `whenFalse` jumping nowhere, an edge between ghosts -
+  // would be stored (or imported) happily and only fail, or silently
+  // dead-end, at runtime. Every id a graph points at must be a node in
+  // the same graph. All issues are plain zod failures, so the API
+  // surfaces them through its existing 400 VALIDATION shape.
+  //
+  // Deliberately NOT checked here:
+  // - startNodeId being the trigger node: the builder falls back to the
+  //   first node when a graph has no trigger node (a manual-trigger
+  //   flow), so existence is the only invariant every producer keeps.
+  // - External resource ids on action steps (assign.userId,
+  //   sequence_subscribe.sequenceId): those name workspace data, not
+  //   graph nodes - a missing target is a runtime warning by design
+  //   (adoption package #3), never a save-time rejection.
+  const ids = new Set(graph.nodes.map((n) => n.id));
+  const checkRef = (target: string | null | undefined, path: (string | number)[], label: string): void => {
+    if (target != null && !ids.has(target)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path,
+        message: `${label} references node "${target}", which does not exist in this graph`,
+      });
+    }
+  };
+  checkRef(graph.startNodeId, ["startNodeId"], "startNodeId");
+  graph.nodes.forEach((node, i) => {
+    const n = node as FlowNode;
+    checkRef(n.next, ["nodes", i, "next"], "next");
+    if (n.type === "condition") {
+      checkRef(n.whenTrue, ["nodes", i, "whenTrue"], "whenTrue");
+      checkRef(n.whenFalse, ["nodes", i, "whenFalse"], "whenFalse");
+    }
+  });
+  graph.edges.forEach((edge, i) => {
+    checkRef(edge.source, ["edges", i, "source"], "edge source");
+    checkRef(edge.target, ["edges", i, "target"], "edge target");
+  });
 });
 
 export type StoredGraph = z.infer<typeof storedGraphSchema>;

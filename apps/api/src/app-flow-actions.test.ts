@@ -89,6 +89,23 @@ describe("flow action steps: validation + round-trip via POST /flows", () => {
     expect((await createFlow("Bad status", badStatus)).status).toBe(400);
   });
 
+  test("dangling graph references are rejected at the schema edge (400)", async () => {
+    const danglingNext = structuredClone(actionGraph);
+    (danglingNext.nodes[5] as { next: string | null }).next = "ghost";
+    const res = await createFlow("Dangling next", danglingNext);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION");
+
+    const danglingStart = structuredClone(actionGraph);
+    danglingStart.startNodeId = "ghost";
+    expect((await createFlow("Dangling start", danglingStart)).status).toBe(400);
+
+    const danglingEdge = structuredClone(actionGraph);
+    danglingEdge.edges[0]!.target = "ghost";
+    expect((await createFlow("Dangling edge", danglingEdge)).status).toBe(400);
+  });
+
   test("export -> import round-trip: re-POSTing a fetched graph stores an equal graph", async () => {
     const created = await createFlow("Original", actionGraph);
     const { flow: original } = (await created.json()) as { flow: { id: string; graph: unknown } };
