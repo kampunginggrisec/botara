@@ -13,6 +13,9 @@ import {
   getDb, getWorkspaceById, listContacts, getContact, createContact, updateContact, segmentCounts,
   listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
   touchConversationLastUserMessage,
+  listSavedReplies, getSavedReply, getSavedReplyByShortcut, createSavedReply,
+  updateSavedReply, deleteSavedReply, isUniqueViolation,
+  type SavedReplyRow, type MessageRow,
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, listBroadcasts, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
@@ -2009,7 +2012,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products", "/moderation"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products", "/moderation", "/saved-replies"]) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
@@ -2379,6 +2382,27 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const members = await deps.authStore.listMembers(ws);
     return new Map(members.map((m) => [m.userId, { name: m.name, email: m.email }]));
   };
+  /**
+   * Shared message serializer: ISO dates, an explicit `kind` (rows from
+   * before migration 0008 read as "message"), and the author's display
+   * identity for human-written rows (internal notes) resolved from the
+   * member list - null once the author has left the workspace.
+   */
+  const serializeMessage = (
+    m: MessageRow,
+    memberById: Map<string, { name: string | null; email: string }>,
+  ) => ({
+    ...m,
+    kind: m.kind ?? "message",
+    createdAt: iso(m.createdAt),
+    author: m.authorUserId
+      ? {
+          userId: m.authorUserId,
+          name: memberById.get(m.authorUserId)?.name ?? null,
+          email: memberById.get(m.authorUserId)?.email ?? null,
+        }
+      : null,
+  });
 
   const listConversationsRoute = createRoute({
     method: "get", path: "/conversations",
@@ -2421,9 +2445,64 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const conversation = await getConversation(db, ws, id);
     if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
     const rows = await listMessages(db, id);
+    const memberById = await memberMapOf(ws);
     return c.json({
-      messages: rows.map((m) => ({ ...m, createdAt: iso(m.createdAt) })),
+      messages: rows.map((m) => serializeMessage(m, memberById)),
     });
+  });
+
+  /**
+   * Internal notes (package #2): a team-only timeline entry on the
+   * conversation. A note is created through THIS route only - it never
+   * calls an adapter, never enqueues a send, bypasses the messaging
+   * window and the account-connected gate on purpose (agents coordinate
+   * precisely when they cannot write to the customer), and persists as
+   * a messages row with kind "note" so the thread is one timeline.
+   * Customer-facing surfaces filter kind "note" out (webchat widget,
+   * AI suggest); the consecutive-outbound counter steps over notes.
+   */
+  const createNoteRoute = createRoute({
+    method: "post", path: "/conversations/{id}/notes",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({ body: z.string().min(1).max(4000) }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Internal note added" } },
+  });
+  app.openapi(createNoteRoute, async (c) => {
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const text = c.req.valid("json").body.trim();
+    if (!text) throw new AppError("VALIDATION", "Note body must not be empty.", { status: 400 });
+
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+
+    const note = await createMessage(db, {
+      conversationId: id,
+      direction: "out",
+      kind: "note",
+      authorUserId: auth.user.id,
+      type: "text",
+      body: text,
+      // "sent" = fully recorded; a note has no delivery lifecycle.
+      status: "sent",
+    });
+    // Same inbox event shape as a message: other agents' open threads
+    // refetch and the note appears live.
+    await deps.realtimePublisher.publishInboxMessage({
+      workspaceId: ws, conversationId: id, direction: "out", messageId: note.id,
+    }).catch(() => undefined);
+    const memberById = await memberMapOf(ws);
+    return c.json({ message: serializeMessage(note, memberById) }, 201);
   });
 
   const replyRoute = createRoute({
@@ -3033,6 +3112,173 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.redirect(target, 302);
   });
 
+  // -------------------------------------------------------- saved replies
+  // Package #2: the workspace's shared quick-reply library. Reads are
+  // open to every member (agents compose with them); writes are
+  // mutator-role (guardMutator), like other workspace content.
+  const serializeSavedReply = (r: SavedReplyRow) => ({
+    ...r,
+    createdAt: iso(r.createdAt),
+    updatedAt: iso(r.updatedAt),
+  });
+  /** Shortcuts are stored canonical: trimmed, always "/"-prefixed; empty clears. */
+  const normalizeShortcut = (raw: string | null | undefined): string | null => {
+    if (raw === undefined || raw === null) return null;
+    const trimmed = raw.trim();
+    if (!trimmed) return null;
+    return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
+  };
+  const assertShortcutFree = async (
+    db: Database, ws: string, shortcut: string | null, excludeId?: string,
+  ): Promise<void> => {
+    if (!shortcut) return;
+    const clash = await getSavedReplyByShortcut(db, ws, shortcut);
+    if (clash && clash.id !== excludeId) {
+      throw new AppError(
+        "CONFLICT",
+        `A saved reply with shortcut ${shortcut} already exists in this workspace.`,
+        { status: 409 },
+      );
+    }
+  };
+  const shortcutConflict = (shortcut: string | null) => new AppError(
+    "CONFLICT",
+    `A saved reply with shortcut ${shortcut} already exists in this workspace.`,
+    { status: 409 },
+  );
+  const validateShortcut = (shortcut: string | null): void => {
+    if (shortcut && (shortcut.length > 60 || !/^\/\S+$/.test(shortcut))) {
+      throw new AppError(
+        "VALIDATION",
+        "Shortcut must be a single token like /halo (max 60 characters, no spaces).",
+        { status: 400 },
+      );
+    }
+  };
+
+  const listSavedRepliesRoute = createRoute({
+    method: "get", path: "/saved-replies",
+    responses: { 200: { description: "Saved replies" } },
+  });
+  app.openapi(listSavedRepliesRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listSavedReplies(db, ws);
+    return c.json({ savedReplies: rows.map(serializeSavedReply) });
+  });
+
+  const createSavedReplyRoute = createRoute({
+    method: "post", path: "/saved-replies",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              title: z.string().min(1).max(200),
+              body: z.string().min(1).max(10000),
+              shortcut: z.string().max(60).nullable().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Saved reply created" } },
+  });
+  app.openapi(createSavedReplyRoute, async (c) => {
+    guardMutator(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const body = c.req.valid("json");
+    const title = body.title.trim();
+    const text = body.body.trim();
+    if (!title || !text) {
+      throw new AppError("VALIDATION", "Title and body must not be empty.", { status: 400 });
+    }
+    const shortcut = normalizeShortcut(body.shortcut);
+    validateShortcut(shortcut);
+    await assertShortcutFree(db, ws, shortcut);
+    try {
+      const row = await createSavedReply(db, {
+        workspaceId: ws, title, body: text, shortcut, createdBy: auth.user.id,
+      });
+      return c.json({ savedReply: serializeSavedReply(row) }, 201);
+    } catch (err) {
+      // Race backstop: the partial unique index fired between the
+      // pre-check and the insert - same typed 409, never a raw 500.
+      if (shortcut && isUniqueViolation(err)) throw shortcutConflict(shortcut);
+      throw err;
+    }
+  });
+
+  const updateSavedReplyRoute = createRoute({
+    method: "patch", path: "/saved-replies/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              title: z.string().min(1).max(200).optional(),
+              body: z.string().min(1).max(10000).optional(),
+              /** null clears the shortcut; absent leaves it unchanged. */
+              shortcut: z.string().max(60).nullable().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Saved reply updated" } },
+  });
+  app.openapi(updateSavedReplyRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const existing = await getSavedReply(db, ws, id);
+    if (!existing) throw new AppError("NOT_FOUND", "Saved reply not found.", { status: 404 });
+    const patch: { title?: string; body?: string; shortcut?: string | null } = {};
+    if (body.title !== undefined) {
+      const title = body.title.trim();
+      if (!title) throw new AppError("VALIDATION", "Title must not be empty.", { status: 400 });
+      patch.title = title;
+    }
+    if (body.body !== undefined) {
+      const text = body.body.trim();
+      if (!text) throw new AppError("VALIDATION", "Body must not be empty.", { status: 400 });
+      patch.body = text;
+    }
+    if (body.shortcut !== undefined) {
+      patch.shortcut = normalizeShortcut(body.shortcut);
+      validateShortcut(patch.shortcut);
+      await assertShortcutFree(db, ws, patch.shortcut, id);
+    }
+    try {
+      const row = await updateSavedReply(db, ws, id, patch);
+      if (!row) throw new AppError("NOT_FOUND", "Saved reply not found.", { status: 404 });
+      return c.json({ savedReply: serializeSavedReply(row) });
+    } catch (err) {
+      if (patch.shortcut && isUniqueViolation(err)) throw shortcutConflict(patch.shortcut);
+      throw err;
+    }
+  });
+
+  const deleteSavedReplyRoute = createRoute({
+    method: "delete", path: "/saved-replies/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Saved reply deleted" } },
+  });
+  app.openapi(deleteSavedReplyRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const deleted = await deleteSavedReply(db, ws, id);
+    if (!deleted) throw new AppError("NOT_FOUND", "Saved reply not found.", { status: 404 });
+    return c.json({ deleted: true });
+  });
+
   // ------------------------------------------------------------- templates
   const listTemplatesRoute = createRoute({
     method: "get", path: "/templates",
@@ -3259,7 +3505,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const { id } = c.req.valid("param");
     const conversation = await getConversation(db, ws, id);
     if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
-    const history = (await listMessages(db, id)).slice(-20);
+    // Internal notes stay out of the prompt: they are team coordination,
+    // not conversation history, and must never bleed into a customer-
+    // facing draft.
+    const history = (await listMessages(db, id)).filter((m) => m.kind !== "note").slice(-20);
     // Fase 3: ground the suggestion in the workspace KB when it exists -
     // embed the latest customer message, cosine-rank the stored chunk
     // embeddings in code, and hand the top-3 to the model as reference
@@ -4097,9 +4346,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const { db, session } = await requireWebchatSession(c, c.req.param("workspaceId"));
     const after = c.req.query("after");
     const rows = await listMessages(db, session.conversationId);
+    // This listing is CUSTOMER-facing (the visitor's own widget): internal
+    // notes (kind "note", package #2) must never reach it.
+    const visible = rows.filter((m) => m.kind !== "note");
     const filtered = after
-      ? rows.filter((m) => m.createdAt.toISOString() > after)
-      : rows;
+      ? visible.filter((m) => m.createdAt.toISOString() > after)
+      : visible;
     return c.json({
       messages: filtered.map((m) => ({ ...m, createdAt: iso(m.createdAt) })),
     });

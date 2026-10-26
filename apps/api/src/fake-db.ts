@@ -1,7 +1,7 @@
 import {
   auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
   kbChunks, kbDocuments,
-  messages, processedComments, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
+  messages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains, workspaces,
   type Database,
 } from "@botara/db";
@@ -310,6 +310,7 @@ export interface FakeDatabase {
     auditLog: Row[];
     kbDocuments: Row[];
     kbChunks: Row[];
+    savedReplies: Row[];
     workspaces: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
@@ -335,6 +336,7 @@ export function createFakeDatabase(): FakeDatabase {
     auditLog: [] as Row[],
     kbDocuments: [] as Row[],
     kbChunks: [] as Row[],
+    savedReplies: [] as Row[],
     workspaces: [] as Row[],
   };
   const core = new FakeCore();
@@ -356,6 +358,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(auditLog, store.auditLog);
   core.register(kbDocuments, store.kbDocuments);
   core.register(kbChunks, store.kbChunks);
+  core.register(savedReplies, store.savedReplies);
   core.register(workspaces, store.workspaces);
 
   const impl = {
