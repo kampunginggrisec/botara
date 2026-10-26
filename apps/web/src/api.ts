@@ -1047,10 +1047,10 @@ export const api = {
   updatePipeline(id: string, body: { name?: string; isDefault?: boolean }): Promise<{ pipeline: Pipeline }> {
     return request(`/pipelines/${id}`, { method: "PATCH", body: JSON.stringify(body) });
   },
-  deletePipeline(id: string, force = false): Promise<{ ok: boolean }> {
+  deletePipeline(id: string, force = false): Promise<{ deleted: boolean }> {
     return request(`/pipelines/${id}${force ? "?force=true" : ""}`, { method: "DELETE" });
   },
-  getPipelineSummary(id: string): Promise<PipelineSummary> {
+  getPipelineSummary(id: string): Promise<{ summary: PipelineSummary }> {
     return request(`/pipelines/${id}/summary`);
   },
   createPipelineStage(pipelineId: string, body: { name: string }): Promise<{ stage: PipelineStage }> {
@@ -1059,7 +1059,7 @@ export const api = {
   updatePipelineStage(pipelineId: string, stageId: string, body: { name: string }): Promise<{ stage: PipelineStage }> {
     return request(`/pipelines/${pipelineId}/stages/${stageId}`, { method: "PATCH", body: JSON.stringify(body) });
   },
-  deletePipelineStage(pipelineId: string, stageId: string): Promise<{ ok: boolean }> {
+  deletePipelineStage(pipelineId: string, stageId: string): Promise<{ deleted: boolean }> {
     return request(`/pipelines/${pipelineId}/stages/${stageId}`, { method: "DELETE" });
   },
   reorderPipelineStages(pipelineId: string, stageIds: string[]): Promise<{ stages: PipelineStage[] }> {
@@ -1092,7 +1092,7 @@ export const api = {
   }>): Promise<{ deal: Deal }> {
     return request(`/deals/${id}`, { method: "PATCH", body: JSON.stringify(body) });
   },
-  deleteDeal(id: string): Promise<{ ok: boolean }> {
+  deleteDeal(id: string): Promise<{ deleted: boolean }> {
     return request(`/deals/${id}`, { method: "DELETE" });
   },
   listChannelAccounts(): Promise<{ accounts: ChannelAccount[] }> {

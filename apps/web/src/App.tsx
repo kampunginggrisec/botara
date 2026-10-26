@@ -2706,7 +2706,7 @@ function DealsPage({ workspace }: { workspace: WorkspaceSummary | undefined }) {
         api.getPipelineSummary(pipelineId),
       ]);
       setDeals(d.deals);
-      setSummary(s);
+      setSummary(s.summary);
     } catch (err) {
       setError(errText(err, t("deals.loadFailed")));
     }
@@ -2758,7 +2758,7 @@ function DealsPage({ workspace }: { workspace: WorkspaceSummary | undefined }) {
         let count = 0;
         try {
           const s = await api.getPipelineSummary(p.id);
-          count = s.open.count + s.won.count + s.lost.count;
+          count = s.summary.open.count + s.summary.won.count + s.summary.lost.count;
         } catch { /* count is cosmetic in the confirm text */ }
         if (window.confirm(t("deals.pipelineHasDeals", { count }))) {
           try {
