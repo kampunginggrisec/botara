@@ -92,7 +92,9 @@ not started; *Not planned* = deliberately out of scope for now.
 |---|---|---|---|
 | Team members | All plans (size varies by plan) | **Implemented** | Members admin in Settings (invite by email, roles, remove) |
 | Role-based access control (RBAC) | **Paid** (Community = unlimited admins, no RBAC) | **Implemented** | owner/admin/member/agent roles enforced server-side — in Botara's open core |
-| Audit logs | **Paid** | **Implemented** | `audit_log` table; auth + workspace + channel events — open core |
+| Platform operator admin panel | Not itemized publicly | **Implemented** | `/admin` in the web app (docs/admin-panel.md): deployment overview + active users (login-based), user/workspace lists, billing = per-workspace usage/cost visibility from the WhatsApp cost ledger (monitoring only — no subscription charging), audit viewer; `users.is_platform_admin` flag, first registered user bootstraps as operator, last-admin revoke guard |
+| Platform settings in the admin UI (vs env files) | Not itemized publicly | **Implemented** | App credentials (Meta/Threads/Instagram/TikTok/Telegram), R2, Resend, AI keys managed in Admin → Settings, stored in `platform_settings` (secrets AES-256-GCM under the vault key); resolution DB → env → unset with a 60s effective-env refresh in api/worker; bootstrap secrets (SESSION_SECRET, TOKEN_VAULT_KEY, DATABASE_URL, REDIS_URL, ports) stay env-only by design |
+| Audit logs | **Paid** | **Implemented** | `audit_log` table; auth + workspace + channel events — open core, viewable in the admin panel |
 | Multi-workspace | Per plan (Community 1 → Enterprise unlimited) | **Implemented** | Workspace switcher; per-workspace data scoping everywhere |
 | White label / branding removal | **Paid** (Whitelabel/Enterprise) | **Not planned** | Botara is self-hosted open source; no branding lock-in either way |
 | Custom domain + SSL for an agency portal | **Paid** | **Partial** | Any self-hosted Botara runs on your own domain + HTTPS (Caddy); a multi-tenant agency portal is not a product surface |
