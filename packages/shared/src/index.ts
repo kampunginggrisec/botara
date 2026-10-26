@@ -1,6 +1,6 @@
 export {
   AppError, NotImplementedError, ERROR_CODES, type ErrorCode,
-  ChannelInitiationError, ConversationAddressMissingError,
+  ChannelInitiationError, ChannelAccountDisconnectedError, ConversationAddressMissingError,
 } from "./errors";
 export {
   money, addMoney, usdToCents, startOfUtcMonth, addHours, isWithinWindow, type Money,

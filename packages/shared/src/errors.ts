@@ -12,6 +12,7 @@ export const ERROR_CODES = [
   "MESSAGING_WINDOW_CLOSED",
   "CONSECUTIVE_SEND_CAP",
   "CHANNEL_INITIATION_UNSUPPORTED",
+  "CHANNEL_ACCOUNT_DISCONNECTED",
   "CONVERSATION_ADDRESS_MISSING",
   "CONFIGURATION",
   "INTERNAL",
@@ -68,6 +69,23 @@ export class ChannelInitiationError extends AppError {
       { status: 400, details: { channel, surface } },
     );
     this.name = "ChannelInitiationError";
+  }
+}
+
+/**
+ * A send was attempted through a channel account that is not connected
+ * (soft-disconnected from the Channels page, or purged). The account row
+ * and its history survive a soft disconnect, but nothing may be sent
+ * through it until it is reconnected.
+ */
+export class ChannelAccountDisconnectedError extends AppError {
+  constructor(channel: string) {
+    super(
+      "CHANNEL_ACCOUNT_DISCONNECTED",
+      `Cannot send on ${channel}: this channel account is disconnected. Reconnect it from the Channels page to send again.`,
+      { status: 409, details: { channel } },
+    );
+    this.name = "ChannelAccountDisconnectedError";
   }
 }
 
