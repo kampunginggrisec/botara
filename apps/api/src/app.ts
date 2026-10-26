@@ -7,7 +7,7 @@ import IORedis from "ioredis";
 import {
   AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
   buildVariableContext, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
-  MessagingWindowClosedError,
+  MessagingWindowClosedError, parseApiTokenScopes,
 } from "@botara/shared";
 import {
   getDb, getWorkspaceById, listContacts, getContact, createContact, updateContact, segmentCounts,
@@ -66,8 +66,9 @@ import {
   ADMIN_ROLES, API_TOKEN_PREFIX, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
   DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
   verifySessionToken,
-  type AuthContext, type AuthStore, type AuthUser,
+  type ApiTokenGrant, type AuthContext, type AuthStore, type AuthUser,
 } from "./auth";
+import { WORKSPACE_ROUTE_PREFIXES, assertApiTokenRouteAccess } from "./route-scopes";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
   createAIProviderFromEnv, moderateText, rankChunks,
@@ -707,7 +708,7 @@ export function normalizeEmbeddedConfigId(
 
 // ------------------------------------------------------------------- types
 
-export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
+export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string; apiToken?: ApiTokenGrant } };
 type Ctx = Context<AppEnv>;
 
 
@@ -1099,12 +1100,26 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     // resolves through the token store (SHA-256 hash lookup, revocation
     // honored) and authenticates as its user - workspace membership checks
     // then apply identically to the JWT path. No SESSION_SECRET involved.
+    //
+    // Scoped tokens (#5): resolution also yields the token's GRANT.
+    // Expiry is enforced here (401 TOKEN_EXPIRED - distinct from an
+    // unknown/revoked token), and a RESTRICTED grant (workspace binding
+    // and/or scope list) is checked against the route's required scope
+    // right here, so every caller of authenticateRequest - workspace
+    // middleware, auth routes, admin routes - enforces it identically.
+    // Legacy grants pass through untouched. Session JWTs never reach
+    // this branch and are never scope-limited.
     if (token.startsWith(API_TOKEN_PREFIX)) {
-      const user = await deps.authStore.findUserByApiToken(token);
-      if (!user) {
+      const resolution = await deps.authStore.resolveApiToken(token);
+      if (resolution.status === "invalid") {
         throw new AppError("UNAUTHORIZED", "API token is invalid or revoked.", { status: 401 });
       }
-      return user;
+      if (resolution.status === "expired") {
+        throw new AppError("TOKEN_EXPIRED", "API token has expired.", { status: 401 });
+      }
+      c.set("apiToken", resolution.grant);
+      assertApiTokenRouteAccess(resolution.grant, c.req.method, c.req.path);
+      return resolution.user;
     }
     const claims = verifySessionToken(token, sessionSecret());
     if (!claims) {
@@ -1148,7 +1163,34 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       );
     }
     const user = await authenticateRequest(c);
-    const base: AuthContext = { user: { id: user.id, email: user.email, name: user.name } };
+    const grant = c.get("apiToken");
+    const base: AuthContext = {
+      user: { id: user.id, email: user.email, name: user.name },
+      ...(grant ? { apiToken: grant } : {}),
+    };
+    // Workspace-bound API token (#5): the token's workspace IS the
+    // effective workspace. A disagreeing selector (header or, for GET,
+    // ?workspace_id=) is a 403 - never a silent override - and the
+    // owner's membership is re-verified on every request, so removing
+    // the owner from the workspace kills the token with it.
+    if (grant?.workspaceId) {
+      if (selectedWorkspace && selectedWorkspace !== grant.workspaceId) {
+        throw new AppError(
+          "FORBIDDEN",
+          "This API token is bound to a different workspace.",
+          { status: 403, details: { boundWorkspaceId: grant.workspaceId } },
+        );
+      }
+      const membership = await deps.authStore.getMembership(grant.workspaceId, user.id);
+      if (!membership) {
+        throw new AppError(
+          "FORBIDDEN",
+          "The API token's owner is no longer a member of the workspace this token is bound to.",
+          { status: 403 },
+        );
+      }
+      return { ...base, workspaceId: grant.workspaceId, role: membership.role };
+    }
     if (!selectedWorkspace) return base;
     const membership = await deps.authStore.getMembership(selectedWorkspace, user.id);
     if (!membership) {
@@ -1165,6 +1207,16 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   ): Promise<AuthContext> {
     const auth = authContext(c);
     if (auth.viaHeaderFallback) return { ...auth, workspaceId: workspaceIdParam, role: "owner" };
+    // Workspace-bound API token (#5): path-selected workspaces obey the
+    // binding too - membership of the OWNER in another workspace must
+    // not let a bound token act there.
+    if (auth.apiToken?.workspaceId && auth.apiToken.workspaceId !== workspaceIdParam) {
+      throw new AppError(
+        "FORBIDDEN",
+        "This API token is bound to a different workspace.",
+        { status: 403, details: { boundWorkspaceId: auth.apiToken.workspaceId } },
+      );
+    }
     const membership = await deps.authStore.getMembership(workspaceIdParam, auth.user.id);
     if (!membership || !roles.includes(membership.role)) {
       throw new AppError(
@@ -1365,6 +1417,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   // does (see authenticateRequest), with identical workspace membership
   // checks - a token is exactly as powerful as its user, so Settings is
   // where they are created and revoked.
+  //
+  // Scoped tokens (#5): creation optionally binds the token to one
+  // workspace (workspaceId), restricts it to a scope list (scopes, the
+  // taxonomy in @botara/shared - docs/api-tokens.md), and/or gives it an
+  // expiry (expiresAt). Omitting all three mints a legacy token whose
+  // behavior is unchanged. Restricted tokens cannot call these routes
+  // at all (enforced in authenticateRequest) - token management always
+  // requires a session or a legacy token.
 
   const createApiTokenRoute = createRoute({
     method: "post", path: "/auth/tokens",
@@ -1372,7 +1432,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       body: {
         content: {
           "application/json": {
-            schema: z.object({ name: z.string().min(1).max(120) }),
+            schema: z.object({
+              name: z.string().min(1).max(120),
+              workspaceId: z.string().uuid().optional(),
+              scopes: z.array(z.string().min(1).max(40)).max(64).optional(),
+              expiresAt: z.string().datetime().optional(),
+            }),
           },
         },
       },
@@ -1381,8 +1446,42 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
   app.openapi(createApiTokenRoute, async (c) => {
     const user = await authenticateRequest(c);
-    const { raw, token } = await deps.authStore.createApiToken(user.id, c.req.valid("json").name.trim());
-    await deps.authStore.audit({ userId: user.id, action: "auth.token.create", details: { tokenId: token.id, name: token.name } });
+    const body = c.req.valid("json");
+    let scopes: string[] | null = null;
+    if (body.scopes !== undefined) {
+      const parsed = parseApiTokenScopes(body.scopes);
+      if (!parsed) {
+        throw new AppError(
+          "VALIDATION",
+          "scopes must be valid API token scopes (docs/api-tokens.md).",
+          { status: 400, details: { scopes: body.scopes } },
+        );
+      }
+      scopes = parsed;
+    }
+    let expiresAt: Date | null = null;
+    if (body.expiresAt !== undefined) {
+      expiresAt = new Date(body.expiresAt);
+      if (Number.isNaN(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+        throw new AppError("VALIDATION", "expiresAt must be a future ISO 8601 timestamp.", { status: 400 });
+      }
+    }
+    if (body.workspaceId !== undefined) {
+      const membership = await deps.authStore.getMembership(body.workspaceId, user.id);
+      if (!membership) {
+        throw new AppError("FORBIDDEN", "You are not a member of the selected workspace.", { status: 403 });
+      }
+    }
+    const { raw, token } = await deps.authStore.createApiToken(user.id, body.name.trim(), {
+      workspaceId: body.workspaceId ?? null,
+      scopes,
+      expiresAt,
+    });
+    await deps.authStore.audit({
+      userId: user.id,
+      action: "auth.token.create",
+      details: { tokenId: token.id, name: token.name, workspaceId: token.workspaceId, scopes: token.scopes },
+    });
     return c.json({ token: raw, tokenInfo: token }, 201);
   });
 
@@ -2035,7 +2134,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products", "/moderation", "/saved-replies"]) {
+  for (const prefix of WORKSPACE_ROUTE_PREFIXES) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
