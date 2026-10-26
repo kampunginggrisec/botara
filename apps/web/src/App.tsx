@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
+  type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
+  type AdminUserItem, type AdminWorkspaceItem,
   type ApiTokenInfo, type AuthUser, type BroadcastEstimate, type CatalogProduct, type CatalogSummary,
   type ChannelAccount, type Contact,
   type ContactImportResult, type Conversation, type Flow, type GrowthLink, type KbDocument,
@@ -16,7 +18,7 @@ import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 
-type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings";
+type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
 const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "dashboard", labelKey: "nav.dashboard" },
@@ -30,6 +32,7 @@ const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["
   { id: "knowledge", labelKey: "nav.knowledge" },
   { id: "growth", labelKey: "nav.growth" },
   { id: "settings", labelKey: "nav.settings" },
+  { id: "admin", labelKey: "nav.admin" },
 ];
 
 // Shared dark-aware primitives (Fase 4 theme pass).
@@ -2234,6 +2237,566 @@ function GrowthPage() {
   );
 }
 
+// ---------------------------------------------------------- Platform admin
+// Operator panel (deployment-scoped, NOT workspace-scoped). Rendered
+// only for users with isPlatformAdmin; every /admin route also enforces
+// the flag server-side (401/403 otherwise).
+
+type AdminTab = "overview" | "users" | "workspaces" | "billing" | "settings" | "audit";
+
+const ADMIN_TABS: Array<{ id: AdminTab; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
+  { id: "overview", labelKey: "admin.tab.overview" },
+  { id: "users", labelKey: "admin.tab.users" },
+  { id: "workspaces", labelKey: "admin.tab.workspaces" },
+  { id: "billing", labelKey: "admin.tab.billing" },
+  { id: "settings", labelKey: "admin.tab.settings" },
+  { id: "audit", labelKey: "admin.tab.audit" },
+];
+
+/** Managed-setting groups, in panel display order (mirrors the API registry). */
+const ADMIN_SETTING_GROUPS = ["meta", "threads", "instagram", "tiktok", "telegram", "storage", "email", "ai"] as const;
+type AdminSettingGroup = (typeof ADMIN_SETTING_GROUPS)[number];
+
+const adminGroupLabelKey = (group: string): "admin.group.meta" | "admin.group.threads" | "admin.group.instagram" | "admin.group.tiktok" | "admin.group.telegram" | "admin.group.storage" | "admin.group.email" | "admin.group.ai" => {
+  switch (group) {
+    case "threads": return "admin.group.threads";
+    case "instagram": return "admin.group.instagram";
+    case "tiktok": return "admin.group.tiktok";
+    case "telegram": return "admin.group.telegram";
+    case "storage": return "admin.group.storage";
+    case "email": return "admin.group.email";
+    case "ai": return "admin.group.ai";
+    default: return "admin.group.meta";
+  }
+};
+
+const fmtDateTime = (iso: string): string => new Date(iso).toLocaleString();
+
+function AdminPage() {
+  const { t } = useI18n();
+  const [tab, setTab] = useState<AdminTab>("overview");
+  return (
+    <div>
+      <PageTitle title={t("admin.title")} subtitle={t("admin.subtitle")} />
+      <div className="mt-6 flex flex-wrap gap-2">
+        {ADMIN_TABS.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => setTab(item.id)}
+            className={tab === item.id ? primaryBtn : outlineBtn}
+          >
+            {t(item.labelKey)}
+          </button>
+        ))}
+      </div>
+      <div className="mt-6">
+        {tab === "overview" && <AdminOverviewView />}
+        {tab === "users" && <AdminUsersView />}
+        {tab === "workspaces" && <AdminWorkspacesView />}
+        {tab === "billing" && <AdminBillingView />}
+        {tab === "settings" && <AdminSettingsView />}
+        {tab === "audit" && <AdminAuditView />}
+      </div>
+    </div>
+  );
+}
+
+function AdminOverviewView() {
+  const { t } = useI18n();
+  const [overview, setOverview] = useState<AdminOverview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.adminOverview()
+      .then((data) => { setOverview(data); setError(null); })
+      .catch((err) => setError(errText(err, t("admin.overviewLoadFailed"))));
+  }, [t]);
+
+  const cards: Array<{ label: string; value: number }> = overview ? [
+    { label: t("admin.totalUsers"), value: overview.totals.users },
+    { label: t("admin.activeUsers7d"), value: overview.activeUsers.last7d },
+    { label: t("admin.activeUsers30d"), value: overview.activeUsers.last30d },
+    { label: t("admin.totalWorkspaces"), value: overview.totals.workspaces },
+    { label: t("admin.channelAccounts"), value: overview.totals.channelAccounts },
+    { label: t("admin.messages"), value: overview.totals.messages },
+    { label: t("admin.messages30d"), value: overview.totals.messagesLast30d },
+  ] : [];
+
+  return (
+    <div>
+      {error && <div className="max-w-xl"><ErrorBox error={error} /></div>}
+      {!overview && !error && <p className={mutedCls}>{t("app.loading")}</p>}
+      {overview && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-3 gap-4 max-w-4xl">
+            {cards.map((card) => (
+              <div key={card.label} className={`${cardCls} p-4`}>
+                <div className="text-2xl font-bold">{card.value}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{card.label}</div>
+              </div>
+            ))}
+          </div>
+          <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+            <div className="font-medium text-sm">{t("admin.byChannel")}</div>
+            {overview.channelAccountsByChannel.length === 0 ? (
+              <p className={`mt-1 ${mutedCls}`}>{t("admin.byChannelEmpty")}</p>
+            ) : (
+              <ul className="mt-2 space-y-1 text-sm">
+                {overview.channelAccountsByChannel.map((row) => (
+                  <li key={row.channel} className="flex justify-between max-w-xs">
+                    <span className="text-slate-500 dark:text-slate-400">{row.channel}</span>
+                    <span className="font-medium">{row.count}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+          <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+            <div className="font-medium text-sm">{t("admin.recentRegistrations")}</div>
+            {overview.recentRegistrations.length === 0 ? (
+              <p className={`mt-2 ${mutedCls}`}>{t("admin.recentEmpty")}</p>
+            ) : (
+              <ul className="mt-2 divide-y divide-slate-100 dark:divide-slate-800">
+                {overview.recentRegistrations.map((reg) => (
+                  <li key={reg.id} className="flex items-center justify-between py-2 text-sm">
+                    <span>{reg.email}{reg.name ? ` · ${reg.name}` : ""}</span>
+                    <span className="text-xs text-slate-400">{fmtDateTime(reg.createdAt)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function AdminUsersView() {
+  const { t } = useI18n();
+  const [users, setUsers] = useState<AdminUserItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busyId, setBusyId] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api.adminUsers();
+      setUsers(data.users);
+      setError(null);
+    } catch (err) {
+      setError(errText(err, t("admin.users.loadFailed")));
+    }
+  }, [t]);
+  useEffect(() => { void load(); }, [load]);
+
+  const toggleAdmin = async (target: AdminUserItem) => {
+    const grant = !target.isPlatformAdmin;
+    if (!window.confirm(grant ? t("admin.grantConfirm") : t("admin.revokeConfirm"))) return;
+    setBusyId(target.id);
+    setError(null);
+    try {
+      await api.adminSetPlatformAdmin(target.id, grant);
+      await load();
+    } catch (err) {
+      // errText surfaces the server message (e.g. the 409 last-admin guard).
+      setError(errText(err, t("admin.users.actionFailed")));
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  return (
+    <div>
+      {error && <div className="max-w-2xl"><ErrorBox error={error} /></div>}
+      {!users && !error && <p className={mutedCls}>{t("app.loading")}</p>}
+      {users && (
+        <div className={`${cardCls} overflow-hidden max-w-5xl`}>
+          {users.length === 0 ? (
+            <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("admin.users.empty")}</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                <tr>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.email")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.name")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.workspaces")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.created")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.lastLogin")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.users.platformAdmin")}</th>
+                  <th className="px-4 py-2 font-medium">{t("common.actions")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr key={u.id} className="border-t border-slate-100 dark:border-slate-800 align-top">
+                    <td className="px-4 py-2">{u.email}</td>
+                    <td className="px-4 py-2">{u.name ?? "-"}</td>
+                    <td className="px-4 py-2">
+                      <span className="flex gap-1 flex-wrap">
+                        {u.workspaces.map((w) => (
+                          <span key={w.id} className={chipCls}>{w.name} ({w.role})</span>
+                        ))}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 whitespace-nowrap">{fmtDateTime(u.createdAt)}</td>
+                    <td className="px-4 py-2 whitespace-nowrap">{u.lastLoginAt ? fmtDateTime(u.lastLoginAt) : t("admin.users.neverLoggedIn")}</td>
+                    <td className="px-4 py-2">
+                      {u.isPlatformAdmin && <span className={chipCls}>{t("admin.platformAdminBadge")}</span>}
+                    </td>
+                    <td className="px-4 py-2 whitespace-nowrap">
+                      <button
+                        onClick={() => void toggleAdmin(u)}
+                        disabled={busyId === u.id}
+                        className={`text-xs underline disabled:opacity-50 ${u.isPlatformAdmin ? "text-red-600 dark:text-red-400" : "text-slate-900 dark:text-slate-100"}`}
+                      >
+                        {u.isPlatformAdmin ? t("admin.revoke") : t("admin.grant")}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AdminWorkspacesView() {
+  const { t } = useI18n();
+  const [workspaces, setWorkspaces] = useState<AdminWorkspaceItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.adminWorkspaces()
+      .then((data) => { setWorkspaces(data.workspaces); setError(null); })
+      .catch((err) => setError(errText(err, t("admin.workspaces.loadFailed"))));
+  }, [t]);
+
+  return (
+    <div>
+      {error && <div className="max-w-2xl"><ErrorBox error={error} /></div>}
+      {!workspaces && !error && <p className={mutedCls}>{t("app.loading")}</p>}
+      {workspaces && (
+        <div className={`${cardCls} overflow-hidden max-w-5xl`}>
+          {workspaces.length === 0 ? (
+            <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("admin.workspaces.empty")}</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                <tr>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.name")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.owner")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.members")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.channelAccounts")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.messages")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.workspaces.created")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {workspaces.map((w) => (
+                  <tr key={w.id} className="border-t border-slate-100 dark:border-slate-800">
+                    <td className="px-4 py-2">{w.name} <span className="text-xs text-slate-400">({w.slug})</span></td>
+                    <td className="px-4 py-2">{w.ownerEmail ?? "-"}</td>
+                    <td className="px-4 py-2">{w.memberCount}</td>
+                    <td className="px-4 py-2">{w.channelAccountCount}</td>
+                    <td className="px-4 py-2">{w.messageCount}</td>
+                    <td className="px-4 py-2 whitespace-nowrap">{fmtDateTime(w.createdAt)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const ADMIN_BILLING_PERIODS: Array<{ days: number; labelKey: "admin.billing.days7" | "admin.billing.days30" | "admin.billing.days90" }> = [
+  { days: 7, labelKey: "admin.billing.days7" },
+  { days: 30, labelKey: "admin.billing.days30" },
+  { days: 90, labelKey: "admin.billing.days90" },
+];
+
+function AdminBillingView() {
+  const { t } = useI18n();
+  const [days, setDays] = useState(30);
+  const [billing, setBilling] = useState<AdminBilling | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setBilling(null);
+    api.adminBilling(days)
+      .then((data) => { if (!cancelled) { setBilling(data); setError(null); } })
+      .catch((err) => { if (!cancelled) setError(errText(err, t("admin.billing.loadFailed"))); });
+    return () => { cancelled = true; };
+  }, [t, days]);
+
+  return (
+    <div>
+      <div className="flex flex-wrap gap-2">
+        {ADMIN_BILLING_PERIODS.map((period) => (
+          <button
+            key={period.days}
+            onClick={() => setDays(period.days)}
+            className={days === period.days ? primaryBtn : outlineBtn}
+          >
+            {t(period.labelKey)}
+          </button>
+        ))}
+      </div>
+      {error && <div className="mt-4 max-w-2xl"><ErrorBox error={error} /></div>}
+      {!billing && !error && <p className={`mt-4 ${mutedCls}`}>{t("app.loading")}</p>}
+      {billing && (
+        <>
+          <div className={`mt-4 max-w-5xl ${cardCls} overflow-hidden`}>
+            {billing.workspaces.length === 0 ? (
+              <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("admin.billing.empty")}</div>
+            ) : (
+              <table className="w-full text-sm">
+                <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                  <tr>
+                    <th className="px-4 py-2 font-medium">{t("admin.billing.workspace")}</th>
+                    <th className="px-4 py-2 font-medium">{t("admin.billing.category")}</th>
+                    <th className="px-4 py-2 font-medium">{t("admin.billing.units")}</th>
+                    <th className="px-4 py-2 font-medium">{t("admin.billing.entries")}</th>
+                    <th className="px-4 py-2 font-medium">{t("admin.billing.cost")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {billing.workspaces.map((ws) => (
+                    <Fragment key={`${ws.workspaceId}-${ws.currency}`}>
+                      <tr className="border-t border-slate-100 dark:border-slate-800 font-medium">
+                        <td className="px-4 py-2">{ws.workspaceName} <span className={chipCls}>{ws.currency}</span></td>
+                        <td className="px-4 py-2">{t("admin.billing.total")}</td>
+                        <td className="px-4 py-2">{ws.units}</td>
+                        <td className="px-4 py-2">{ws.entries}</td>
+                        <td className="px-4 py-2">{ws.amount.toFixed(4)}</td>
+                      </tr>
+                      {ws.byCategory.map((cat) => (
+                        <tr key={`${ws.workspaceId}-${ws.currency}-${cat.category}`} className="text-slate-500 dark:text-slate-400">
+                          <td className="px-4 py-1.5" />
+                          <td className="px-4 py-1.5">{cat.category}</td>
+                          <td className="px-4 py-1.5">{cat.units}</td>
+                          <td className="px-4 py-1.5">{cat.entries}</td>
+                          <td className="px-4 py-1.5">{cat.amount.toFixed(4)}</td>
+                        </tr>
+                      ))}
+                    </Fragment>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+          {billing.totals.length > 0 && (
+            <div className={`mt-4 max-w-5xl ${cardCls} p-4`}>
+              <div className="font-medium text-sm">{t("admin.billing.totals")}</div>
+              <ul className="mt-2 space-y-1 text-sm">
+                {billing.totals.map((row) => (
+                  <li key={row.currency} className="flex justify-between max-w-md">
+                    <span className="text-slate-500 dark:text-slate-400">{row.currency} · {row.units} · {row.entries}</span>
+                    <span className="font-medium">{row.amount.toFixed(4)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function AdminSettingsView() {
+  const { t } = useI18n();
+  const [settings, setSettings] = useState<AdminSettingView[] | null>(null);
+  // Draft inputs keyed by setting key. Inputs ALWAYS start empty: an
+  // empty input means "keep the current value" and is never sent.
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [savingGroup, setSavingGroup] = useState<string | null>(null);
+  const [clearingKey, setClearingKey] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api.adminSettings();
+      setSettings(data.settings);
+      setError(null);
+    } catch (err) {
+      setError(errText(err, t("admin.settings.loadFailed")));
+    }
+  }, [t]);
+  useEffect(() => { void load(); }, [load]);
+
+  const sourceLabel = (setting: AdminSettingView): string =>
+    setting.source === "db"
+      ? t("admin.settings.sourcePanel")
+      : setting.source === "env"
+        ? t("admin.settings.sourceEnv")
+        : t("admin.settings.sourceNotSet");
+
+  const saveGroup = async (group: AdminSettingGroup) => {
+    if (!settings) return;
+    const updates: AdminSettingUpdate[] = settings
+      .filter((s) => s.group === group)
+      .filter((s) => (drafts[s.key] ?? "").trim() !== "")
+      .map((s) => ({ key: s.key, value: drafts[s.key] ?? "" }));
+    if (updates.length === 0) return;
+    setSavingGroup(group);
+    setError(null);
+    setNotice(null);
+    try {
+      const res = await api.adminUpdateSettings(updates);
+      setSettings(res.settings);
+      setDrafts((prev) => {
+        const next = { ...prev };
+        for (const u of updates) delete next[u.key];
+        return next;
+      });
+      setNotice(t("admin.settings.saved"));
+    } catch (err) {
+      setError(errText(err, t("admin.settings.saveFailed")));
+    } finally {
+      setSavingGroup(null);
+    }
+  };
+
+  const clearSetting = async (setting: AdminSettingView) => {
+    if (!window.confirm(t("admin.settings.clearConfirm"))) return;
+    setClearingKey(setting.key);
+    setError(null);
+    setNotice(null);
+    try {
+      const updates: AdminSettingUpdate[] = [{ key: setting.key, clear: true }];
+      const res = await api.adminUpdateSettings(updates);
+      setSettings(res.settings);
+      setDrafts((prev) => {
+        const next = { ...prev };
+        delete next[setting.key];
+        return next;
+      });
+      setNotice(t("admin.settings.saved"));
+    } catch (err) {
+      setError(errText(err, t("admin.settings.saveFailed")));
+    } finally {
+      setClearingKey(null);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl">
+      <p className={mutedCls}>{t("admin.settings.propagationNote")}</p>
+      {error && <div className="mt-4"><ErrorBox error={error} /></div>}
+      {notice && <div className="mt-4"><NoticeBox>{notice}</NoticeBox></div>}
+      {!settings && !error && <p className={`mt-4 ${mutedCls}`}>{t("app.loading")}</p>}
+      {settings && ADMIN_SETTING_GROUPS.map((group) => {
+        const groupSettings = settings.filter((s) => s.group === group);
+        if (groupSettings.length === 0) return null;
+        const hasDrafts = groupSettings.some((s) => (drafts[s.key] ?? "").trim() !== "");
+        return (
+          <div key={group} className={`mt-4 ${cardCls} p-4 space-y-4`}>
+            <div className="font-medium text-sm">{t(adminGroupLabelKey(group))}</div>
+            {groupSettings.map((setting) => (
+              <div key={setting.key}>
+                <div className="flex items-center justify-between gap-2">
+                  <label className={labelCls} htmlFor={`admin-setting-${setting.key}`}>
+                    {setting.label} <span className="font-mono normal-case">({setting.key})</span>
+                  </label>
+                  <span className={chipCls}>{sourceLabel(setting)}</span>
+                </div>
+                {setting.hint && <p className="mb-1 text-xs text-slate-500 dark:text-slate-400">{setting.hint}</p>}
+                <div className="flex gap-2">
+                  <input
+                    id={`admin-setting-${setting.key}`}
+                    type={setting.secret ? "password" : "text"}
+                    autoComplete="off"
+                    value={drafts[setting.key] ?? ""}
+                    onChange={(e) => setDrafts((prev) => ({ ...prev, [setting.key]: e.target.value }))}
+                    placeholder={setting.isSet ? t("admin.settings.placeholderSet") : t("admin.settings.placeholderNotSet")}
+                    className={inputCls}
+                  />
+                  {setting.source === "db" && (
+                    <button
+                      onClick={() => void clearSetting(setting)}
+                      disabled={clearingKey === setting.key}
+                      className={`${outlineBtn} whitespace-nowrap`}
+                    >
+                      {t("admin.settings.clear")}
+                    </button>
+                  )}
+                </div>
+                {setting.updatedAt && (
+                  <p className="mt-1 text-[11px] text-slate-400 dark:text-slate-500">
+                    {t("common.updated")}: {fmtDateTime(setting.updatedAt)}
+                  </p>
+                )}
+              </div>
+            ))}
+            <button
+              onClick={() => void saveGroup(group)}
+              disabled={savingGroup === group || !hasDrafts}
+              className={primaryBtn}
+            >
+              {savingGroup === group ? t("common.saving") : t("common.save")}
+            </button>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function AdminAuditView() {
+  const { t } = useI18n();
+  const [entries, setEntries] = useState<AdminAuditItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    api.adminAudit(50)
+      .then((data) => { setEntries(data.entries); setError(null); })
+      .catch((err) => setError(errText(err, t("admin.audit.loadFailed"))));
+  }, [t]);
+
+  return (
+    <div>
+      {error && <div className="max-w-2xl"><ErrorBox error={error} /></div>}
+      {!entries && !error && <p className={mutedCls}>{t("app.loading")}</p>}
+      {entries && (
+        <div className={`${cardCls} overflow-hidden max-w-5xl`}>
+          {entries.length === 0 ? (
+            <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("admin.audit.empty")}</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                <tr>
+                  <th className="px-4 py-2 font-medium">{t("admin.audit.time")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.audit.actor")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.audit.action")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.audit.details")}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {entries.map((entry) => (
+                  <tr key={entry.id} className="border-t border-slate-100 dark:border-slate-800 align-top">
+                    <td className="px-4 py-2 whitespace-nowrap">{fmtDateTime(entry.createdAt)}</td>
+                    <td className="px-4 py-2">{entry.actorEmail ?? entry.userId ?? "-"}</td>
+                    <td className="px-4 py-2 whitespace-nowrap">{entry.action}</td>
+                    <td className="px-4 py-2"><code className="text-xs break-all">{JSON.stringify(entry.details)}</code></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SettingsPage({ user, workspace, refreshSession }: {
   user: AuthUser;
   workspace: WorkspaceSummary | undefined;
@@ -2843,7 +3406,7 @@ function AuthedApp() {
           <div className="text-xs text-slate-400 mt-1">{t("app.tagline")}</div>
         </div>
         <nav className="flex-1 px-3 py-4 space-y-1">
-          {NAV.map((item) => (
+          {NAV.filter((item) => item.id !== "admin" || user.isPlatformAdmin).map((item) => (
             <a
               key={item.id}
               href="#"
@@ -2905,6 +3468,7 @@ function AuthedApp() {
             refreshSession={() => { void loadSession(); }}
           />
         )}
+        {page === "admin" && user.isPlatformAdmin && <AdminPage />}
       </main>
     </div>
   );

@@ -148,6 +148,8 @@ export interface AuthUser {
   id: string;
   email: string;
   name: string | null;
+  /** Platform operator flag (admin panel) - NOT a workspace role. */
+  isPlatformAdmin: boolean;
 }
 
 export interface WorkspaceSummary {
@@ -453,6 +455,93 @@ export interface Sequence {
   createdAt: string;
 }
 
+// ------------------------------------------------------- platform admin
+// Deployment-scoped operator views (see apps/api/src/admin.ts). Every
+// route requires a platform-admin session; values for settings are
+// NEVER returned - only set/source metadata.
+
+export interface AdminOverview {
+  totals: {
+    users: number;
+    workspaces: number;
+    channelAccounts: number;
+    messages: number;
+    messagesLast30d: number;
+  };
+  channelAccountsByChannel: Array<{ channel: string; count: number }>;
+  activeUsers: { last7d: number; last30d: number };
+  recentRegistrations: Array<{ id: string; email: string; name: string | null; createdAt: string }>;
+}
+
+export interface AdminUserItem {
+  id: string;
+  email: string;
+  name: string | null;
+  createdAt: string;
+  lastLoginAt: string | null;
+  isPlatformAdmin: boolean;
+  workspaces: Array<{ id: string; name: string; role: string }>;
+}
+
+export interface AdminWorkspaceItem {
+  id: string;
+  name: string;
+  slug: string;
+  ownerEmail: string | null;
+  memberCount: number;
+  channelAccountCount: number;
+  messageCount: number;
+  createdAt: string;
+}
+
+export interface AdminBillingCategory {
+  category: string;
+  units: number;
+  entries: number;
+  amount: number;
+}
+
+export interface AdminBillingWorkspace {
+  workspaceId: string;
+  workspaceName: string;
+  currency: string;
+  units: number;
+  entries: number;
+  amount: number;
+  byCategory: AdminBillingCategory[];
+}
+
+export interface AdminBilling {
+  days: number;
+  workspaces: AdminBillingWorkspace[];
+  totals: Array<{ currency: string; units: number; entries: number; amount: number }>;
+}
+
+export interface AdminSettingView {
+  key: string;
+  secret: boolean;
+  group: string;
+  label: string;
+  hint?: string;
+  isSet: boolean;
+  source: "db" | "env" | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+/** One settings update: set a value, or clear the DB value (env fallback returns). */
+export type AdminSettingUpdate = { key: string; value: string } | { key: string; clear: true };
+
+export interface AdminAuditItem {
+  id: string;
+  action: string;
+  actorEmail: string | null;
+  userId: string | null;
+  workspaceId: string | null;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface StatsOverview {
   contacts: { total: number };
   conversations: { open: number; total: number };
@@ -748,5 +837,36 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     });
+  },
+  // ------------------------------------------------ platform admin panel
+  adminOverview(): Promise<AdminOverview> {
+    return request("/admin/overview");
+  },
+  adminUsers(): Promise<{ users: AdminUserItem[] }> {
+    return request("/admin/users");
+  },
+  adminSetPlatformAdmin(id: string, grant: boolean): Promise<{ user: { id: string; isPlatformAdmin: boolean } }> {
+    return request(`/admin/users/${id}/platform-admin`, {
+      method: "POST",
+      body: JSON.stringify({ grant }),
+    });
+  },
+  adminWorkspaces(): Promise<{ workspaces: AdminWorkspaceItem[] }> {
+    return request("/admin/workspaces");
+  },
+  adminBilling(days: number): Promise<AdminBilling> {
+    return request(`/admin/billing?days=${days}`);
+  },
+  adminSettings(): Promise<{ settings: AdminSettingView[] }> {
+    return request("/admin/settings");
+  },
+  adminUpdateSettings(updates: AdminSettingUpdate[]): Promise<{ settings: AdminSettingView[] }> {
+    return request("/admin/settings", {
+      method: "PUT",
+      body: JSON.stringify({ updates }),
+    });
+  },
+  adminAudit(limit: number): Promise<{ entries: AdminAuditItem[] }> {
+    return request(`/admin/audit?limit=${limit}`);
   },
 };
