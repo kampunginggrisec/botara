@@ -1,5 +1,9 @@
 import { AppError } from "@botara/shared";
 import { CHANNEL_CAPABILITIES, type FetchLike } from "@botara/channels";
+import {
+  createChannelAccount, listChannelAccounts, updateChannelAccountAvatar, updateChannelAccountToken,
+  type Database,
+} from "@botara/db";
 
 /**
  * WhatsApp Embedded Signup v4 - server-side code exchange (Fase 2).
@@ -119,6 +123,36 @@ export interface WhatsAppOnboardingDeps {
     tokenVaultRef: string;
     status: string;
   }): Promise<{ id: string }>;
+}
+
+/**
+ * Production `persistAccount` for Embedded Signup: an UPSERT keyed by
+ * (workspace, channel, externalId). Re-running the signup for a number
+ * that already has a row - above all after a soft disconnect -
+ * reactivates THAT row (status back to "connected", fresh vault ref,
+ * refreshed avatar when Meta returned one) instead of inserting a
+ * duplicate account for the same number.
+ */
+export function createDbWhatsAppAccountPersister(
+  getDatabase: () => Database,
+): WhatsAppOnboardingDeps["persistAccount"] {
+  return async (input) => {
+    const db = getDatabase();
+    const existing = (await listChannelAccounts(db, input.workspaceId))
+      .find((a) => a.channel === input.channel && a.externalId === input.externalId);
+    if (existing) {
+      await updateChannelAccountToken(db, existing.id, {
+        tokenVaultRef: input.tokenVaultRef,
+        status: "connected",
+      });
+      if (input.avatarUrl) {
+        await updateChannelAccountAvatar(db, existing.id, input.avatarUrl);
+      }
+      return { id: existing.id };
+    }
+    const row = await createChannelAccount(db, input);
+    return { id: row.id };
+  };
 }
 
 interface GraphJson {

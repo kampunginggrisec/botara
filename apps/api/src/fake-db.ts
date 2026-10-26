@@ -1,5 +1,7 @@
 import {
-  catalogProducts, channelAccounts, contacts, conversations, messages, webchatSessions,
+  broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
+  messages, processedComments, sequenceEnrollments, sequences, templates, webchatSessions,
+  workspaceDomains,
   type Database,
 } from "@botara/db";
 
@@ -275,6 +277,14 @@ export interface FakeDatabase {
     channelAccounts: Row[];
     webchatSessions: Row[];
     catalogProducts: Row[];
+    broadcasts: Row[];
+    templates: Row[];
+    sequences: Row[];
+    sequenceEnrollments: Row[];
+    processedComments: Row[];
+    growthLinks: Row[];
+    costLedger: Row[];
+    workspaceDomains: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -287,6 +297,14 @@ export function createFakeDatabase(): FakeDatabase {
     channelAccounts: [] as Row[],
     webchatSessions: [] as Row[],
     catalogProducts: [] as Row[],
+    broadcasts: [] as Row[],
+    templates: [] as Row[],
+    sequences: [] as Row[],
+    sequenceEnrollments: [] as Row[],
+    processedComments: [] as Row[],
+    growthLinks: [] as Row[],
+    costLedger: [] as Row[],
+    workspaceDomains: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -295,12 +313,24 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(channelAccounts, store.channelAccounts);
   core.register(webchatSessions, store.webchatSessions);
   core.register(catalogProducts, store.catalogProducts);
+  core.register(broadcasts, store.broadcasts);
+  core.register(templates, store.templates);
+  core.register(sequences, store.sequences);
+  core.register(sequenceEnrollments, store.sequenceEnrollments);
+  core.register(processedComments, store.processedComments);
+  core.register(growthLinks, store.growthLinks);
+  core.register(costLedger, store.costLedger);
+  core.register(workspaceDomains, store.workspaceDomains);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),
     insert: (table: unknown) => new FakeInsert(core, table),
     update: (table: unknown) => new FakeUpdate(core, table),
     delete: (table: unknown) => new FakeDelete(core, table),
+    // No rollback semantics: the callback runs against the same store.
+    // Repository code uses transactions for atomicity on real Postgres;
+    // the fake only needs the same call shape.
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(impl),
   };
 
   return {

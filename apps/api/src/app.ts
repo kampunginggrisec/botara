@@ -5,8 +5,8 @@ import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import {
-  AppError, ChannelInitiationError, ConsecutiveSendCapError, countConsecutiveOutbound,
-  evaluateReplyWindow, MessagingWindowClosedError,
+  AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
+  countConsecutiveOutbound, evaluateReplyWindow, MessagingWindowClosedError,
 } from "@botara/shared";
 import {
   getDb, listContacts, createContact, updateContact, segmentCounts,
@@ -15,7 +15,7 @@ import {
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
-  deleteChannelAccount,
+  deleteChannelAccount, channelAccountHasReferences, purgeChannelAccount, softDisconnectChannelAccount,
   applyTemplateCategoryChange,
   findOrCreateWebchatAccount, createConversation as createConversationRow,
   createWebchatSession, getWebchatSessionByToken, touchWebchatSession,
@@ -69,7 +69,7 @@ import {
   DEFAULT_AI_MODEL, DEFAULT_EMBEDDING_MODEL, type AIProvider,
 } from "@botara/ai";
 import {
-  InMemoryVault, exchangeEmbeddedSignup,
+  InMemoryVault, createDbWhatsAppAccountPersister, exchangeEmbeddedSignup,
   type EmbeddedSignupInput, type EmbeddedSignupResult, type TokenVaultPort,
 } from "./whatsapp-onboarding";
 import { createDbWebchatStore } from "./webchat-store";
@@ -550,10 +550,7 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
           appId: process.env.META_APP_ID,
           appSecret: process.env.META_APP_SECRET,
           vault,
-          async persistAccount(persistInput) {
-            const row = await createChannelAccount(defaultGetDatabase(), persistInput);
-            return { id: row.id };
-          },
+          persistAccount: createDbWhatsAppAccountPersister(defaultGetDatabase),
         },
         workspaceId,
         input,
@@ -633,6 +630,23 @@ type Ctx = Context<AppEnv>;
 
 function errorBody(err: AppError) {
   return { error: { code: err.code, message: err.message, ...(err.details !== undefined ? { details: err.details } : {}) } };
+}
+
+/**
+ * Postgres FK-violation detection (SQLSTATE 23503), tolerant of the
+ * wrapping drizzle/postgres-js apply (the code may sit on err.cause).
+ */
+function isFkViolation(err: unknown): boolean {
+  let current: unknown = err;
+  for (let depth = 0; depth < 3 && current; depth++) {
+    const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+    if (candidate.code === "23503") return true;
+    if (typeof candidate.message === "string" && candidate.message.includes("violates foreign key constraint")) {
+      return true;
+    }
+    current = candidate.cause;
+  }
+  return false;
 }
 
 /**
@@ -2343,6 +2357,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const account = await getChannelAccount(db, ws, conversation.channelAccountId);
     if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
 
+    // A soft-disconnected account keeps its history but may not send:
+    // fail BEFORE any message row is persisted or the adapter is called.
+    if (account.status !== "connected") throw new ChannelAccountDisconnectedError(account.channel);
+
     // Window enforcement (fail closed): free-form replies outside the
     // window are rejected; template replies stay allowed. The window
     // length is per-channel (Meta 24h, TikTok 48h - see @botara/shared).
@@ -3149,50 +3167,73 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   const deleteAccountRoute = createRoute({
     method: "delete", path: "/channels/accounts/{id}",
     request: { params: z.object({ id: z.string() }) },
-    responses: { 200: { description: "Channel account disconnected (deleted)" } },
+    responses: { 200: { description: "Channel account hard-deleted, soft-disconnected, or purged" } },
   });
   app.openapi(deleteAccountRoute, async (c) => {
     guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
     const { id } = c.req.valid("param");
-    let account;
-    try {
-      account = await deleteChannelAccount(db, ws, id);
-    } catch (err) {
-      // Child tables (conversations, broadcasts, sequences, ...) reference
-      // channel_accounts without ON DELETE CASCADE, so disconnecting an
-      // account that already carries data raises Postgres 23503 (possibly
-      // wrapped by drizzle as err.cause). Surface that as a typed 409.
-      let current: unknown = err;
-      let isFkViolation = false;
-      for (let depth = 0; depth < 3 && current; depth++) {
-        const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
-        if (candidate.code === "23503") isFkViolation = true;
-        if (typeof candidate.message === "string" && candidate.message.includes("violates foreign key constraint")) {
-          isFkViolation = true;
-        }
-        current = candidate.cause;
-      }
-      if (isFkViolation) {
+    const purge = c.req.query("purge") === "true";
+    const account = await getChannelAccount(db, ws, id);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    const userId = authContext(c).user.id;
+    // Captured up front: the soft disconnect nulls the ref on the row,
+    // and the vault entry behind the OLD ref must still be deleted.
+    const previousTokenVaultRef = account.tokenVaultRef;
+
+    if (purge) {
+      // Permanent deletion is two-step on purpose: the account must
+      // already be soft-disconnected (credential revoked, history kept),
+      // so a purge can never be a one-click accident on a live account.
+      if (account.status !== "disconnected") {
         throw new AppError(
           "CONFLICT",
-          "This account still has conversations or other data attached, so it cannot be disconnected yet.",
-          { status: 409 },
+          "Only a disconnected account can be deleted permanently. Disconnect it first, then delete it permanently.",
+          { status: 409, details: { reason: "purge_requires_disconnected" } },
         );
       }
-      throw err;
+      await purgeChannelAccount(db, ws, id);
+      await deps.authStore.audit({
+        workspaceId: ws, userId,
+        action: "channel.purged",
+        details: { channel: account.channel, externalId: account.externalId },
+      }).catch(() => undefined);
+      return c.json({ mode: "purged" });
     }
-    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
-    if (account.tokenVaultRef) {
-      await deps.vault.delete(account.tokenVaultRef).catch(() => undefined);
+
+    // Disconnect ALWAYS works: an account with no attached data is
+    // hard-deleted; an account carrying history is soft-disconnected
+    // (row + data kept, credential revoked, sends blocked) and can be
+    // reconnected later or purged explicitly.
+    let mode: "deleted" | "disconnected";
+    if (await channelAccountHasReferences(db, id)) {
+      await softDisconnectChannelAccount(db, ws, id);
+      mode = "disconnected";
+    } else {
+      try {
+        await deleteChannelAccount(db, ws, id);
+        mode = "deleted";
+      } catch (err) {
+        // Race backstop: data landed between the reference probe and the
+        // delete (child FKs are NO ACTION, so this is Postgres 23503,
+        // possibly wrapped by drizzle as err.cause) - fall back to a
+        // soft disconnect instead of failing, so disconnect never
+        // dead-ends.
+        if (!isFkViolation(err)) throw err;
+        await softDisconnectChannelAccount(db, ws, id);
+        mode = "disconnected";
+      }
+    }
+    if (previousTokenVaultRef) {
+      await deps.vault.delete(previousTokenVaultRef).catch(() => undefined);
     }
     await deps.authStore.audit({
-      workspaceId: ws, userId: authContext(c).user.id,
+      workspaceId: ws, userId,
       action: "channel.disconnected",
-      details: { channel: account.channel, externalId: account.externalId },
+      details: { channel: account.channel, externalId: account.externalId, mode },
     }).catch(() => undefined);
-    return c.json({ deleted: true });
+    return c.json({ mode });
   });
 
   // Telegram account avatar, proxied: Telegram file URLs embed the bot
