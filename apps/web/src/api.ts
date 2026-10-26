@@ -243,6 +243,15 @@ export interface Message {
    * for an inbound webchat button click. Null for plain messages.
    */
   payload?: RichBlock | { buttonPayload: string } | null;
+  /**
+   * Stored media backing this message (inbound media pipeline): public
+   * URLs to render, parallel to mediaKeys (storage object keys - the
+   * filename shown on file chips comes from the key's last segment).
+   * Empty when the message has no media or its media could not be
+   * fetched at ingest (caption-only persistence).
+   */
+  mediaUrls?: string[];
+  mediaKeys?: string[];
   status: string;
   createdAt: string;
 }

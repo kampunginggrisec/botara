@@ -138,6 +138,47 @@ function RichPayloadChips({ payload }: { payload: Message["payload"] }) {
   return null;
 }
 
+const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|avif)(\?|#|$)/i;
+
+/**
+ * Stored media under a thread bubble (inbound media pipeline): the
+ * bytes were copied into Botara storage at ingest; mediaUrls are the
+ * public URLs to render and mediaKeys carry the filename (last path
+ * segment). Images render inline and click through to the full file;
+ * everything else is a file chip. A stored item whose URL list is
+ * empty (storage has no public base configured) shows as an unlinked
+ * chip - the file exists, it is just not publicly addressable.
+ */
+function MessageMediaList({ message }: { message: Message }) {
+  const keys = message.mediaKeys ?? [];
+  const urls = message.mediaUrls ?? [];
+  if (keys.length === 0 && urls.length === 0) return null;
+  const names = keys.length > 0 ? keys : urls;
+  return (
+    <div className="flex flex-col gap-1">
+      {names.map((name, i) => {
+        const url = urls[i];
+        const filename = name.split("/").pop() ?? name;
+        if (url && IMAGE_FILE_RE.test(filename)) {
+          return (
+            <a key={i} href={url} target="_blank" rel="noreferrer">
+              <img src={url} alt={filename} className="max-h-48 rounded-lg border border-slate-200 dark:border-slate-700" />
+            </a>
+          );
+        }
+        const chipCls = "inline-flex max-w-full items-center gap-1 self-start rounded-full border border-slate-300 px-2.5 py-0.5 text-xs text-slate-500 dark:border-slate-600 dark:text-slate-400";
+        return url ? (
+          <a key={i} href={url} target="_blank" rel="noreferrer" className={`${chipCls} underline`}>
+            <span className="truncate">{filename}</span>
+          </a>
+        ) : (
+          <span key={i} className={chipCls}><span className="truncate">{filename}</span></span>
+        );
+      })}
+    </div>
+  );
+}
+
 function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const { t } = useI18n();
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -458,6 +499,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                         <div>{m.body ?? <em>({m.type})</em>}</div>
                         <div className={`mt-1 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>{m.status}</div>
                       </div>
+                      <MessageMediaList message={m} />
                       {m.direction === "out" && <RichPayloadChips payload={m.payload} />}
                     </div>
                   </div>
