@@ -2643,6 +2643,122 @@ function ChannelAccountAvatar({ account }: { account: ChannelAccount }) {
   );
 }
 
+/**
+ * Email sending-domain manager (F2) for the Channels connect modal:
+ * lists the workspace's registered domains with their status and adds /
+ * removes them via /channels/email/domains. Mounted only while the
+ * connect modal is open, so it loads on open.
+ */
+function EmailDomainsCard({ className }: { className: string }) {
+  const { t } = useI18n();
+  const [domains, setDomains] = useState<WorkspaceDomain[]>([]);
+  const [emailAccounts, setEmailAccounts] = useState<ChannelAccount[]>([]);
+  const [domain, setDomain] = useState("");
+  const [accountId, setAccountId] = useState("");
+  const [resendId, setResendId] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await api.listEmailDomains();
+      setDomains(data.domains);
+    } catch (err) {
+      pushToast("err", errText(err, t("channels.email.loadFailed")));
+    }
+  }, [t]);
+
+  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    api.listChannelAccounts()
+      .then((data) => setEmailAccounts(data.accounts.filter((a) => a.channel === "email")))
+      .catch(() => { /* the account link is optional */ });
+  }, []);
+
+  const add = async () => {
+    setBusy(true);
+    try {
+      const res = await api.addEmailDomain({
+        domain: domain.trim(),
+        ...(accountId ? { channelAccountId: accountId } : {}),
+        ...(resendId.trim() ? { resendDomainId: resendId.trim() } : {}),
+      });
+      pushToast("ok", t("channels.email.added", { domain: res.domain.domain }));
+      setDomain("");
+      setResendId("");
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("channels.email.addFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (d: WorkspaceDomain) => {
+    setBusy(true);
+    try {
+      await api.deleteEmailDomain(d.id);
+      pushToast("ok", t("channels.email.deleted", { domain: d.domain }));
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("channels.email.deleteFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className={className}>
+      <div className="font-medium text-sm">{t("channels.email.title")}</div>
+      <p className={`mt-1 ${mutedCls}`}>{t("channels.email.body")}</p>
+      {domains.length === 0 ? (
+        <div className="mt-3 text-sm text-slate-400 dark:text-slate-500">{t("channels.email.domainsEmpty")}</div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          {domains.map((d) => (
+            <div key={d.id} className="flex items-center gap-2 rounded-md border border-slate-200 px-2.5 py-1.5 text-sm dark:border-slate-700">
+              <span className="font-mono text-xs">{d.domain}</span>
+              <span className={chipCls}>{d.status}</span>
+              <button
+                onClick={() => void remove(d)}
+                disabled={busy}
+                className="ml-auto text-xs text-red-600 underline disabled:opacity-50 dark:text-red-400"
+              >
+                {t("common.delete")}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="mt-3 space-y-2">
+        <input
+          value={domain}
+          onChange={(e) => setDomain(e.target.value)}
+          placeholder={t("channels.email.domainPlaceholder")}
+          className={inputCls}
+        />
+        {emailAccounts.length > 0 && (
+          <div>
+            <label className={labelCls}>{t("channels.email.accountLabel")}</label>
+            <select value={accountId} onChange={(e) => setAccountId(e.target.value)} className={inputCls}>
+              <option value="">-</option>
+              {emailAccounts.map((a) => (
+                <option key={a.id} value={a.id}>{a.displayName ?? a.externalId}</option>
+              ))}
+            </select>
+          </div>
+        )}
+        <div>
+          <label className={labelCls}>{t("channels.email.resendIdLabel")}</label>
+          <input value={resendId} onChange={(e) => setResendId(e.target.value)} className={inputCls} />
+        </div>
+        <button onClick={() => void add()} disabled={busy || !domain.trim()} className={primaryBtn}>
+          {t("channels.email.addButton")}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function ChannelsPage() {
   const { t } = useI18n();
   const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
@@ -3177,6 +3293,8 @@ function ChannelsPage() {
             {copied ? t("channels.webchat.copied") : t("channels.webchat.copy")}
           </button>
         </div>
+
+        <EmailDomainsCard className={connectCard} />
             </div>
           </div>
         </div>
@@ -3419,6 +3537,87 @@ const adminGroupLabelKey = (group: string): "admin.group.meta" | "admin.group.th
 };
 
 const fmtDateTime = (iso: string): string => new Date(iso).toLocaleString();
+
+/** Any i18n key (for dynamically composed keys, e.g. per-webhook hints). */
+type I18nKey = Parameters<ReturnType<typeof useI18n>["t"]>[0];
+
+const adminGroupDescKey = (group: string): I18nKey => `admin.groupDesc.${group}` as I18nKey;
+
+/**
+ * Connection reference (F11): every webhook callback + OAuth redirect URL
+ * an operator must paste into a provider dashboard, from
+ * GET /admin/connection-info. URLs are computed server-side from the
+ * public base; verify-token rows name the settings KEY only.
+ */
+function ConnectionReferenceCard() {
+  const { t } = useI18n();
+  const [info, setInfo] = useState<ConnectionInfo | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.adminConnectionInfo()
+      .then((data) => { if (!cancelled) setInfo(data); })
+      .catch(() => { if (!cancelled) setFailed(true); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const copyUrl = async (url: string) => {
+    try {
+      await navigator.clipboard.writeText(url);
+      pushToast("ok", t("admin.connection.copied"));
+    } catch {
+      pushToast("err", t("admin.connection.copyFailed"));
+    }
+  };
+
+  const row = (id: string, url: string, hint: string, extra?: string) => (
+    <div key={id} className="flex flex-wrap items-center gap-2 py-1.5">
+      <span className="w-36 shrink-0 text-xs font-medium text-slate-600 dark:text-slate-300">{id}</span>
+      <code className="min-w-0 flex-1 break-all rounded bg-slate-50 px-2 py-1 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">{url}</code>
+      <button
+        onClick={() => void copyUrl(url)}
+        className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
+      >
+        {t("admin.connection.copy")}
+      </button>
+      <span className="w-full text-[11px] text-slate-400 dark:text-slate-500">
+        {hint}
+        {extra ? ` ${extra}` : ""}
+      </span>
+    </div>
+  );
+
+  return (
+    <div className={`mt-4 ${cardCls} p-4`}>
+      <div className="font-medium text-sm">{t("admin.connection.title")}</div>
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("admin.connection.subtitle")}</p>
+      {failed && <div className="mt-3"><ErrorBox error={t("admin.connection.loadFailed")} /></div>}
+      {info && (
+        <div className="mt-2 divide-y divide-slate-100 dark:divide-slate-800">
+          <div className="pt-2">
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">{t("admin.connection.webhooks")}</div>
+            {info.webhooks.map((w) =>
+              row(
+                w.id,
+                w.url,
+                t(`admin.connection.hint.webhook.${w.id}` as I18nKey),
+                [
+                  w.verifyTokenKey ? t("admin.connection.verifyToken", { key: w.verifyTokenKey }) : "",
+                  w.autoConfigured ? t("admin.connection.autoConfigured") : "",
+                ].filter(Boolean).join(" ") || undefined,
+              ),
+            )}
+          </div>
+          <div className="pt-2">
+            <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 dark:text-slate-500">{t("admin.connection.oauth")}</div>
+            {info.oauthRedirects.map((o) => row(o.id, o.url, t("admin.connection.hint.oauth")))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 function AdminPage() {
   const { t } = useI18n();
@@ -3838,6 +4037,8 @@ function AdminSettingsView() {
   return (
     <div className="max-w-4xl">
       <p className={mutedCls}>{t("admin.settings.propagationNote")}</p>
+      <p className={`mt-1 ${mutedCls}`}>{t("admin.settings.overrideNote")}</p>
+      <ConnectionReferenceCard />
       {error && <div className="mt-4"><ErrorBox error={error} /></div>}
       {notice && <div className="mt-4"><NoticeBox>{notice}</NoticeBox></div>}
       {!settings && !error && <p className={`mt-4 ${mutedCls}`}>{t("app.loading")}</p>}
@@ -3847,7 +4048,10 @@ function AdminSettingsView() {
         const hasDrafts = groupSettings.some((s) => (drafts[s.key] ?? "").trim() !== "");
         return (
           <div key={group} className={`mt-4 ${cardCls} p-4 space-y-4`}>
-            <div className="font-medium text-sm">{t(adminGroupLabelKey(group))}</div>
+            <div>
+              <div className="font-medium text-sm">{t(adminGroupLabelKey(group))}</div>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">{t(adminGroupDescKey(group))}</p>
+            </div>
             {groupSettings.map((setting) => (
               <div key={setting.key}>
                 <div className="flex items-center justify-between gap-2">
@@ -4544,6 +4748,28 @@ function AuthedApp() {
     setWorkspaceId(id);
   };
 
+  // Create workspace (F7): the switcher's "+ New workspace" entry opens
+  // a small name modal; on success the app switches to the new workspace.
+  const [showNewWorkspace, setShowNewWorkspace] = useState(false);
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
+
+  const createWorkspace = async () => {
+    setCreatingWorkspace(true);
+    try {
+      const res = await api.createWorkspace({ name: newWorkspaceName.trim() });
+      setWorkspaces((prev) => [...prev, { ...res.workspace, role: "owner" }]);
+      changeWorkspace(res.workspace.id);
+      pushToast("ok", t("workspace.created"));
+      setShowNewWorkspace(false);
+      setNewWorkspaceName("");
+    } catch (err) {
+      pushToast("err", errText(err, t("workspace.createFailed")));
+    } finally {
+      setCreatingWorkspace(false);
+    }
+  };
+
   const logout = async () => {
     await api.logout();
     setUser(null);
@@ -4575,12 +4801,19 @@ function AuthedApp() {
             <label className="block text-xs text-slate-400 mb-1">{t("common.workspace")}</label>
             <select
               value={workspaceId}
-              onChange={(e) => changeWorkspace(e.target.value)}
+              onChange={(e) => {
+                if (e.target.value === "__new__") {
+                  setShowNewWorkspace(true);
+                } else {
+                  changeWorkspace(e.target.value);
+                }
+              }}
               className="w-full rounded-md bg-slate-800 border border-slate-700 px-2 py-1.5 text-xs text-slate-100 focus:outline-none"
             >
               {workspaces.map((w) => (
                 <option key={w.id} value={w.id}>{w.name} ({w.role})</option>
               ))}
+              <option value="__new__">+ {t("workspace.new")}</option>
             </select>
           </div>
           <div className="text-[11px] text-slate-500">
@@ -4623,6 +4856,36 @@ function AuthedApp() {
         )}
         {page === "admin" && user.isPlatformAdmin && <AdminPage />}
       </main>
+      {showNewWorkspace && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4" onClick={() => setShowNewWorkspace(false)}>
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("workspace.createTitle")}
+            className="w-full max-w-sm rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-base font-semibold">{t("workspace.createTitle")}</h2>
+            <input
+              value={newWorkspaceName}
+              onChange={(e) => setNewWorkspaceName(e.target.value)}
+              placeholder={t("workspace.namePlaceholder")}
+              className={`mt-4 ${inputCls}`}
+              autoFocus
+            />
+            <div className="mt-5 flex justify-end gap-2">
+              <button onClick={() => setShowNewWorkspace(false)} className={outlineBtn}>{t("common.cancel")}</button>
+              <button
+                onClick={() => void createWorkspace()}
+                disabled={creatingWorkspace || !newWorkspaceName.trim()}
+                className={primaryBtn}
+              >
+                {creatingWorkspace ? t("common.saving") : t("common.create")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
