@@ -234,6 +234,9 @@ export async function createMessage(
     body?: string;
     /** Rich block (outbound sends) or { buttonPayload } (webchat clicks). */
     payload?: unknown;
+    /** Stored inbound media (public URLs + storage keys), parallel arrays. */
+    mediaUrls?: string[];
+    mediaKeys?: string[];
     externalId?: string;
     status?: string;
     idempotencyKey?: string;
@@ -253,6 +256,8 @@ export async function createMessage(
       type: input.type ?? "text",
       body: input.body,
       payload: input.payload ?? null,
+      mediaUrls: input.mediaUrls ?? [],
+      mediaKeys: input.mediaKeys ?? [],
       externalId: input.externalId,
       status: input.status ?? "queued",
       idempotencyKey: input.idempotencyKey,

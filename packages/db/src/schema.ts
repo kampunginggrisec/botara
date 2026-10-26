@@ -93,6 +93,16 @@ export const messages = pgTable("messages", {
    * - the code the visitor's tap sent back. Null for plain messages.
    */
   payload: jsonb("payload"),
+  /**
+   * Stored media backing this message (inbound media pipeline): public
+   * URLs the SPA renders, parallel to mediaKeys. Bytes are copied into
+   * Botara's own storage at ingest because provider URLs/ids expire;
+   * a message whose media could not be fetched keeps both arrays empty
+   * (caption-only persistence - a media failure never loses the message).
+   */
+  mediaUrls: jsonb("media_urls").notNull().default([]),
+  /** Storage object keys backing mediaUrls, kept for lifecycle management. */
+  mediaKeys: jsonb("media_keys").notNull().default([]),
   externalId: varchar("external_id", { length: 200 }),
   status: varchar("status", { length: 40 }).notNull().default("queued"), // queued|sent|delivered|read|failed
   /** Idempotency key used on the provider send call; safe retries depend on it. */
