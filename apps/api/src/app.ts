@@ -79,6 +79,9 @@ import {
 import {
   contactsToCsv, contactsToJson, dedupeImportRows, parseImport,
 } from "./contacts-io";
+import {
+  DEFAULT_KB_UPLOAD_LIMITS, extractKbFileText, sanitizeUploadFilename, titleFromFilename,
+} from "./kb-upload";
 import { buildGrowthTarget, generateGrowthSlug, growthShortUrl } from "./growth";
 import { syncWhatsAppCatalog, type CatalogSyncResult } from "./catalog-sync";
 
@@ -192,6 +195,8 @@ export interface ApiDeps {
   dataDeletionStore: DataDeletionStore;
   /** Fase 3: knowledge-base ingestion enqueueing. */
   kbEnqueuer: KbEnqueuer;
+  /** KB file-upload limits (defaults in kb-upload.ts; tests inject tiny limits). */
+  kbUploadLimits?: { maxFileBytes?: number; maxTextChars?: number };
   /** Fase 3: readiness probes for /health/ready. */
   readiness: ReadinessChecker;
   /** Fase 3: in-process rate-limit overrides (tests use tiny limits). */
@@ -3668,11 +3673,45 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   const serializeKbDocument = (d: Awaited<ReturnType<typeof listKbDocuments>>[number]) => ({
     id: d.id,
     title: d.title,
-    status: d.status,
-    chunkCount: d.chunkCount,
+    status: d.status ?? "pending",
+    chunkCount: d.chunkCount ?? 0,
     error: d.error ?? undefined,
+    sourceFilename: d.sourceFilename ?? undefined,
     createdAt: iso(d.createdAt),
   });
+
+  /** KB creation requires an AI provider (ingestion embeds the chunks) - fail fast, never fake. */
+  const requireKbAiProvider = (): void => {
+    if (!deps.getAiProvider()) {
+      throw new AppError(
+        "CONFIGURATION",
+        "No AI provider is configured (AI_API_KEY); KB ingestion needs embeddings and is never faked.",
+        { status: 503 },
+      );
+    }
+  };
+
+  /**
+   * Shared KB document creation: persist + enqueue the kb-ingest job
+   * (chunk + embed in the worker). Used by both the typed-text route and
+   * the file-upload route so every document flows through ONE pipeline.
+   * A queue failure surfaces as 503; the document stays "pending".
+   */
+  const persistKbDocument = async (
+    c: Ctx,
+    input: { title: string; content: string; sourceFilename?: string | null },
+  ) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const doc = await createKbDocument(db, {
+      workspaceId: ws,
+      title: input.title,
+      sourceText: input.content,
+      sourceFilename: input.sourceFilename ?? null,
+    });
+    await deps.kbEnqueuer.enqueueKbIngest({ workspaceId: ws, documentId: doc.id });
+    return doc;
+  };
 
   const createKbDocumentRoute = createRoute({
     method: "post", path: "/kb/documents",
@@ -3695,20 +3734,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     // Ingestion EMBEDS the chunks - without an AI provider there is
     // nothing honest to do with the document, so fail fast with 503
     // before storing anything.
-    if (!deps.getAiProvider()) {
-      throw new AppError(
-        "CONFIGURATION",
-        "No AI provider is configured (AI_API_KEY); KB ingestion needs embeddings and is never faked.",
-        { status: 503 },
-      );
-    }
-    const ws = workspaceId(c);
-    const db = deps.getDatabase();
+    requireKbAiProvider();
     const body = c.req.valid("json");
-    const doc = await createKbDocument(db, { workspaceId: ws, title: body.title, sourceText: body.content });
-    // Enqueue the kb-ingest job (chunk + embed in the worker). A queue
-    // failure surfaces as 503; the document stays "pending" and visible.
-    await deps.kbEnqueuer.enqueueKbIngest({ workspaceId: ws, documentId: doc.id });
+    const doc = await persistKbDocument(c, { title: body.title, content: body.content });
     return c.json({ document: serializeKbDocument(doc) }, 201);
   });
 
@@ -3756,6 +3784,50 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const deleted = await deleteKbDocument(db, ws, c.req.valid("param").id);
     if (!deleted) throw new AppError("NOT_FOUND", "KB document not found.", { status: 404 });
     return c.json({ deleted: true });
+  });
+
+  // File upload: multipart form (file + optional title). The text is
+  // extracted server-side (PDF/DOCX/TXT/MD - see ./kb-upload.ts) and the
+  // result becomes a normal KB document via persistKbDocument; the
+  // original file is never stored. Extraction failures are honest typed
+  // errors (400 wrong type/oversize, 422 unreadable/no text layer).
+  app.post("/kb/documents/upload", async (c) => {
+    guardMutator(c);
+    requireKbAiProvider();
+    const limits = { ...DEFAULT_KB_UPLOAD_LIMITS, ...deps.kbUploadLimits };
+    const form = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>;
+    const file = form.file;
+    if (!(file instanceof File)) {
+      throw new AppError("VALIDATION", "Multipart form field 'file' is required.", { status: 400 });
+    }
+    if (file.size > limits.maxFileBytes) {
+      throw new AppError(
+        "VALIDATION",
+        `File is too large: ${file.size} bytes exceeds the ${limits.maxFileBytes}-byte (10 MB) upload limit.`,
+        { status: 400, details: { maxFileBytes: limits.maxFileBytes } },
+      );
+    }
+    const filename = sanitizeUploadFilename(file.name || "upload");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const extraction = await extractKbFileText({ filename, bytes }, limits);
+    const rawTitle = typeof form.title === "string" ? form.title.trim() : "";
+    if (rawTitle.length > 300) {
+      throw new AppError("VALIDATION", "Title must be at most 300 characters.", { status: 400 });
+    }
+    const doc = await persistKbDocument(c, {
+      title: rawTitle || titleFromFilename(filename),
+      content: extraction.text,
+      sourceFilename: filename,
+    });
+    return c.json({
+      document: serializeKbDocument(doc),
+      extraction: {
+        format: extraction.format,
+        chars: extraction.chars,
+        truncated: extraction.truncated,
+        sourceFilename: filename,
+      },
+    }, 201);
   });
 
   // ------------------------------------------------------ webchat (Fase 2)
