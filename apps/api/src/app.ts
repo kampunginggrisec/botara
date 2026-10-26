@@ -654,6 +654,39 @@ export function dataDeletionAppSecrets(
   ];
 }
 
+/**
+ * The WhatsApp Embedded Signup config id as the FB SDK needs it: the bare
+ * config_id. Operators sometimes paste the whole onboarding URL from the
+ * WhatsApp product settings into the panel instead of just the id (this
+ * happened on the trial deployment, 2026-10-26); when the stored value is
+ * a URL carrying a config_id parameter, extract it. Anything else passes
+ * through trimmed; unset/empty stays null.
+ */
+export function normalizeEmbeddedConfigId(
+  raw: string | undefined,
+): string | null {
+  if (raw === undefined) return null;
+  const value = raw.trim();
+  if (value.length === 0) return null;
+  if (value.includes("config_id=")) {
+    try {
+      const fromUrl = new URL(value).searchParams.get("config_id");
+      if (fromUrl) return fromUrl;
+    } catch {
+      // Not a parseable URL - try the parameter pattern directly.
+      const match = /[?&]config_id=([^&#]+)/.exec(value);
+      if (match?.[1]) {
+        try {
+          return decodeURIComponent(match[1]);
+        } catch {
+          return match[1];
+        }
+      }
+    }
+  }
+  return value;
+}
+
 // ------------------------------------------------------------------- types
 
 export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
@@ -1362,7 +1395,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   // the public base URL). NEVER includes secrets - only public app ids.
   app.get("/config/public", (c) => c.json({
     metaAppId: deps.env.META_APP_ID ?? null,
-    whatsappEmbeddedConfigId: deps.env.WHATSAPP_EMBEDDED_CONFIG_ID ?? null,
+    whatsappEmbeddedConfigId: normalizeEmbeddedConfigId(deps.env.WHATSAPP_EMBEDDED_CONFIG_ID),
     instagramAppId: deps.env.INSTAGRAM_APP_ID ?? null,
     threadsAppId: deps.env.THREADS_APP_ID ?? null,
     tiktokAppId: deps.env.TIKTOK_APP_ID ?? null,

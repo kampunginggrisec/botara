@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createApp } from "./app";
+import { createApp, normalizeEmbeddedConfigId } from "./app";
 import { testDeps, registerUser } from "./test-helpers";
 import { createDbFlowDispatcher } from "./flows-dispatch";
 import type { InboundEvent } from "@botara/channels";
@@ -46,6 +46,42 @@ describe("GET /config/public", () => {
     expect(body.metaAppId).toBe("123456");
     expect(body.whatsappEmbeddedConfigId).toBe("cfg-1");
     expect(body.publicWebhookBaseUrl).toBe("https://bot.example.com/api");
+  });
+
+  test("extracts the bare config_id when a full onboarding URL was stored", async () => {
+    const app = createApp(testDeps({
+      env: {
+        WHATSAPP_EMBEDDED_CONFIG_ID:
+          "https://business.facebook.com/messaging/whatsapp/onboard/?app_id=123456&config_id=1616551992742344&extras=%7B%22version%22%3A%22v4%22%7D",
+      },
+    }));
+    const body = (await (await app.request("/config/public")).json()) as Record<string, unknown>;
+    expect(body.whatsappEmbeddedConfigId).toBe("1616551992742344");
+  });
+});
+
+describe("normalizeEmbeddedConfigId", () => {
+  test("null/empty handling", () => {
+    expect(normalizeEmbeddedConfigId(undefined)).toBeNull();
+    expect(normalizeEmbeddedConfigId("")).toBeNull();
+    expect(normalizeEmbeddedConfigId("   ")).toBeNull();
+  });
+
+  test("bare ids pass through trimmed", () => {
+    expect(normalizeEmbeddedConfigId("1616551992742344")).toBe("1616551992742344");
+    expect(normalizeEmbeddedConfigId("  cfg-1 ")).toBe("cfg-1");
+  });
+
+  test("full onboarding URL yields its config_id", () => {
+    expect(
+      normalizeEmbeddedConfigId(
+        "https://business.facebook.com/messaging/whatsapp/onboard/?app_id=3230392650493633&config_id=1616551992742344&extras=%7B%22version%22%3A%22v4%22%7D&redirect_uri=https%3A%2F%2Fexample.com%2Fcb",
+      ),
+    ).toBe("1616551992742344");
+  });
+
+  test("unparseable values pass through rather than being hidden", () => {
+    expect(normalizeEmbeddedConfigId("not a url at all")).toBe("not a url at all");
   });
 });
 
