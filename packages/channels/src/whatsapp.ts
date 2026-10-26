@@ -414,7 +414,9 @@ export class WhatsAppAdapter implements ChannelAdapter {
     const blob = file.data instanceof Blob
       ? file.data
       : new Blob(
-          [file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data)],
+          // Fresh ArrayBuffer-backed copy: BlobPart requires
+          // Uint8Array<ArrayBuffer> under the DOM lib's typings.
+          [new Uint8Array(file.data instanceof Uint8Array ? file.data : new Uint8Array(file.data))],
           { type: file.mimeType },
         );
     const form = new FormData();

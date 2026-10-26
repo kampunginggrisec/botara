@@ -773,7 +773,9 @@ export class TikTokAdapter implements ChannelAdapter {
     const form = new FormData();
     form.set("business_id", this.businessIdFor(account, pair));
     form.set("media_type", "IMAGE");
-    const blob = new Blob([input.bytes], { type: input.contentType });
+    // Fresh ArrayBuffer-backed copy: BlobPart requires
+    // Uint8Array<ArrayBuffer> under the DOM lib's typings.
+    const blob = new Blob([new Uint8Array(input.bytes)], { type: input.contentType });
     form.set("file", blob, input.filename ?? "image.jpg");
     const data = await this.business<{ media_id?: string }>(account, {
       method: "POST", path: "business/message/media/upload/", form,
