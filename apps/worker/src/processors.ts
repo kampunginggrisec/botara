@@ -95,6 +95,13 @@ export interface FlowRunContext {
   tokenVaultRef?: string;
   contactId: string;
   contactExternalId: string;
+  /**
+   * Botara conversation id this run belongs to (action steps -
+   * assign / set_conversation_status / collect_input - act on it).
+   * Optional: embedded jobs queued before package #3 lack it, and
+   * conversation-scoped steps then degrade to run warnings.
+   */
+  conversationId?: string;
   /** Provider conversation id (TikTok), resolved from the conversation row. */
   conversationExternalId?: string;
   country?: string;
@@ -134,6 +141,41 @@ export interface FlowRunRef {
    * that node so it is never sent twice.
    */
   skipFirstSendMessage?: boolean;
+  /**
+   * Collect-input resume (package #3): the run paused at a collect_input
+   * node and a reply (or the timeout) claimed its wait. loadFlowRun
+   * restarts from this state snapshot instead of the flow's start, with
+   * `resumeVariables` (the captured answer) merged into the event.
+   */
+  resumeState?: FlowState;
+  resumeVariables?: Record<string, string>;
+}
+
+/**
+ * A claimed collect-input wait (package #3), as the repositories hand
+ * it back: the marker row is DELETED by the claim, so whoever holds
+ * this object is the wait's only resumer.
+ */
+export interface ClaimedFlowWait {
+  id: string;
+  workspaceId: string;
+  conversationId: string;
+  contactId: string;
+  channelAccountId: string;
+  flowId: string;
+  variable: string;
+  saveToContactField?: string | null;
+  resumeState: FlowState;
+}
+
+/** Delayed-job marker enqueued alongside a wait that has a timeout. */
+export interface FlowWaitTimeoutJobData {
+  flowWaitTimeoutId: string;
+}
+
+export function isFlowWaitTimeout(data: unknown): data is FlowWaitTimeoutJobData {
+  if (!data || typeof data !== "object") return false;
+  return typeof (data as Record<string, unknown>).flowWaitTimeoutId === "string";
 }
 
 export interface WorkerPorts {
@@ -199,6 +241,34 @@ export interface WorkerPorts {
   httpFetch(url: string, method: "GET" | "POST"): Promise<void>;
   /** Schedule a flow-run resume after a delay node paused the run. */
   scheduleFlowResume(job: FlowRunJobData, delaySeconds: number): Promise<void>;
+  // ---- flow action steps + collect_input (package #3), all optional:
+  // processFlowRun wires whichever exist into the executor's ports;
+  // a missing one degrades that step to a recorded action + warning.
+  addContactTag?(workspaceId: string, contactId: string, tag: string): Promise<void>;
+  removeContactTag?(workspaceId: string, contactId: string, tag: string): Promise<void>;
+  /** False = the user is not a workspace member (executor warns). */
+  assignConversation?(input: { workspaceId: string; conversationId: string; userId: string | null }): Promise<boolean>;
+  setConversationStatus?(input: { workspaceId: string; conversationId: string; status: "resolved" | "open" }): Promise<void>;
+  /** False = sequence missing / not enrollable (executor warns). */
+  subscribeSequence?(input: { workspaceId: string; contactId: string; sequenceId: string }): Promise<boolean>;
+  unsubscribeSequence?(input: { workspaceId: string; contactId: string; sequenceId: string }): Promise<void>;
+  /**
+   * Persist a collect-input wait for a paused run and arrange its
+   * timeout (when the step configured one). The wait row is the only
+   * durable trace of the paused run - resumes claim it by deletion.
+   */
+  scheduleFlowInputWait?(job: FlowRunJobData, wait: {
+    nodeId: string | null;
+    variable: string;
+    saveToContactField?: string;
+    timeoutHours?: number;
+  }): Promise<void>;
+  /** Atomically claim one wait by id (timeout path); null = already claimed / gone. */
+  claimFlowWaitById?(waitId: string): Promise<ClaimedFlowWait | null>;
+  /** Live conversation status for the timeout path's quiet-end check. */
+  getConversationStatus?(conversationId: string): Promise<string | null>;
+  /** Enqueue an id-based flow run (the timeout path's resume). */
+  enqueueFlowRun?(ref: FlowRunRef): Promise<void>;
 }
 
 function billingCategory(data: SendMessageJobData): WhatsAppCategory {
@@ -435,6 +505,52 @@ export async function processFlowRun(
       if (!ports.aiReply) return null;
       return ports.aiReply({ workspaceId: ctx.workspaceId, prompt, query });
     },
+    // Action steps (package #3): wired only when the matching worker
+    // port exists - the executor degrades unwired steps to a recorded
+    // action + warning. Conversation-scoped steps also warn (via a
+    // false report) when the job carries no conversation id.
+    ...(ports.addContactTag ? {
+      addTag: async ({ tag }: { tag: string }) => { await ports.addContactTag!(ctx.workspaceId, ctx.contactId, tag); },
+    } : {}),
+    ...(ports.removeContactTag ? {
+      removeTag: async ({ tag }: { tag: string }) => { await ports.removeContactTag!(ctx.workspaceId, ctx.contactId, tag); },
+    } : {}),
+    ...(ports.assignConversation ? {
+      assignConversation: async ({ userId }: { userId: string | null }) => {
+        if (!ctx.conversationId) return false;
+        return ports.assignConversation!({ workspaceId: ctx.workspaceId, conversationId: ctx.conversationId, userId });
+      },
+    } : {}),
+    ...(ports.setConversationStatus ? {
+      setConversationStatus: async ({ status }: { status: "resolved" | "open" }) => {
+        if (!ctx.conversationId) throw new Error("flow run carries no conversation");
+        await ports.setConversationStatus!({ workspaceId: ctx.workspaceId, conversationId: ctx.conversationId, status });
+      },
+    } : {}),
+    ...(ports.subscribeSequence ? {
+      subscribeSequence: async ({ sequenceId }: { sequenceId: string }) =>
+        ports.subscribeSequence!({ workspaceId: ctx.workspaceId, contactId: ctx.contactId, sequenceId }),
+    } : {}),
+    ...(ports.unsubscribeSequence ? {
+      unsubscribeSequence: async ({ sequenceId }: { sequenceId: string }) => {
+        await ports.unsubscribeSequence!({ workspaceId: ctx.workspaceId, contactId: ctx.contactId, sequenceId });
+      },
+    } : {}),
+    ...(ports.scheduleFlowInputWait ? {
+      awaitInput: async (input: {
+        nodeId: string | null; variable: string; saveToContactField?: string;
+        timeoutHours?: number; resumeState: FlowState;
+      }) => {
+        if (!ctx.conversationId) throw new Error("flow run carries no conversation");
+        await ports.scheduleFlowInputWait!(
+          { flow: data.flow, state: input.resumeState, event: { type: "awaiting-input" }, context: ctx },
+          {
+            nodeId: input.nodeId, variable: input.variable,
+            saveToContactField: input.saveToContactField, timeoutHours: input.timeoutHours,
+          },
+        );
+      },
+    } : {}),
   };
   // Variable interpolation (variables #1): the executor renders every
   // send_message against this context; the run's own variables (trigger
@@ -456,5 +572,53 @@ export async function processFlowRun(
       `[worker] flow ${data.flow.id} -> contact ${ctx.contactId}: unknown variables rendered empty (${result.warnings.map((w) => w.path).join(", ")})`,
     );
   }
+  if (result.actionWarnings.length > 0) {
+    console.warn(
+      `[worker] flow ${data.flow.id} -> contact ${ctx.contactId}: action steps skipped (${result.actionWarnings.join("; ")})`,
+    );
+  }
   return result;
+}
+
+/**
+ * "flow-run" timeout marker for a collect-input wait (package #3):
+ * the delayed companion job of a wait created with `timeoutHours`.
+ * Claiming is the race guard - when the contact's reply already
+ * claimed the wait (dispatcher), this is a no-op; when the claim
+ * succeeds here, the run resumes with an EMPTY captured value and the
+ * reply (if it ever comes) falls back to normal trigger matching.
+ * A wait whose conversation has since resolved ends quietly: the run
+ * is dropped, never resumed into a closed thread.
+ */
+export async function processFlowWaitTimeout(
+  ports: WorkerPorts,
+  waitId: string,
+): Promise<{ resumed: boolean; reason?: string }> {
+  if (!ports.claimFlowWaitById || !ports.enqueueFlowRun) {
+    return { resumed: false, reason: "ports-unwired" };
+  }
+  const wait = await ports.claimFlowWaitById(waitId);
+  if (!wait) return { resumed: false, reason: "already-claimed" };
+  const status = ports.getConversationStatus
+    ? await ports.getConversationStatus(wait.conversationId)
+    : null;
+  if (status === "resolved") {
+    console.log(
+      `[worker] flow wait ${waitId}: conversation ${wait.conversationId} resolved while waiting - run ended quietly`,
+    );
+    return { resumed: false, reason: "conversation-resolved" };
+  }
+  console.warn(
+    `[worker] flow wait ${waitId}: no reply within the timeout - resuming flow ${wait.flowId} with an empty {{vars.${wait.variable}}}`,
+  );
+  await ports.enqueueFlowRun({
+    flowId: wait.flowId,
+    workspaceId: wait.workspaceId,
+    contactId: wait.contactId,
+    conversationId: wait.conversationId,
+    channelAccountId: wait.channelAccountId,
+    resumeState: wait.resumeState,
+    resumeVariables: { [wait.variable]: "" },
+  });
+  return { resumed: true };
 }

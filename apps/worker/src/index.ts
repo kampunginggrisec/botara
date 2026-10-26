@@ -12,6 +12,9 @@ import {
   listChannelAccountsDueForRefresh, updateChannelAccountToken, purgeExpiredDisconnectedAccounts,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
+  addContactTag, removeContactTag, getWorkspaceMember, updateConversationAssignment,
+  createEnrollment, getSequence, cancelActiveEnrollments,
+  createFlowWait, claimFlowWaitById, deleteFlowWaitsForConversation, updateConversationStatus,
   getContactByExternal, createContact, listConversations, findOpenConversation,
   findConversationByExternalId, getConversationById, listMessages, updateBroadcastStatus,
   isCommentProcessed, markCommentProcessed,
@@ -27,7 +30,7 @@ import {
 import { countConsecutiveOutbound } from "@botara/shared";
 import { putObject } from "@botara/media";
 import {
-  processBroadcast, processFlowRun, processSendMessage,
+  isFlowWaitTimeout, processBroadcast, processFlowRun, processFlowWaitTimeout, processSendMessage,
   type BroadcastSnapshot, type FlowRunJobData, type FlowRunRef, type SendMessageJobData, type WorkerPorts,
 } from "./processors";
 import { firstSendMessageOf, storedGraphSchema, toRunnableFlow, type FlowState } from "@botara/flow-engine";
@@ -186,11 +189,20 @@ function buildProdPorts(db: Database): WorkerPorts {
           variables[key] = String(value);
         }
       }
+      // Collect-input resume (package #3): restart from the snapshot
+      // the paused run stored in its wait row; the captured answer
+      // rides the event variables (merged over contact fields below,
+      // and by the interpreter over the state) as the collect variable.
       // Comment-to-DM runs: the first send_message was already delivered
       // as the private reply to the comment, so the run starts AFTER that
       // node (state pre-advanced) instead of sending it a second time.
       let state: FlowState | undefined;
-      if (ref.skipFirstSendMessage) {
+      if (ref.resumeState) {
+        state = {
+          ...ref.resumeState,
+          variables: { ...variables, ...ref.resumeState.variables, ...(ref.resumeVariables ?? {}) },
+        };
+      } else if (ref.skipFirstSendMessage) {
         const first = firstSendMessageOf(parsed.data);
         if (first) {
           state = {
@@ -214,7 +226,8 @@ function buildProdPorts(db: Database): WorkerPorts {
         ...(state ? { state } : {}),
         event: {
           type: ref.commentId ? "comment.received" : "message.received",
-          text: ref.triggerText, variables,
+          text: ref.triggerText,
+          variables: { ...variables, ...(ref.resumeVariables ?? {}) },
         },
         context: {
           workspaceId: ref.workspaceId,
@@ -224,6 +237,8 @@ function buildProdPorts(db: Database): WorkerPorts {
           tokenVaultRef: account.tokenVaultRef ?? undefined,
           contactId: contact.id,
           contactExternalId: contact.externalId,
+          // Botara conversation id for conversation-scoped action steps.
+          conversationId: runConversation?.id ?? ref.conversationId,
           conversationExternalId: runConversation?.externalId ?? undefined,
           // Variable-interpolation context (variables #1).
           contactDisplayName: contact.displayName,
@@ -359,6 +374,107 @@ function buildProdPorts(db: Database): WorkerPorts {
       const queue = queueByName.get("flow-run");
       if (!queue) throw new Error("flow-run queue is not registered");
       await queue.add("flow-run", job, { delay: delaySeconds * 1000 });
+    },
+    // ---- flow action steps + collect_input (package #3) ----
+    async addContactTag(workspaceId, contactId, tag) {
+      await addContactTag(db, workspaceId, contactId, tag);
+    },
+    async removeContactTag(workspaceId, contactId, tag) {
+      await removeContactTag(db, workspaceId, contactId, tag);
+    },
+    async assignConversation({ workspaceId, conversationId, userId }) {
+      // Membership is enforced here (the executor warns on false): a
+      // flow must never assign a conversation outside the workspace.
+      if (userId) {
+        const member = await getWorkspaceMember(db, workspaceId, userId);
+        if (!member) return false;
+      }
+      const updated = await updateConversationAssignment(db, workspaceId, conversationId, userId);
+      return updated !== null;
+    },
+    async setConversationStatus({ workspaceId, conversationId, status }) {
+      await updateConversationStatus(db, workspaceId, conversationId, status);
+      if (status === "resolved") {
+        // Any run still WAITING on this thread (collect_input) ends
+        // quietly: its wait is dropped, never resumed into a closed
+        // conversation. (The currently executing run is not waiting -
+        // it holds no wait row.)
+        await deleteFlowWaitsForConversation(db, conversationId);
+      }
+    },
+    async subscribeSequence({ workspaceId, contactId, sequenceId }) {
+      const sequence = await getSequence(db, workspaceId, sequenceId);
+      if (!sequence || sequence.status !== "active") return false;
+      const steps = (sequence.steps as Array<{ delaySeconds?: number }>) ?? [];
+      if (steps.length === 0) return false;
+      // Same enrollment shape as the API's tag enroll: first step's
+      // delay counts from now; the repository dedups re-enrollment.
+      await createEnrollment(db, {
+        workspaceId, sequenceId, contactId,
+        nextStepAt: new Date(Date.now() + (steps[0]!.delaySeconds ?? 0) * 1000),
+      });
+      return true;
+    },
+    async unsubscribeSequence({ workspaceId, contactId, sequenceId }) {
+      await cancelActiveEnrollments(db, {
+        workspaceId, contactId,
+        ...(sequenceId !== "all" ? { sequenceId } : {}),
+      });
+    },
+    async scheduleFlowInputWait(job, wait) {
+      const ctx = job.context;
+      if (!ctx.conversationId || !job.state) {
+        throw new Error("collect_input wait needs the run's conversation + resume state");
+      }
+      const deadlineAt = wait.timeoutHours !== undefined
+        ? new Date(Date.now() + wait.timeoutHours * 3600 * 1000)
+        : null;
+      const row = await createFlowWait(db, {
+        workspaceId: ctx.workspaceId,
+        conversationId: ctx.conversationId,
+        contactId: ctx.contactId,
+        channelAccountId: ctx.channelAccountId,
+        flowId: job.flow.id,
+        nodeId: wait.nodeId ?? "",
+        variable: wait.variable,
+        saveToContactField: wait.saveToContactField ?? null,
+        resumeState: job.state as unknown as Record<string, unknown>,
+        deadlineAt,
+      });
+      if (deadlineAt) {
+        // The timeout companion job: same queue + delay mechanism as
+        // delay-node resumes; it claims the wait by id when it fires.
+        const queue = queueByName.get("flow-run");
+        if (!queue) throw new Error("flow-run queue is not registered");
+        await queue.add("flow-run", { flowWaitTimeoutId: row.id }, {
+          delay: Math.max(0, deadlineAt.getTime() - Date.now()),
+          jobId: jobIdFor(`flowwait:${row.id}`),
+        });
+      }
+    },
+    async claimFlowWaitById(waitId) {
+      const row = await claimFlowWaitById(db, waitId);
+      if (!row) return null;
+      return {
+        id: row.id,
+        workspaceId: row.workspaceId,
+        conversationId: row.conversationId,
+        contactId: row.contactId,
+        channelAccountId: row.channelAccountId,
+        flowId: row.flowId,
+        variable: row.variable,
+        saveToContactField: row.saveToContactField,
+        resumeState: row.resumeState as unknown as FlowState,
+      };
+    },
+    async getConversationStatus(conversationId) {
+      const row = await getConversationById(db, conversationId);
+      return row?.status ?? null;
+    },
+    async enqueueFlowRun(ref) {
+      const queue = queueByName.get("flow-run");
+      if (!queue) throw new Error("flow-run queue is not registered");
+      await queue.add("flow-run", ref, { jobId: jobIdFor(`flowrun:${crypto.randomUUID()}`) });
     },
   };
 }
@@ -752,6 +868,11 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
     case "broadcast":
       return processBroadcast(buildProdPorts(db), job.data as { broadcastId: string });
     case "flow-run":
+      // Collect-input timeout markers share the queue with runs: a
+      // marker claims its wait and (usually) enqueues the real resume.
+      if (isFlowWaitTimeout(job.data)) {
+        return processFlowWaitTimeout(buildProdPorts(db), job.data.flowWaitTimeoutId);
+      }
       return processFlowRun(buildProdPorts(db), job.data as FlowRunJobData | FlowRunRef);
     case "token-refresh":
       if (job.name === "scan") {
