@@ -257,4 +257,23 @@ describe("telegram fetchOwnAvatar (avatar proxy source)", () => {
     const tg = new TelegramAdapter({ credentials: creds, fetchFn });
     expect(await tg.fetchOwnAvatar({ botToken: "123456:TEST-TOKEN", botId: "555000111" })).toBeNull();
   });
+
+  test("publish sends to targetExternalId (channel chat), token resolved from the bot account (item H)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { ok: true, result: { message_id: 99 } } }]);
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    const res = await tg.publish({
+      account: ACCOUNT, // externalId 555000111 = the bot itself
+      targetExternalId: "@kampungchannel",
+      text: "Kelas baru dibuka!",
+      idempotencyKey: "post-1",
+    });
+    expect(res).toEqual({ externalPostId: "99" });
+    // The bot token (from the account's credentials) authorizes the call…
+    expect(calls[0]!.url).toBe("https://api.telegram.org/bot123456:TEST-TOKEN/sendMessage");
+    // …but the DESTINATION is the channel chat, not the bot itself.
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      chat_id: "@kampungchannel",
+      text: "Kelas baru dibuka!",
+    });
+  });
 });

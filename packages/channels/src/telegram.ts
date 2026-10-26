@@ -280,11 +280,14 @@ export class TelegramAdapter implements ChannelAdapter {
   }
 
   async publish(input: PublishInput): Promise<{ externalPostId: string }> {
-    // Publishing to a Telegram channel = sending to the channel chat id,
-    // which the caller passes as the account's publish target in externalId.
+    // Publishing to Telegram = sending to a channel CHAT with the bot's
+    // token. The destination is input.targetExternalId (the API requires
+    // it for telegram post targets — a bot cannot post to itself, which
+    // is what account.externalId, the bot's own user id, would mean).
+    // Credentials still resolve from input.account (id / tokenVaultRef).
     const result = await this.send({
       account: input.account,
-      toExternalId: input.account.externalId,
+      toExternalId: input.targetExternalId ?? input.account.externalId,
       text: input.text,
       media: input.mediaUrls?.[0] ? { type: "photo", link: input.mediaUrls[0] } : undefined,
       idempotencyKey: input.idempotencyKey,

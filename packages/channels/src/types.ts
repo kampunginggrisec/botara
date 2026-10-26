@@ -257,6 +257,14 @@ export interface SendResult {
 
 export interface PublishInput {
   account: ChannelAccountRef;
+  /**
+   * Publish DESTINATION when it differs from the account identity
+   * (item H): Telegram accounts are bots — publish() sends to this
+   * channel chat (chat ID or @username) instead of the bot itself.
+   * Credential resolution always uses `account` (id / tokenVaultRef);
+   * only adapters whose publish target is a chat (Telegram) read this.
+   */
+  targetExternalId?: string;
   text?: string;
   mediaUrls?: string[];
   /** Hint when a single media URL is given (Threads container media_type, IG media kind). */

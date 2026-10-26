@@ -983,6 +983,14 @@ export type ScheduledPostRow = typeof scheduledPosts.$inferSelect;
 export interface ScheduledPostTarget {
   channelAccountId: string;
   channel: string;
+  /**
+   * Publish DESTINATION distinct from the account identity (item H):
+   * Telegram accounts are bots, and a bot cannot post to itself — a
+   * telegram target names the channel chat (chat ID or @username) the
+   * post goes to. Required for telegram targets (API-enforced);
+   * credentials always resolve from channelAccountId, never from this.
+   */
+  targetExternalId?: string;
 }
 
 export type ScheduledPostResults = Record<
@@ -1059,6 +1067,7 @@ export async function updateScheduledPost(
   patch: {
     text?: string;
     mediaUrls?: string[];
+    targets?: ScheduledPostTarget[];
     scheduledAt?: Date | null;
     status?: string;
     results?: ScheduledPostResults;
@@ -1069,6 +1078,7 @@ export async function updateScheduledPost(
     .set({
       ...(patch.text !== undefined ? { text: patch.text } : {}),
       ...(patch.mediaUrls !== undefined ? { mediaUrls: patch.mediaUrls } : {}),
+      ...(patch.targets !== undefined ? { targets: patch.targets } : {}),
       ...(patch.scheduledAt !== undefined ? { scheduledAt: patch.scheduledAt } : {}),
       ...(patch.status !== undefined ? { status: patch.status } : {}),
       ...(patch.results !== undefined ? { results: patch.results } : {}),

@@ -415,7 +415,7 @@ function buildPublishPorts(db: Database): PublishPorts {
     async loadPost(postId): Promise<ScheduledPostSnapshot | null> {
       const row = await getScheduledPostById(db, postId);
       if (!row) return null;
-      const rawTargets = (row.targets as Array<{ channelAccountId: string; channel: string }>) ?? [];
+      const rawTargets = (row.targets as Array<{ channelAccountId: string; channel: string; targetExternalId?: string }>) ?? [];
       const targets: ScheduledPostSnapshot["targets"] = [];
       for (const t of rawTargets) {
         const account = await getChannelAccount(db, row.workspaceId, t.channelAccountId);
@@ -427,6 +427,7 @@ function buildPublishPorts(db: Database): PublishPorts {
           channelAccountId: account.id,
           channel: account.channel,
           accountExternalId: account.externalId,
+          targetExternalId: t.targetExternalId,
           authMode: account.authMode ?? undefined,
           tokenVaultRef: account.tokenVaultRef ?? undefined,
         });

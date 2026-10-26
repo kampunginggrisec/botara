@@ -1,6 +1,6 @@
 import {
   broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
-  messages, processedComments, sequenceEnrollments, sequences, templates, webchatSessions,
+  messages, processedComments, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains,
   type Database,
 } from "@botara/db";
@@ -285,6 +285,7 @@ export interface FakeDatabase {
     growthLinks: Row[];
     costLedger: Row[];
     workspaceDomains: Row[];
+    scheduledPosts: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -305,6 +306,7 @@ export function createFakeDatabase(): FakeDatabase {
     growthLinks: [] as Row[],
     costLedger: [] as Row[],
     workspaceDomains: [] as Row[],
+    scheduledPosts: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -321,6 +323,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(growthLinks, store.growthLinks);
   core.register(costLedger, store.costLedger);
   core.register(workspaceDomains, store.workspaceDomains);
+  core.register(scheduledPosts, store.scheduledPosts);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),

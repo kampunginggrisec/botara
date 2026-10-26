@@ -16,6 +16,13 @@ export interface PublishTargetSnapshot {
   channelAccountId: string;
   channel: string;
   accountExternalId: string;
+  /**
+   * Publish destination distinct from the account identity (item H):
+   * telegram targets name the channel chat the bot posts to. Passed
+   * through to PublishInput.targetExternalId; credential resolution
+   * keeps using channelAccountId / tokenVaultRef.
+   */
+  targetExternalId?: string;
   authMode?: string;
   tokenVaultRef?: string;
 }
@@ -134,6 +141,7 @@ export async function processPublish(
           authMode: target.authMode,
           tokenVaultRef: target.tokenVaultRef,
         },
+        targetExternalId: target.targetExternalId,
         text: post.text,
         mediaUrls: post.mediaUrls,
         idempotencyKey: `post:${post.id}:${target.channelAccountId}`,

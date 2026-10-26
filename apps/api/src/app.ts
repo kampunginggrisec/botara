@@ -3885,7 +3885,44 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     scheduledAt: iso(p.scheduledAt),
   });
 
-  const postTargetSchema = z.object({ channelAccountId: z.string().min(1) });
+  const postTargetSchema = z.object({
+    channelAccountId: z.string().min(1),
+    targetExternalId: z.string().min(1).optional(),
+  });
+
+  /**
+   * Resolve post targets against the workspace's accounts (item H).
+   * Telegram targets REQUIRE targetExternalId: the account is a bot and
+   * a bot cannot post to itself — the target names the channel chat
+   * (chat ID or @username, bot must be an admin there). The stored
+   * target denormalizes the account's channel for the worker snapshot.
+   */
+  async function resolvePostTargets(
+    db: Database,
+    ws: string,
+    raw: Array<{ channelAccountId: string; targetExternalId?: string }>,
+  ): Promise<ScheduledPostTarget[]> {
+    const targets: ScheduledPostTarget[] = [];
+    for (const t of raw) {
+      const account = await getChannelAccount(db, ws, t.channelAccountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", `Channel account ${t.channelAccountId} not found.`, { status: 404 });
+      }
+      if (account.channel === "telegram" && !t.targetExternalId) {
+        throw new AppError(
+          "VALIDATION",
+          "Telegram publish targets require targetExternalId: the channel chat ID or @username the bot should post to (a bot cannot post to itself).",
+          { status: 400 },
+        );
+      }
+      targets.push({
+        channelAccountId: account.id,
+        channel: account.channel,
+        ...(t.targetExternalId ? { targetExternalId: t.targetExternalId } : {}),
+      });
+    }
+    return targets;
+  }
 
   const createPostRoute = createRoute({
     method: "post", path: "/posts",
@@ -3914,14 +3951,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (!body.text && (!body.mediaUrls || body.mediaUrls.length === 0)) {
       throw new AppError("VALIDATION", "A post needs text or at least one media URL.", { status: 400 });
     }
-    const targets: ScheduledPostTarget[] = [];
-    for (const t of body.targets) {
-      const account = await getChannelAccount(db, ws, t.channelAccountId);
-      if (!account) {
-        throw new AppError("NOT_FOUND", `Channel account ${t.channelAccountId} not found.`, { status: 404 });
-      }
-      targets.push({ channelAccountId: account.id, channel: account.channel });
-    }
+    const targets = await resolvePostTargets(db, ws, body.targets);
     const post = await createScheduledPost(db, {
       workspaceId: ws,
       text: body.text,
@@ -3969,6 +3999,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
             schema: z.object({
               text: z.string().optional(),
               mediaUrls: z.array(z.string().url()).optional(),
+              targets: z.array(postTargetSchema).min(1).optional(),
               scheduledAt: z.string().datetime().nullable().optional(),
               status: z.enum(["draft", "scheduled", "cancelled"]).optional(),
             }),
@@ -3992,6 +4023,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     await updateScheduledPost(db, id, {
       text: body.text,
       mediaUrls: body.mediaUrls,
+      targets: body.targets === undefined ? undefined : await resolvePostTargets(db, ws, body.targets),
       scheduledAt: body.scheduledAt === undefined ? undefined : body.scheduledAt === null ? null : new Date(body.scheduledAt),
       status: body.status,
     });

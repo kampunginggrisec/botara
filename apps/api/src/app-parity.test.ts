@@ -33,6 +33,8 @@ let admin: Registered;
 let other: Registered;
 let contactId: string;
 let conversationId: string;
+let whatsappAccountId: string;
+let telegramAccountId: string;
 
 beforeAll(async () => {
   fake = createFakeDatabase();
@@ -57,6 +59,12 @@ beforeAll(async () => {
   const account = await createChannelAccount(fake.db, {
     workspaceId: admin.workspaceId, channel: "whatsapp", externalId: "628999000111",
   });
+  whatsappAccountId = account.id;
+  const telegramAccount = await createChannelAccount(fake.db, {
+    workspaceId: admin.workspaceId, channel: "telegram", externalId: "8808425227",
+    displayName: "@botaramyid_bot",
+  });
+  telegramAccountId = telegramAccount.id;
   const conversation = await createConversation(fake.db, {
     workspaceId: admin.workspaceId, channelAccountId: account.id, contactId,
   });
@@ -192,6 +200,61 @@ describe("GET /admin/connection-info (F11)", () => {
     expect(forbidden.status).toBe(403);
     const anon = await app.request("/admin/connection-info");
     expect(anon.status).toBe(401);
+  });
+});
+
+describe("post targets: telegram destination (item H)", () => {
+  const postJson = (targets: unknown, text = "Pengumuman") => ({
+    method: "POST",
+    headers: { ...admin.headers, "content-type": "application/json" },
+    body: JSON.stringify({ text, targets }),
+  });
+
+  test("telegram target without targetExternalId is a 400 with a clear message", async () => {
+    const res = await app.request("/posts", postJson([{ channelAccountId: telegramAccountId }]));
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { message?: string; error?: { message?: string } };
+    const message = body.message ?? body.error?.message ?? "";
+    expect(message).toContain("targetExternalId");
+  });
+
+  test("telegram target with targetExternalId persists it; whatsapp target needs none", async () => {
+    const res = await app.request("/posts", postJson([
+      { channelAccountId: telegramAccountId, targetExternalId: "@kampungchannel" },
+      { channelAccountId: whatsappAccountId },
+    ]));
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as {
+      post: { id: string; targets: Array<{ channel: string; targetExternalId?: string }> };
+    };
+    const telegram = body.post.targets.find((t) => t.channel === "telegram");
+    expect(telegram?.targetExternalId).toBe("@kampungchannel");
+    const whatsapp = body.post.targets.find((t) => t.channel === "whatsapp");
+    expect(whatsapp?.targetExternalId).toBeUndefined();
+
+    // PATCH round-trips a changed destination…
+    const patched = await app.request(`/posts/${body.post.id}`, {
+      method: "PATCH",
+      headers: { ...admin.headers, "content-type": "application/json" },
+      body: JSON.stringify({
+        targets: [{ channelAccountId: telegramAccountId, targetExternalId: "-1001234567890" }],
+      }),
+    });
+    expect(patched.status).toBe(200);
+    const patchedBody = (await patched.json()) as {
+      post: { targets: Array<{ channelAccountId: string; channel: string; targetExternalId?: string }> };
+    };
+    expect(patchedBody.post.targets).toEqual([
+      { channelAccountId: telegramAccountId, channel: "telegram", targetExternalId: "-1001234567890" },
+    ]);
+
+    // …and PATCH dropping the destination off a telegram target is a 400.
+    const dropped = await app.request(`/posts/${body.post.id}`, {
+      method: "PATCH",
+      headers: { ...admin.headers, "content-type": "application/json" },
+      body: JSON.stringify({ targets: [{ channelAccountId: telegramAccountId }] }),
+    });
+    expect(dropped.status).toBe(400);
   });
 });
 
