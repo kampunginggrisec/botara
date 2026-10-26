@@ -164,17 +164,20 @@ export class ThreadsAdapter implements ChannelAdapter {
    * (unlike the exchange's lossy numeric user_id) plus the username used
    * for display names. Best-effort: returns {} on any failure.
    */
-  async getProfile(input: { accessToken: string }): Promise<{ userId?: string; username?: string; name?: string }> {
+  async getProfile(input: { accessToken: string }): Promise<{ userId?: string; username?: string; name?: string; avatarUrl?: string }> {
     const url = new URL(`${this.base()}/me`);
-    url.searchParams.set("fields", "id,username,name");
+    url.searchParams.set("fields", "id,username,name,threads_profile_picture_url");
     url.searchParams.set("access_token", input.accessToken);
     const res = await this.fetchFn(url.toString());
     if (!res.ok) return {};
-    const json = (await res.json().catch(() => ({}))) as { id?: string | number; username?: string; name?: string };
+    const json = (await res.json().catch(() => ({}))) as {
+      id?: string | number; username?: string; name?: string; threads_profile_picture_url?: string;
+    };
     return {
       userId: json.id !== undefined ? String(json.id) : undefined,
       username: json.username,
       name: json.name,
+      avatarUrl: json.threads_profile_picture_url,
     };
   }
 

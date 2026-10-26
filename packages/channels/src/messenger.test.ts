@@ -139,3 +139,28 @@ describe("messenger webhooks", () => {
     }
   });
 });
+
+describe("messenger page picture (onboarding avatar)", () => {
+  test("fetchPagePictureUrl returns picture.data.url", async () => {
+    const { fetchFn, calls } = mockFetch([{
+      body: { picture: { data: { url: "https://cdn.example.com/page-pic.jpg", width: 200, height: 200 } } },
+    }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    const url = await msgr.fetchPagePictureUrl({ pageId: "page-1", pageAccessToken: PAGE_TOKEN });
+    expect(url).toBe("https://cdn.example.com/page-pic.jpg");
+    expect(calls[0]!.url).toContain("/page-1?");
+    expect(calls[0]!.url).toContain("fields=picture");
+  });
+
+  test("fetchPagePictureUrl returns null when the Page has no picture", async () => {
+    const { fetchFn } = mockFetch([{ body: { id: "page-1" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    expect(await msgr.fetchPagePictureUrl({ pageId: "page-1", pageAccessToken: PAGE_TOKEN })).toBeNull();
+  });
+
+  test("fetchPagePictureUrl returns null on an API error (best-effort)", async () => {
+    const { fetchFn } = mockFetch([{ status: 400, body: { error: { message: "nope" } } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    expect(await msgr.fetchPagePictureUrl({ pageId: "page-1", pageAccessToken: PAGE_TOKEN })).toBeNull();
+  });
+});

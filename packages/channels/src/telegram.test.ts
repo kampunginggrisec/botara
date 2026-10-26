@@ -172,3 +172,89 @@ describe("telegram adapter", () => {
     expect(await tg.parseWebhook({ update_id: 1, callback_query: { id: "x" } })).toEqual([]);
   });
 });
+
+describe("telegram fetchOwnAvatar (avatar proxy source)", () => {
+  const JPEG_BYTES = new Uint8Array([0xff, 0xd8, 0xff, 0x01, 0x02, 0x03]);
+
+  function avatarFetch(options: {
+    photos?: Array<Array<{ file_id: string; width: number; height: number }>>;
+    photosOk?: boolean;
+  }) {
+    const calls: Array<{ url: string; init?: RequestInit }> = [];
+    const fetchFn: FetchLike = async (input, init) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url.endsWith("/getMe")) {
+        return new Response(JSON.stringify({ ok: true, result: { id: 555000111, is_bot: true } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.endsWith("/getUserProfilePhotos")) {
+        if (options.photosOk === false) {
+          return new Response(JSON.stringify({ ok: false, error_code: 400, description: "bad request" }), {
+            status: 400, headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({
+          ok: true,
+          result: { total_count: (options.photos ?? []).length, photos: options.photos ?? [] },
+        }), { status: 200, headers: { "Content-Type": "application/json" } });
+      }
+      if (url.endsWith("/getFile")) {
+        return new Response(JSON.stringify({ ok: true, result: { file_path: "photos/file_1.jpg" } }), {
+          status: 200, headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/file/bot")) {
+        return new Response(JPEG_BYTES, { status: 200, headers: { "Content-Type": "image/jpeg" } });
+      }
+      throw new Error(`unexpected url ${url}`);
+    };
+    return { fetchFn, calls };
+  }
+
+  test("photo found -> bytes + content type, mid size picked, bot id from getMe when omitted", async () => {
+    const { fetchFn, calls } = avatarFetch({
+      photos: [[
+        { file_id: "small", width: 160, height: 160 },
+        { file_id: "mid", width: 320, height: 320 },
+        { file_id: "large", width: 640, height: 640 },
+      ]],
+    });
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    const out = await tg.fetchOwnAvatar({ botToken: "123456:TEST-TOKEN" });
+    expect(out).not.toBeNull();
+    expect(out!.contentType).toBe("image/jpeg");
+    expect(out!.bytes).toEqual(JPEG_BYTES);
+    // The getFile call must target the second-smallest size.
+    const getFileCall = calls.find((c) => c.url.endsWith("/getFile"))!;
+    expect(JSON.parse(getFileCall.init!.body as string)).toEqual({ file_id: "mid" });
+    // user_id came from getMe (botId omitted).
+    const photosCall = calls.find((c) => c.url.endsWith("/getUserProfilePhotos"))!;
+    expect(JSON.parse(photosCall.init!.body as string)).toEqual({ user_id: 555000111, limit: 1 });
+  });
+
+  test("explicit botId skips getMe", async () => {
+    const { fetchFn, calls } = avatarFetch({
+      photos: [[{ file_id: "only", width: 160, height: 160 }]],
+    });
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    const out = await tg.fetchOwnAvatar({ botToken: "123456:TEST-TOKEN", botId: "555000111" });
+    expect(out).not.toBeNull();
+    expect(calls.some((c) => c.url.endsWith("/getMe"))).toBe(false);
+    const getFileCall = calls.find((c) => c.url.endsWith("/getFile"))!;
+    expect(JSON.parse(getFileCall.init!.body as string)).toEqual({ file_id: "only" });
+  });
+
+  test("no profile photo -> null", async () => {
+    const { fetchFn } = avatarFetch({ photos: [] });
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    expect(await tg.fetchOwnAvatar({ botToken: "123456:TEST-TOKEN", botId: "555000111" })).toBeNull();
+  });
+
+  test("telegram API error -> null (never throws)", async () => {
+    const { fetchFn } = avatarFetch({ photosOk: false });
+    const tg = new TelegramAdapter({ credentials: creds, fetchFn });
+    expect(await tg.fetchOwnAvatar({ botToken: "123456:TEST-TOKEN", botId: "555000111" })).toBeNull();
+  });
+});

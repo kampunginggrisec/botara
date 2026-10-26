@@ -59,7 +59,12 @@ export class TelegramAdapter implements ChannelAdapter {
 
   private async call<T>(account: ChannelAccountRef, method: string, body?: Record<string, unknown>): Promise<T> {
     const token = await this.tokenFor(account);
-    const res = await this.fetchFn(`${this.baseUrl}/bot${token}/${method}`, {
+    return this.callWithToken<T>(token, method, body);
+  }
+
+  /** Same as call(), with the bot token supplied directly (pre-vault / proxy flows). */
+  private async callWithToken<T>(botToken: string, method: string, body?: Record<string, unknown>): Promise<T> {
+    const res = await this.fetchFn(`${this.baseUrl}/bot${botToken}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body ?? {}),
@@ -98,6 +103,48 @@ export class TelegramAdapter implements ChannelAdapter {
   /** Register the webhook with an EXPLICIT token (connect flow, pre-vault). */
   async setWebhookWithToken(input: { url: string; secretToken?: string }): Promise<{ ok: true }> {
     return this.setWebhook({ id: "", externalId: "" }, input);
+  }
+
+  /**
+   * The bot's OWN profile photo as raw bytes, for the API's authenticated
+   * avatar proxy. Telegram file URLs embed the bot token
+   * (https://api.telegram.org/file/bot<TOKEN>/...), so they must never be
+   * stored on the account row or rendered by a client - the bytes are
+   * fetched here and streamed by the API instead. `botId` is the bot's own
+   * user id (the channel account's externalId); when omitted it is
+   * resolved via getMe. Best-effort: null when the bot has no profile
+   * photo or any call fails.
+   */
+  async fetchOwnAvatar(input: {
+    botToken: string;
+    botId?: string;
+  }): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+    try {
+      const botId = input.botId
+        ?? String((await this.callWithToken<{ id: number }>(input.botToken, "getMe")).id);
+      const photos = await this.callWithToken<{
+        total_count: number;
+        photos: Array<Array<{ file_id: string; width: number; height: number }>>;
+      }>(input.botToken, "getUserProfilePhotos", { user_id: Number(botId), limit: 1 });
+      const sizes = photos.photos?.[0];
+      if (!sizes || sizes.length === 0) return null;
+      // PhotoSize entries ascend by dimension. Take the second-smallest
+      // when offered (typically 320px - plenty for a 40px avatar) and
+      // never the full-size original.
+      const size = sizes[Math.min(1, sizes.length - 1)]!;
+      const file = await this.callWithToken<{ file_path?: string }>(
+        input.botToken, "getFile", { file_id: size.file_id },
+      );
+      if (!file.file_path) return null;
+      const res = await this.fetchFn(`${this.baseUrl}/file/bot${input.botToken}/${file.file_path}`);
+      if (!res.ok) return null;
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length === 0) return null;
+      const contentType = res.headers.get("content-type") ?? telegramFileContentType(file.file_path);
+      return { bytes, contentType };
+    } catch {
+      return null;
+    }
   }
 
   // --- account lifecycle ---------------------------------------------------
@@ -380,4 +427,13 @@ function telegramMediaOf(msg: TelegramMessage): MessageMedia | undefined {
     return { type: "sticker", id: msg.sticker.file_id };
   }
   return undefined;
+}
+
+/** Content type for a Telegram file download when the response omits one. */
+function telegramFileContentType(filePath: string): string {
+  const ext = filePath.split(".").pop()?.toLowerCase();
+  if (ext === "png") return "image/png";
+  if (ext === "webp") return "image/webp";
+  if (ext === "gif") return "image/gif";
+  return "image/jpeg";
 }

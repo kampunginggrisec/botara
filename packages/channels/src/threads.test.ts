@@ -195,8 +195,21 @@ describe("threads onboarding identity", () => {
     const profile = await th.getProfile({ accessToken: "long-tok" });
     expect(profile.userId).toBe("29490699623849312");
     expect(profile.username).toBe("syahid");
+    expect(profile.avatarUrl).toBeUndefined();
     expect(calls[0]!.url).toContain("https://graph.threads.net/v1.0/me?");
-    expect(calls[0]!.url).toContain("fields=id%2Cusername%2Cname");
+    expect(calls[0]!.url).toContain("fields=id%2Cusername%2Cname%2Cthreads_profile_picture_url");
+  });
+
+  test("getProfile returns the profile picture url when /me provides one", async () => {
+    const { fetchFn } = mockFetch([{
+      body: {
+        id: "29490699623849312", username: "syahid",
+        threads_profile_picture_url: "https://cdn.example.com/threads-pic.jpg",
+      },
+    }]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    const profile = await th.getProfile({ accessToken: "long-tok" });
+    expect(profile.avatarUrl).toBe("https://cdn.example.com/threads-pic.jpg");
   });
 
   test("getProfile returns {} on an API error (best-effort)", async () => {

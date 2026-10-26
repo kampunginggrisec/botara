@@ -156,6 +156,28 @@ export class MessengerAdapter implements ChannelAdapter {
       .map((p) => ({ id: String(p.id), name: p.name ?? String(p.id), accessToken: p.access_token! }));
   }
 
+  /**
+   * Onboarding-time helper (API layer): the Page's public profile picture
+   * URL (GET /{page-id}?fields=picture with the Page token) for the
+   * Channels account card. Best-effort - null on any failure or when the
+   * Page has no picture; a missing avatar never fails a connect.
+   */
+  async fetchPagePictureUrl(input: { pageId: string; pageAccessToken: string }): Promise<string | null> {
+    try {
+      const url = new URL(`${this.baseUrl}/${this.apiVersion}/${input.pageId}`);
+      url.searchParams.set("fields", "picture");
+      url.searchParams.set("access_token", input.pageAccessToken);
+      const res = await this.fetchFn(url.toString());
+      if (!res.ok) return null;
+      const json = (await res.json().catch(() => ({}))) as {
+        picture?: { data?: { url?: string } };
+      };
+      return json.picture?.data?.url ?? null;
+    } catch {
+      return null;
+    }
+  }
+
   async refreshTokenIfNeeded(): Promise<{ refreshed: boolean }> {
     // Page access tokens derived from a long-lived user token do not expire.
     return { refreshed: false };
