@@ -256,6 +256,13 @@ export const id: Dictionary = {
 
   "channels.title": "Channel",
   "channels.subtitle": "Hubungkan channel pesan ke workspace ini. Kredensial disimpan terenkripsi di token vault - tidak akan ditampilkan lagi.",
+  "channels.connectAccount": "Hubungkan Akun",
+  "channels.allPlatforms": "Semua platform",
+  "channels.connectedOn": "Terhubung {date}",
+  "channels.disconnect": "Putuskan",
+  "channels.disconnectConfirm": "Yakin putuskan?",
+  "channels.disconnected": "{name} diputuskan.",
+  "channels.disconnectFailed": "Gagal memutuskan akun.",
   "channels.connectedTitle": "Akun terhubung",
   "channels.connectedEmpty": "Belum ada akun channel terhubung. Gunakan kartu koneksi di bawah.",
   "channels.coexistence": "Coexistence",

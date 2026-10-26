@@ -258,6 +258,13 @@ export const en = {
 
   "channels.title": "Channels",
   "channels.subtitle": "Connect messaging channels to this workspace. Credentials are stored encrypted in the token vault - they are never shown again.",
+  "channels.connectAccount": "Connect Account",
+  "channels.allPlatforms": "All platforms",
+  "channels.connectedOn": "Connected {date}",
+  "channels.disconnect": "Disconnect",
+  "channels.disconnectConfirm": "Confirm disconnect?",
+  "channels.disconnected": "{name} disconnected.",
+  "channels.disconnectFailed": "Failed to disconnect the account.",
   "channels.connectedTitle": "Connected accounts",
   "channels.connectedEmpty": "No channel accounts connected yet. Use the connect cards below.",
   "channels.coexistence": "Coexistence",

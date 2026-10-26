@@ -1800,6 +1800,22 @@ function CatalogSyncSection({ accountId }: { accountId: string }) {
   );
 }
 
+const CHANNEL_META: Record<string, { label: string; glyph: string; accent: string }> = {
+  whatsapp: { label: "WhatsApp", glyph: "W", accent: "bg-emerald-500" },
+  telegram: { label: "Telegram", glyph: "T", accent: "bg-sky-500" },
+  instagram: { label: "Instagram", glyph: "I", accent: "bg-rose-500" },
+  threads: { label: "Threads", glyph: "@", accent: "bg-slate-900 dark:bg-slate-600" },
+  messenger: { label: "Messenger", glyph: "M", accent: "bg-blue-600" },
+  tiktok: { label: "TikTok", glyph: "♪", accent: "bg-slate-800 dark:bg-slate-600" },
+  webchat: { label: "Webchat", glyph: "W", accent: "bg-violet-500" },
+};
+
+const CHANNEL_ORDER = ["whatsapp", "telegram", "instagram", "threads", "messenger", "tiktok", "webchat"] as const;
+
+function channelMeta(channel: string): { label: string; glyph: string; accent: string } {
+  return CHANNEL_META[channel] ?? { label: channel, glyph: channel.charAt(0).toUpperCase(), accent: "bg-slate-500" };
+}
+
 function ChannelsPage() {
   const { t } = useI18n();
   const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
@@ -1812,6 +1828,9 @@ function ChannelsPage() {
   const [busy, setBusy] = useState(false);
   const [pendingPages, setPendingPages] = useState<Array<{ id: string; name: string }> | null>(null);
   const [copied, setCopied] = useState(false);
+  const [platformFilter, setPlatformFilter] = useState<string>("all");
+  const [confirmDisconnectId, setConfirmDisconnectId] = useState<string | null>(null);
+  const [disconnectBusyId, setDisconnectBusyId] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -1962,11 +1981,41 @@ function ChannelsPage() {
     } catch { /* clipboard unavailable in this browser context */ }
   };
 
+  const disconnect = async (a: ChannelAccount) => {
+    setDisconnectBusyId(a.id);
+    try {
+      await api.deleteChannelAccount(a.id);
+      pushToast("ok", t("channels.disconnected", { name: a.displayName ?? a.channel }));
+      setConfirmDisconnectId(null);
+      await load();
+    } catch (err) {
+      pushToast("err", errText(err, t("channels.disconnectFailed")));
+    } finally {
+      setDisconnectBusyId(null);
+    }
+  };
+
   const connectCard = "rounded-lg border border-slate-200 bg-white p-4 shadow-sm dark:border-slate-800 dark:bg-slate-900";
 
+  const filteredAccounts = platformFilter === "all" ? accounts : accounts.filter((a) => a.channel === platformFilter);
+  const pillBase = "inline-flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-xs font-medium transition-colors";
+  const pillActive = "border-sky-400 bg-sky-50 text-sky-900 dark:border-sky-700 dark:bg-sky-950 dark:text-sky-200";
+  const pillInactive = "border-slate-200 bg-white text-slate-600 hover:border-slate-300 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300";
+
   return (
-    <div>
-      <PageTitle title={t("channels.title")} subtitle={t("channels.subtitle")} />
+    <div className="max-w-[1400px]">
+      <div className="flex flex-wrap items-start justify-between gap-4">
+        <div>
+          <PageTitle title={t("channels.title")} subtitle={t("channels.subtitle")} />
+        </div>
+        <button
+          type="button"
+          onClick={() => document.getElementById("connect-channels")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+          className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900"
+        >
+          {`+ ${t("channels.connectAccount")}`}
+        </button>
+      </div>
       {banner && (
         <div className="mt-4 max-w-3xl">
           {banner.kind === "ok" ? <NoticeBox>{banner.text}</NoticeBox> : <ErrorBox error={banner.text} />}
@@ -1976,26 +2025,141 @@ function ChannelsPage() {
       {notice && <div className="mt-4 max-w-3xl"><NoticeBox>{notice}</NoticeBox></div>}
 
       <h2 className="mt-6 text-base font-semibold">{t("channels.connectedTitle")}</h2>
-      <div className="mt-3 space-y-2 max-w-3xl">
-        {accounts.length === 0 && !error && <EmptyState>{t("channels.connectedEmpty")}</EmptyState>}
-        {accounts.map((a) => (
-          <div key={a.id} className={`${cardCls} p-3`}>
-            <div className="flex flex-wrap items-center gap-2">
-              <span className={chipCls}>{a.channel}</span>
-              <span className="font-medium text-sm">{a.displayName ?? a.externalId}</span>
-              <span className="text-xs text-slate-500 dark:text-slate-400">{a.status}</span>
-              {a.channel === "whatsapp" && a.isCoexistence && (
-                <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{t("channels.coexistence")}</span>
-              )}
-              <span className="text-xs text-slate-400 dark:text-slate-500">
-                {a.hasCredential ? t("channels.hasCredential") : t("channels.noCredential")}
-                {a.tokenExpiresAt ? ` · ${t("channels.expires", { date: new Date(a.tokenExpiresAt).toLocaleDateString() })}` : ""}
-              </span>
-            </div>
-            {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
+      {accounts.length > 0 && (
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setPlatformFilter("all")}
+            className={`${pillBase} ${platformFilter === "all" ? pillActive : pillInactive}`}
+          >
+            {`${t("channels.allPlatforms")} (${accounts.length})`}
+          </button>
+          {CHANNEL_ORDER.filter((ch) => accounts.some((a) => a.channel === ch)).map((ch) => {
+            const meta = channelMeta(ch);
+            const count = accounts.filter((a) => a.channel === ch).length;
+            return (
+              <button
+                key={ch}
+                type="button"
+                onClick={() => setPlatformFilter(ch)}
+                className={`${pillBase} ${platformFilter === ch ? pillActive : pillInactive}`}
+              >
+                <span className="font-semibold">{meta.glyph}</span>
+                {`${meta.label} (${count})`}
+              </button>
+            );
+          })}
+          {accounts
+            .map((a) => a.channel)
+            .filter((ch, idx, arr) => !(CHANNEL_ORDER as readonly string[]).includes(ch) && arr.indexOf(ch) === idx)
+            .map((ch) => {
+              const meta = channelMeta(ch);
+              const count = accounts.filter((a) => a.channel === ch).length;
+              return (
+                <button
+                  key={ch}
+                  type="button"
+                  onClick={() => setPlatformFilter(ch)}
+                  className={`${pillBase} ${platformFilter === ch ? pillActive : pillInactive}`}
+                >
+                  <span className="font-semibold">{meta.glyph}</span>
+                  {`${meta.label} (${count})`}
+                </button>
+              );
+            })}
+        </div>
+      )}
+      {accounts.length === 0 ? (
+        !error && (
+          <div className="mt-3">
+            <EmptyState>{t("channels.connectedEmpty")}</EmptyState>
           </div>
-        ))}
-      </div>
+        )
+      ) : filteredAccounts.length === 0 ? (
+        <div className="mt-3">
+          <EmptyState>{t("channels.connectedEmpty")}</EmptyState>
+        </div>
+      ) : (
+        <div className="mt-3 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4">
+          {filteredAccounts.map((a) => {
+            const meta = channelMeta(a.channel);
+            const handle = a.displayName ?? a.externalId;
+            return (
+              <div key={a.id} className={`flex flex-col ${cardCls} p-4`}>
+                <div className="flex items-center gap-2.5">
+                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white ${meta.accent}`}>{meta.glyph}</span>
+                  <span className="font-medium text-sm">{meta.label}</span>
+                  <span
+                    className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+                      a.status === "connected"
+                        ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300"
+                        : "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300"
+                    }`}
+                  >
+                    {a.status}
+                  </span>
+                  <span className="ml-auto" title={a.authMode ?? a.externalId}>
+                    <svg className="h-4 w-4 text-slate-300 dark:text-slate-600" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                      <circle cx="12" cy="12" r="10" />
+                      <line x1="12" y1="16" x2="12" y2="12" />
+                      <line x1="12" y1="8" x2="12.01" y2="8" />
+                    </svg>
+                  </span>
+                </div>
+                <div className="mt-3 truncate font-semibold" title={handle}>{handle}</div>
+                <div className="mt-1.5 flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                  <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                    <rect x="3" y="4" width="18" height="18" rx="2" ry="2" />
+                    <line x1="16" y1="2" x2="16" y2="6" />
+                    <line x1="8" y1="2" x2="8" y2="6" />
+                    <line x1="3" y1="10" x2="21" y2="10" />
+                  </svg>
+                  <span>{t("channels.connectedOn", { date: new Date(a.createdAt).toLocaleDateString() })}</span>
+                </div>
+                <div className="mt-1 text-xs text-slate-400 dark:text-slate-500">
+                  {a.hasCredential ? t("channels.hasCredential") : t("channels.noCredential")}
+                  {a.tokenExpiresAt ? ` · ${t("channels.expires", { date: new Date(a.tokenExpiresAt).toLocaleDateString() })}` : ""}
+                </div>
+                {a.channel === "whatsapp" && a.isCoexistence && (
+                  <div className="mt-2">
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{t("channels.coexistence")}</span>
+                  </div>
+                )}
+                {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
+                <div className="mt-auto pt-4">
+                  {confirmDisconnectId === a.id ? (
+                    <div className="flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void disconnect(a)}
+                        disabled={disconnectBusyId === a.id}
+                        className="flex-1 rounded-full bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-500 disabled:opacity-50"
+                      >
+                        {t("channels.disconnectConfirm")}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDisconnectId(null)}
+                        className="rounded-full border border-slate-300 px-4 py-2 text-sm dark:border-slate-700"
+                      >
+                        {t("common.cancel")}
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => setConfirmDisconnectId(a.id)}
+                      className="w-full rounded-full border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:border-red-300 hover:text-red-600 dark:border-slate-700 dark:text-slate-200 dark:hover:border-red-900 dark:hover:text-red-400"
+                    >
+                      {t("channels.disconnect")}
+                    </button>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
 
       {pendingPages !== null && (
         <div className="mt-6 max-w-3xl rounded-lg border border-sky-300 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950">
@@ -2014,8 +2178,9 @@ function ChannelsPage() {
         </div>
       )}
 
+      <div id="connect-channels" className="scroll-mt-6">
       <h2 className="mt-8 text-base font-semibold">{t("channels.connectTitle")}</h2>
-      <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4 max-w-4xl">
+      <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
         <div className={connectCard}>
           <div className="font-medium text-sm">{t("channels.whatsapp.title")}</div>
           <p className={`mt-1 ${mutedCls}`}>{t("channels.whatsapp.body")}</p>
@@ -2094,6 +2259,7 @@ function ChannelsPage() {
             {copied ? t("channels.webchat.copied") : t("channels.webchat.copy")}
           </button>
         </div>
+      </div>
       </div>
     </div>
   );
