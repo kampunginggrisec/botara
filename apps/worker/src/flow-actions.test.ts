@@ -211,3 +211,35 @@ describe("collect_input timeout processor", () => {
     expect(isFlowWaitTimeout(null)).toBe(false);
   });
 });
+
+describe("create_deal step (worker ports, package #6)", () => {
+  const dealFlow: Flow = {
+    id: "fd", version: 1, startNodeId: "t1",
+    nodes: [
+      { id: "t1", type: "trigger", trigger: "manual", config: {}, next: "d1" },
+      { id: "d1", type: "create_deal", pipelineId: "pipe-1", title: "Order baru", value: 1000, next: "s1" },
+      { id: "s1", type: "send_message", text: "done", next: null },
+    ],
+  };
+
+  test("the port receives the run's workspace/contact/conversation + node config", async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const f = fakePorts({
+      async createDeal(input) { seen.push({ ...input }); return true; },
+    });
+    const result = await processFlowRun(f.ports, { flow: dealFlow, event: { type: "manual" }, context: ctx });
+    expect(seen).toEqual([{
+      workspaceId: "ws1", contactId: "c1", conversationId: "conv1",
+      pipelineId: "pipe-1", title: "Order baru", value: 1000,
+    }]);
+    expect(result.actionWarnings).toEqual([]);
+    expect(f.sent.map((s) => s.text)).toEqual(["done"]);
+  });
+
+  test("a missing pipeline (port false) warns; the run completes", async () => {
+    const f = fakePorts({ async createDeal() { return false; } });
+    const result = await processFlowRun(f.ports, { flow: dealFlow, event: { type: "manual" }, context: ctx });
+    expect(result.actionWarnings).toEqual(['create_deal "Order baru": target not found - skipped']);
+    expect(result.state.status).toBe("completed");
+  });
+});

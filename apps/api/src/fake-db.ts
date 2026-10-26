@@ -1,7 +1,7 @@
 import {
-  auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, flows, flowWaits, growthLinks,
+  auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, deals, flows, flowWaits, growthLinks,
   kbChunks, kbDocuments,
-  messages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
+  messages, pipelines, pipelineStages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains, workspaces,
   type Database,
 } from "@botara/db";
@@ -315,6 +315,9 @@ export interface FakeDatabase {
     flowWaits: Row[];
     flows: Row[];
     workspaces: Row[];
+    pipelines: Row[];
+    pipelineStages: Row[];
+    deals: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -344,6 +347,9 @@ export function createFakeDatabase(): FakeDatabase {
     flowWaits: [] as Row[],
     flows: [] as Row[],
     workspaces: [] as Row[],
+    pipelines: [] as Row[],
+    pipelineStages: [] as Row[],
+    deals: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -369,6 +375,9 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(flowWaits, store.flowWaits);
   core.register(flows, store.flows);
   core.register(workspaces, store.workspaces);
+  core.register(pipelines, store.pipelines);
+  core.register(pipelineStages, store.pipelineStages);
+  core.register(deals, store.deals);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),

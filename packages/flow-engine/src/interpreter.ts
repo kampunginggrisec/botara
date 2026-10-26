@@ -130,7 +130,7 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
     case "sequence_unsubscribe":
       return { state: advance(node.next), actions: [{ type: "sequence_unsubscribe", sequenceId: node.sequenceId }] };
     case "create_deal": {
-      const title = node.title.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
+      const title = (node.title ?? "").replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
       return {
         state: advance(node.next),
         actions: [{

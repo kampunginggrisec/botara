@@ -40,6 +40,14 @@ describe("requiredScopeForRoute", () => {
     expect(requiredScopeForRoute("GET", "/kb/documents")).toEqual({ kind: "scope", scope: "kb:read" });
     expect(requiredScopeForRoute("POST", "/posts")).toEqual({ kind: "scope", scope: "posts:write" });
     expect(requiredScopeForRoute("POST", "/moderation/check")).toEqual({ kind: "scope", scope: "settings:write" });
+    // Package #6: pipelines are the deals board's frame - same resource.
+    expect(requiredScopeForRoute("GET", "/deals")).toEqual({ kind: "scope", scope: "deals:read" });
+    expect(requiredScopeForRoute("POST", "/deals")).toEqual({ kind: "scope", scope: "deals:write" });
+    expect(requiredScopeForRoute("PATCH", "/deals/abc")).toEqual({ kind: "scope", scope: "deals:write" });
+    expect(requiredScopeForRoute("GET", "/pipelines")).toEqual({ kind: "scope", scope: "deals:read" });
+    expect(requiredScopeForRoute("GET", "/pipelines/abc/summary")).toEqual({ kind: "scope", scope: "deals:read" });
+    expect(requiredScopeForRoute("POST", "/pipelines/abc/stages/reorder")).toEqual({ kind: "scope", scope: "deals:write" });
+    expect(requiredScopeForRoute("DELETE", "/pipelines/abc/stages/s1")).toEqual({ kind: "scope", scope: "deals:write" });
   });
 
   test("workspace administration maps to settings; the collection is not a resource route", () => {
