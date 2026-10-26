@@ -558,6 +558,25 @@ export async function createChannelAccount(
   return row!;
 }
 
+/**
+ * Hard-delete one channel account (Channels "disconnect"). Workspace-scoped:
+ * returns the deleted row, or null when no account with that id belongs to
+ * the workspace. Callers must surface FK violations (child rows in
+ * conversations/broadcasts/etc. reference this table without cascades).
+ */
+export async function deleteChannelAccount(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<ChannelAccountRow | null> {
+  const existing = await getChannelAccount(db, workspaceId, id);
+  if (!existing) return null;
+  await db
+    .delete(channelAccounts)
+    .where(and(eq(channelAccounts.id, id), eq(channelAccounts.workspaceId, workspaceId)));
+  return existing;
+}
+
 /** Worker-side lookup by provider identity (webhooks carry no workspace). */
 export async function findChannelAccountByExternal(
   db: Database,

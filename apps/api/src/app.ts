@@ -15,6 +15,7 @@ import {
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
+  deleteChannelAccount,
   applyTemplateCategoryChange,
   findOrCreateWebchatAccount, createConversation as createConversationRow,
   createWebchatSession, getWebchatSessionByToken, touchWebchatSession,
@@ -412,7 +413,7 @@ export function createReadinessChecker(
  */
 export function createDefaultVault(): TokenVaultPort {
   const memory = new InMemoryVault();
-  let real: { store: TokenVaultPort["store"] } | null | undefined;
+  let real: { store: TokenVaultPort["store"]; delete: TokenVaultPort["delete"] } | null | undefined;
   const resolveReal = () => {
     if (real !== undefined) return real;
     if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
@@ -420,7 +421,10 @@ export function createDefaultVault(): TokenVaultPort {
       const vault = createTokenVault(db, process.env, {
         write: async (entry) => { await insertAuditLog(db, entry); },
       });
-      real = { store: (input) => vault.store(input) };
+      real = {
+        store: (input) => vault.store(input),
+        delete: (ref) => vault.delete(ref),
+      };
     } else {
       real = null;
     }
@@ -430,6 +434,14 @@ export function createDefaultVault(): TokenVaultPort {
     async store(input) {
       const vault = resolveReal();
       return vault ? vault.store(input) : memory.store(input);
+    },
+    async delete(ref) {
+      const vault = resolveReal();
+      // Each vault is a no-op for refs it does not own (the real vault only
+      // parses vault:db:{id} refs, memory only holds its own refs), so both
+      // are asked - a stored ref lives in exactly one of them.
+      if (vault) await vault.delete(ref);
+      await memory.delete(ref);
     },
   };
 }
@@ -3101,6 +3113,55 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         };
       }),
     });
+  });
+
+  const deleteAccountRoute = createRoute({
+    method: "delete", path: "/channels/accounts/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Channel account disconnected (deleted)" } },
+  });
+  app.openapi(deleteAccountRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    let account;
+    try {
+      account = await deleteChannelAccount(db, ws, id);
+    } catch (err) {
+      // Child tables (conversations, broadcasts, sequences, ...) reference
+      // channel_accounts without ON DELETE CASCADE, so disconnecting an
+      // account that already carries data raises Postgres 23503 (possibly
+      // wrapped by drizzle as err.cause). Surface that as a typed 409.
+      let current: unknown = err;
+      let isFkViolation = false;
+      for (let depth = 0; depth < 3 && current; depth++) {
+        const candidate = current as { code?: unknown; message?: unknown; cause?: unknown };
+        if (candidate.code === "23503") isFkViolation = true;
+        if (typeof candidate.message === "string" && candidate.message.includes("violates foreign key constraint")) {
+          isFkViolation = true;
+        }
+        current = candidate.cause;
+      }
+      if (isFkViolation) {
+        throw new AppError(
+          "CONFLICT",
+          "This account still has conversations or other data attached, so it cannot be disconnected yet.",
+          { status: 409 },
+        );
+      }
+      throw err;
+    }
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    if (account.tokenVaultRef) {
+      await deps.vault.delete(account.tokenVaultRef).catch(() => undefined);
+    }
+    await deps.authStore.audit({
+      workspaceId: ws, userId: authContext(c).user.id,
+      action: "channel.disconnected",
+      details: { channel: account.channel, externalId: account.externalId },
+    }).catch(() => undefined);
+    return c.json({ deleted: true });
   });
 
   // ------------------------------------------------- Meta catalog sync

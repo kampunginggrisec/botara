@@ -22,6 +22,8 @@ import { CHANNEL_CAPABILITIES, type FetchLike } from "@botara/channels";
 export interface TokenVaultPort {
   /** Persist a secret and return an opaque reference for channel_accounts.token_vault_ref. */
   store(input: { channel: string; workspaceId: string; label: string; secret: string }): Promise<string>;
+  /** Remove the secret behind a vault ref; unknown refs are a no-op. */
+  delete(ref: string): Promise<void>;
 }
 
 /**
@@ -41,6 +43,10 @@ export class InMemoryVault implements TokenVaultPort {
     const ref = `vault:memory:${input.channel}:${input.workspaceId}:${crypto.randomUUID()}`;
     this.entries.set(ref, input.secret);
     return ref;
+  }
+
+  async delete(ref: string): Promise<void> {
+    this.entries.delete(ref);
   }
 
   /** Test/dev only: read a secret back by ref. Never exposed over HTTP. */
