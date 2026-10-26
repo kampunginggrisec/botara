@@ -19,3 +19,8 @@ export {
   type InterpolationWarning, type InterpolationResult, type VariableContext,
   type InterpolationContactInput, type InterpolationChannelInput,
 } from "./variables";
+export {
+  API_TOKEN_RESOURCES, API_TOKEN_SCOPES, isApiTokenScope, parseApiTokenScopes,
+  scopeCovers, grantsAnyRead, tokenIsRestricted,
+  type ApiTokenResource, type ApiTokenScope, type ApiTokenScopeLevel,
+} from "./api-tokens";
