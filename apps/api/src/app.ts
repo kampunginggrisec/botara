@@ -6,10 +6,11 @@ import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import {
   AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
-  countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, MessagingWindowClosedError,
+  buildVariableContext, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
+  MessagingWindowClosedError,
 } from "@botara/shared";
 import {
-  getDb, listContacts, getContact, createContact, updateContact, segmentCounts,
+  getDb, getWorkspaceById, listContacts, getContact, createContact, updateContact, segmentCounts,
   listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
   touchConversationLastUserMessage,
   listTemplates, createTemplate, updateTemplateLatestCategory,
@@ -47,7 +48,7 @@ import {
   StaticCredentialProvider, buildInstagramAuthorizeUrl, buildThreadsAuthorizeUrl,
   buildMessengerAuthorizeUrl, buildTikTokAuthorizeUrl, serializeTikTokTokenPair,
   verifyTikTokWebhookSignature,
-  richBlockSchema, richBlockText, richToPlainText,
+  interpolateRichBlock, richBlockSchema, richBlockText, richToPlainText,
   VaultCredentialProvider, envWhatsAppCredentials,
   type ChannelKey, type InboundEvent, type FetchLike, type InstagramAuthMode,
 } from "@botara/channels";
@@ -2290,17 +2291,31 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       },
     };
     const flow = toRunnableFlow(row.id, parsed.data);
+    // Test-runs interpolate against a synthetic contact built from the
+    // caller's contactFields (variables package #1), so the preview shows
+    // exactly what a real run would send for those fields.
+    const workspace = await getWorkspaceById(deps.getDatabase(), wsId).catch(() => null);
+    const interpolation = buildVariableContext({
+      contact: {
+        displayName: typeof variables.name === "string" ? variables.name : "Test Contact",
+        externalId: "test-contact",
+        channel: "test",
+        customFields: variables,
+      },
+      workspaceName: workspace?.name,
+    });
     const result = await runFlow(ports, flow, undefined, {
       type: "message.received",
       text: body.text ?? "",
       variables,
-    });
+    }, { interpolation });
     const actions: FlowAction[] = result.executed;
     return c.json({
       status: result.state.status,
       paused: result.paused,
       actions,
       variables: result.state.variables,
+      warnings: result.warnings,
     });
   });
 
@@ -2486,6 +2501,48 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       throw new AppError("VALIDATION", "text (or a rich block) is required for free-form replies.", { status: 400 });
     }
 
+    // Variable interpolation (variables package #1): free-form agent text
+    // and rich blocks render against THIS conversation's contact at send
+    // time, and the RENDERED content is what gets persisted and sent, so
+    // the thread always shows exactly what the customer received. Unknown
+    // variables render empty and come back as `interpolationWarnings`
+    // for the composer to surface. Template replies are NOT interpolated
+    // (their parameters are positional provider-side values).
+    let replyText = body.text;
+    let replyRich = body.rich;
+    let interpolationWarnings: string[] = [];
+    if (body.kind === "free_form" && (body.text || body.rich)) {
+      // Enrichment lookups are best-effort: a failed fetch degrades to
+      // fewer resolvable variables, never to a blocked reply.
+      const [contact, workspace] = await Promise.all([
+        getContact(db, ws, conversation.contactId).catch(() => null),
+        getWorkspaceById(db, ws).catch(() => null),
+      ]);
+      const varCtx = buildVariableContext({
+        contact: contact
+          ? {
+              displayName: contact.displayName,
+              externalId: contact.externalId,
+              channel: contact.channel,
+              tags: (contact.tags as string[]) ?? [],
+              customFields: (contact.customFields as Record<string, unknown>) ?? {},
+            }
+          : { externalId: conversation.contactExternalId, channel: conversation.channel },
+        workspaceName: workspace?.name,
+        channelAccount: account,
+      });
+      if (replyText) {
+        const rendered = interpolate(replyText, varCtx);
+        replyText = rendered.text;
+        interpolationWarnings.push(...rendered.warnings.map((w) => w.path));
+      }
+      if (replyRich) {
+        const rendered = interpolateRichBlock(replyRich, varCtx);
+        replyRich = rendered.block;
+        interpolationWarnings.push(...rendered.warnings.map((w) => w.path));
+      }
+    }
+
     const idempotencyKey = `reply:${id}:${crypto.randomUUID()}`;
     const message = await createMessage(db, {
       conversationId: id,
@@ -2497,8 +2554,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       // buttons/lists from it, the inbox thread shows read-only chips).
       body: body.kind === "template"
         ? templateInput!.name
-        : body.rich ? richToPlainText(body.rich) : body.text,
-      payload: body.kind === "free_form" && body.rich ? body.rich : undefined,
+        : replyRich ? richToPlainText(replyRich) : replyText,
+      payload: body.kind === "free_form" && replyRich ? replyRich : undefined,
       status: "queued",
       idempotencyKey,
     });
@@ -2517,8 +2574,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           tokenVaultRef: account.tokenVaultRef ?? undefined,
         },
         toExternalId: conversation.contactExternalId,
-        text: body.kind === "free_form" ? (body.text ?? (body.rich ? richBlockText(body.rich) : undefined)) : undefined,
-        rich: body.kind === "free_form" ? body.rich : undefined,
+        text: body.kind === "free_form" ? (replyText ?? (replyRich ? richBlockText(replyRich) : undefined)) : undefined,
+        rich: body.kind === "free_form" ? replyRich : undefined,
         template: templateInput,
         // Conversation-addressed channels (TikTok) send to the provider
         // conversation id learned from inbound events; the adapter
@@ -2535,6 +2592,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         message: { ...message, status: "sent", externalId: result.externalMessageId, createdAt: iso(message.createdAt) },
         window: decision,
         ...(result.warnings ? { warnings: result.warnings } : {}),
+        ...(interpolationWarnings.length > 0 ? { interpolationWarnings } : {}),
       });
     } catch (err) {
       await updateMessageStatus(db, message.id, "failed").catch(() => undefined);
@@ -3042,6 +3100,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
             schema: z.object({
               channelAccountId: z.string().min(1),
               templateId: z.string().optional(),
+              /**
+               * Ordered body positional parameter templates (variables
+               * package #1): each entry is interpolated PER RECIPIENT at
+               * send time. Requires templateId - they only make sense as
+               * a template's body components.
+               */
+              templateParams: z.array(z.string().min(1).max(1000)).max(25).optional(),
               name: z.string().optional(),
               tag: z.string().optional(),
               country: z.string().min(2).optional(),
@@ -3061,6 +3126,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
 
     const account = await getChannelAccount(db, ws, body.channelAccountId);
     if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+
+    if (body.templateParams && body.templateParams.length > 0 && !body.templateId) {
+      throw new AppError("VALIDATION", "templateParams requires a templateId: parameters only render into a template broadcast.", { status: 400 });
+    }
 
     // Reactive-only channels (TikTok) can never broadcast: the provider
     // forbids business-initiated messages entirely. Capability-driven -
@@ -3096,6 +3165,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       workspaceId: ws,
       channelAccountId: body.channelAccountId,
       templateId: body.templateId,
+      templateParams: body.templateParams,
       name: body.name,
       tag: body.tag,
       country,
@@ -4225,6 +4295,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       name: z.string().min(1),
       language: z.string().min(1),
       latestCategory: z.string().min(1),
+      /** Per-recipient body parameter templates (variables package #1). */
+      templateParams: z.array(z.string().min(1).max(1000)).max(25).optional(),
     }).optional(),
   });
 

@@ -2,7 +2,7 @@ import {
   auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
   kbChunks, kbDocuments,
   messages, processedComments, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
-  workspaceDomains,
+  workspaceDomains, workspaces,
   type Database,
 } from "@botara/db";
 
@@ -310,6 +310,7 @@ export interface FakeDatabase {
     auditLog: Row[];
     kbDocuments: Row[];
     kbChunks: Row[];
+    workspaces: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -334,6 +335,7 @@ export function createFakeDatabase(): FakeDatabase {
     auditLog: [] as Row[],
     kbDocuments: [] as Row[],
     kbChunks: [] as Row[],
+    workspaces: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -354,6 +356,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(auditLog, store.auditLog);
   core.register(kbDocuments, store.kbDocuments);
   core.register(kbChunks, store.kbChunks);
+  core.register(workspaces, store.workspaces);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),
