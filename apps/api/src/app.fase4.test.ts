@@ -419,9 +419,24 @@ describe("inbound flow dispatcher resilience", () => {
       flowEnqueuer: { async enqueueFlowRun() {} },
     });
     await dispatcher.dispatch([{
-      type: "message.status", channel: "whatsapp",
-      messageExternalId: "wamid.1", status: "read", receivedAt: new Date().toISOString(),
+      type: "template.category_changed", channel: "whatsapp",
+      templateExternalId: "tpl-1", newCategory: "utility", receivedAt: new Date().toISOString(),
     }]);
     expect(dbTouched).toBe(false);
+  });
+
+  test("message.status events feed the broadcast recipient mirror (package #4) but still never throw without a DB", async () => {
+    let dbTouched = false;
+    const dispatcher = createDbFlowDispatcher({
+      getDatabase: () => { dbTouched = true; throw new Error("DATABASE_URL is not configured"); },
+      flowEnqueuer: { async enqueueFlowRun() {} },
+    });
+    await expect(dispatcher.dispatch([{
+      type: "message.status", channel: "whatsapp",
+      messageExternalId: "wamid.1", status: "read", receivedAt: new Date().toISOString(),
+    }])).resolves.toBeUndefined();
+    // The mirror DID attempt its lookup (status events are consumed
+    // since package #4); the failure is contained per-event.
+    expect(dbTouched).toBe(true);
   });
 });

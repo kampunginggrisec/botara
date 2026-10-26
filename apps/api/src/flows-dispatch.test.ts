@@ -703,3 +703,111 @@ describe("tiktok dispatch", () => {
     expect(flowRuns).toHaveLength(0);
   });
 });
+
+describe("broadcast recipient mirror (package #4)", () => {
+  const waStatus = (messageExternalId: string, status: "sent" | "delivered" | "read" | "failed", extra: object = {}): InboundEvent => ({
+    type: "message.status", channel: "whatsapp", accountExternalId: "10987",
+    messageExternalId, status, receivedAt: new Date().toISOString(), ...extra,
+  });
+
+  type SeedOverrides = Partial<{
+    id: string; broadcastId: string; contactId: string; status: string;
+    providerMessageId: string | null; createdAt: Date;
+  }>;
+  const seedRecipient = (store: InMemoryDispatchStore, over: SeedOverrides = {}) => {
+    const row = {
+      id: `rec-${Math.random()}`,
+      broadcastId: "b-1",
+      workspaceId: "ws-1",
+      contactId: "ct-1",
+      status: "sent",
+      providerMessageId: "wamid.X",
+      error: null as string | null,
+      sentAt: new Date("2026-10-26T10:00:00.000Z") as Date | null,
+      deliveredAt: null as Date | null,
+      readAt: null as Date | null,
+      repliedAt: null as Date | null,
+      createdAt: new Date("2026-10-26T10:00:00.000Z"),
+      ...over,
+    };
+    store.broadcastRecipients.push(row as never);
+    return row;
+  };
+
+  test("status webhooks advance delivered -> read and never regress", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedRecipient(store);
+    await dispatcher.dispatch([waStatus("wamid.X", "delivered")]);
+    expect(row.status).toBe("delivered");
+    expect(row.deliveredAt).not.toBeNull();
+    await dispatcher.dispatch([waStatus("wamid.X", "read")]);
+    expect(row.status).toBe("read");
+    expect(row.readAt).not.toBeNull();
+    // Out-of-order late events must not move the row backwards.
+    await dispatcher.dispatch([waStatus("wamid.X", "delivered")]);
+    expect(row.status).toBe("read");
+    await dispatcher.dispatch([waStatus("wamid.X", "failed", { errors: [{ code: 1, title: "late" }] })]);
+    expect(row.status).toBe("read");
+  });
+
+  test("a provider failure before delivery records failed + the provider error", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedRecipient(store);
+    await dispatcher.dispatch([waStatus("wamid.X", "failed", {
+      errors: [{ code: 131047, title: "Re-engagement message" }],
+    })]);
+    expect(row.status).toBe("failed");
+    expect(row.error).toBe("Re-engagement message");
+  });
+
+  test("status events for unknown provider ids are ignored, and rows in other workspaces are never touched", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedRecipient(store);
+    await dispatcher.dispatch([waStatus("wamid.UNKNOWN", "delivered")]);
+    expect(row.status).toBe("sent");
+    // Same provider id, but the recipient lives in a different workspace
+    // than the resolved account (ws-1): the mirror is workspace-scoped.
+    const foreign = seedRecipient(store, { id: "rec-foreign", providerMessageId: "wamid.Y" });
+    (foreign as { workspaceId: string }).workspaceId = "ws-2";
+    await dispatcher.dispatch([waStatus("wamid.Y", "delivered")]);
+    expect(foreign.status).toBe("sent");
+    // A channel with no connected account at all resolves nothing.
+    await dispatcher.dispatch([{
+      type: "message.status", channel: "messenger",
+      messageExternalId: "wamid.X", status: "delivered", receivedAt: new Date().toISOString(),
+    }]);
+    expect(row.status).toBe("sent");
+  });
+
+  test("an inbound reply marks the LATEST open recipient replied, exactly once", async () => {
+    const { store, dispatcher } = setup();
+    const waMessage = (text: string): InboundEvent => ({
+      type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "628111", messageExternalId: `wm-${Math.random()}`,
+      text, receivedAt: new Date().toISOString(),
+    });
+    // First message creates the contact (no recipient rows exist yet).
+    await dispatcher.dispatch([waMessage("halo")]);
+    const contact = [...store.contacts.values()][0]!;
+    const older = seedRecipient(store, {
+      id: "rec-old", broadcastId: "b-old", contactId: contact.id, status: "read",
+      providerMessageId: "wamid.OLD", createdAt: new Date("2026-10-20T10:00:00.000Z"),
+    });
+    const newer = seedRecipient(store, {
+      id: "rec-new", broadcastId: "b-new", contactId: contact.id, status: "delivered",
+      providerMessageId: "wamid.NEW", createdAt: new Date("2026-10-25T10:00:00.000Z"),
+    });
+    const failed = seedRecipient(store, {
+      id: "rec-failed", broadcastId: "b-failed", contactId: contact.id, status: "failed",
+      providerMessageId: null, createdAt: new Date("2026-10-26T09:00:00.000Z"),
+    });
+    await dispatcher.dispatch([waMessage("iya, mau!")]);
+    expect(newer.status).toBe("replied");
+    expect(newer.repliedAt).not.toBeNull();
+    expect(older.status).toBe("read"); // only the latest open broadcast is attributed
+    expect(failed.status).toBe("failed"); // failed rows are not reply-attributed
+    const firstRepliedAt = newer.repliedAt;
+    await dispatcher.dispatch([waMessage("ditunggu ya")]);
+    expect(newer.repliedAt).toBe(firstRepliedAt); // first reply wins, never overwritten
+  });
+});

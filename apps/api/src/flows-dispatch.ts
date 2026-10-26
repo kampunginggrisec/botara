@@ -1,9 +1,10 @@
 import {
-  addContactTag, advanceConversationLastUserMessage, claimFlowWaitByConversation, createContact, createConversation, createMessage,
+  addContactTag, advanceBroadcastRecipientByProviderId, advanceConversationLastUserMessage,
+  broadcastRecipientTransition, claimFlowWaitByConversation, createContact, createConversation, createMessage,
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
-  listGrowthLinksByAccount, touchConversationLastUserMessage, updateContact, updateConversationExternalId,
+  listGrowthLinksByAccount, markBroadcastRecipientReplied, touchConversationLastUserMessage, updateContact, updateConversationExternalId,
   upsertContactByExternal, type Database,
 } from "@botara/db";
 import {
@@ -247,6 +248,21 @@ export interface DispatchStore {
   claimFlowWait(conversationId: string): Promise<ClaimedFlowWait | null>;
   /** Persist one contact custom field (collect_input's save-to-field). */
   setContactField(workspaceId: string, contactId: string, field: string, value: string): Promise<void>;
+  /**
+   * Broadcast recipient mirror (package #4): advance the recipient row
+   * carrying this provider message id from a provider status webhook.
+   * Optional: stores without recipient tracking simply skip it.
+   */
+  advanceBroadcastRecipientByProviderId?(input: {
+    workspaceId: string; providerMessageId: string;
+    status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
+  }): Promise<void>;
+  /**
+   * Broadcast recipient mirror (package #4): attribute a contact's
+   * inbound message as a reply to their latest still-open broadcast.
+   * Optional, same rationale as above.
+   */
+  markBroadcastRecipientReplied?(input: { workspaceId: string; contactId: string; at: Date }): Promise<void>;
 }
 
 /** Production DispatchStore over the Drizzle repositories. */
@@ -339,6 +355,18 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
     },
     async setContactField(workspaceId, contactId, field, value) {
       await updateContact(getDatabase(), workspaceId, contactId, { customFields: { [field]: value } });
+    },
+    async advanceBroadcastRecipientByProviderId(input) {
+      await advanceBroadcastRecipientByProviderId(getDatabase(), {
+        workspaceId: input.workspaceId,
+        providerMessageId: input.providerMessageId,
+        to: input.status,
+        at: input.at,
+        ...(input.error !== undefined ? { error: input.error } : {}),
+      });
+    },
+    async markBroadcastRecipientReplied(input) {
+      await markBroadcastRecipientReplied(getDatabase(), input);
     },
   };
 }
@@ -469,6 +497,40 @@ export class InMemoryDispatchStore implements DispatchStore {
   async setContactField(_workspaceId: string, contactId: string, field: string, value: string) {
     const contact = [...this.contacts.values()].find((ct) => ct.id === contactId);
     if (contact) contact.customFields[field] = value;
+  }
+
+  /** Broadcast recipient rows (package #4), seeded directly by tests. */
+  readonly broadcastRecipients: Array<{
+    id: string; broadcastId: string; workspaceId: string; contactId: string;
+    status: string; providerMessageId?: string | null; error?: string | null;
+    sentAt: Date | null; deliveredAt: Date | null; readAt: Date | null; repliedAt: Date | null;
+    createdAt: Date;
+  }> = [];
+
+  async advanceBroadcastRecipientByProviderId(input: {
+    workspaceId: string; providerMessageId: string;
+    status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
+  }) {
+    for (const row of this.broadcastRecipients) {
+      if (row.workspaceId !== input.workspaceId || row.providerMessageId !== input.providerMessageId) continue;
+      const patch = broadcastRecipientTransition(row, input.status, input.at);
+      if (!patch) continue;
+      Object.assign(row, patch);
+      if (input.status === "failed") row.error = input.error ?? null;
+      if (input.status === "sent") row.error = null;
+      return;
+    }
+  }
+
+  async markBroadcastRecipientReplied(input: { workspaceId: string; contactId: string; at: Date }) {
+    const open = this.broadcastRecipients
+      .filter((r) => r.workspaceId === input.workspaceId && r.contactId === input.contactId
+        && (r.status === "sent" || r.status === "delivered" || r.status === "read"))
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+    const latest = open[0];
+    if (!latest) return;
+    const patch = broadcastRecipientTransition(latest, "replied", input.at);
+    if (patch) Object.assign(latest, patch);
   }
 }
 
@@ -734,6 +796,21 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       }
     }
 
+    // --- broadcast reply attribution (package #4): a NEWLY persisted
+    // inbound message is the contact answering - attribute it to their
+    // latest still-open broadcast recipient. Best-effort bookkeeping:
+    // it runs before the collect-input capture so a captured reply is
+    // still attributed, and it never blocks dispatch.
+    if (event.type === "message.received" && messagePersisted && deps.store.markBroadcastRecipientReplied) {
+      try {
+        await deps.store.markBroadcastRecipientReplied({
+          workspaceId, contactId: contact.id, at: new Date(event.receivedAt),
+        });
+      } catch (err) {
+        log({ event: "broadcast_recipient_reply_failed", workspaceId, contactId: contact.id, error: String(err) });
+      }
+    }
+
     // --- collect-input capture (package #3): a waiting run claims the
     // reply BEFORE growth attribution and keyword matching; only NEWLY
     // persisted messages capture (a webhook redelivery must not resume
@@ -791,6 +868,35 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       } catch (err) {
         log({ event: "flow_run_enqueue_failed", flowId: flow.id, workspaceId, error: String(err) });
       }
+    }
+  }
+
+  /**
+   * Provider delivery-status webhooks (package #4): until now these
+   * events were parsed by the adapters and dropped - nothing consumed
+   * them. Their one consumer is the broadcast recipient mirror: the
+   * recipient row carrying the provider message id (inside the resolved
+   * account's workspace) advances delivered/read, or records the
+   * provider's failure. The forward-only transition guard in the store
+   * makes out-of-order statuses harmless.
+   */
+  async function dispatchMessageStatus(event: Extract<InboundEvent, { type: "message.status" }>): Promise<void> {
+    if (!deps.store.advanceBroadcastRecipientByProviderId) return;
+    const account = await resolveAccount(event);
+    if (!account) return;
+    const firstError = event.errors?.[0];
+    try {
+      await deps.store.advanceBroadcastRecipientByProviderId({
+        workspaceId: account.workspaceId,
+        providerMessageId: event.messageExternalId,
+        status: event.status,
+        at: new Date(event.receivedAt),
+        ...(firstError
+          ? { error: firstError.message ?? firstError.title ?? `provider error ${firstError.code}` }
+          : {}),
+      });
+    } catch (err) {
+      log({ event: "broadcast_recipient_status_failed", workspaceId: account.workspaceId, messageExternalId: event.messageExternalId, error: String(err) });
     }
   }
 
@@ -1013,6 +1119,8 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
             await dispatchContactsSynced(event);
           } else if (event.type === "message.history") {
             await dispatchHistoryMessage(event);
+          } else if (event.type === "message.status") {
+            await dispatchMessageStatus(event);
           }
         } catch (err) {
           // Webhook acknowledgment is king: log and continue with the next event.

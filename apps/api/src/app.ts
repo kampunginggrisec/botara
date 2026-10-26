@@ -18,6 +18,7 @@ import {
   type SavedReplyRow, type MessageRow,
   listTemplates, createTemplate, updateTemplateLatestCategory,
   createBroadcast, listBroadcasts, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
+  listBroadcastRecipients, listFailedBroadcastRecipientContactIds, resetBroadcastRecipients,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
   deleteChannelAccount, channelAccountHasReferences, purgeChannelAccount, softDisconnectChannelAccount,
   applyTemplateCategoryChange,
@@ -126,7 +127,15 @@ export const logEventSink: WebhookEventSink = {
 
 /** Enqueues a broadcast fan-out job for the worker. */
 export interface BroadcastEnqueuer {
-  enqueueBroadcast(broadcastId: string): Promise<void>;
+  /**
+   * Without opts: the full-audience fan-out. With opts (resend-failed,
+   * package #4): a restricted re-send to exactly `contactIds`, made a
+   * distinct BullMQ job by the per-request `resendToken`.
+   */
+  enqueueBroadcast(
+    broadcastId: string,
+    opts?: { contactIds: string[]; resendToken: string },
+  ): Promise<void>;
 }
 
 /** Enqueues a publish job for one scheduled post. */
@@ -278,7 +287,12 @@ export function createBullMqEnqueuer(
 export function createBullMqBroadcastEnqueuer(redisUrl: string): BroadcastEnqueuer {
   const inner = createBullMqEnqueuer(redisUrl, "broadcast", "broadcast");
   return {
-    enqueueBroadcast: (broadcastId) => inner.enqueue({ broadcastId }, `broadcast:${broadcastId}`),
+    enqueueBroadcast: (broadcastId, opts) => (opts
+      ? inner.enqueue(
+          { broadcastId, contactIds: opts.contactIds, resendToken: opts.resendToken },
+          `broadcast:${broadcastId}:resend:${opts.resendToken}`,
+        )
+      : inner.enqueue({ broadcastId }, `broadcast:${broadcastId}`)),
   };
 }
 
@@ -3500,6 +3514,88 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       costEntries: cost.entries,
       costUnits: cost.units,
     });
+  });
+
+  // Per-recipient delivery records (package #4): the aggregate counts
+  // above say HOW MANY; these rows say WHO, at which lifecycle stage,
+  // and why a send failed. Filtering + pagination happen after the
+  // fetch so the per-status counts always describe the WHOLE broadcast.
+  const listBroadcastRecipientsRoute = createRoute({
+    method: "get", path: "/broadcasts/{id}/recipients",
+    request: {
+      params: z.object({ id: z.string() }),
+      query: z.object({
+        status: z.string().optional(),
+        limit: z.coerce.number().int().min(1).max(500).optional(),
+        offset: z.coerce.number().int().min(0).optional(),
+      }),
+    },
+    responses: { 200: { description: "Recipient rows + per-status counts for the broadcast" } },
+  });
+  app.openapi(listBroadcastRecipientsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const broadcast = await getBroadcast(db, ws, id);
+    if (!broadcast) throw new AppError("NOT_FOUND", "Broadcast not found.", { status: 404 });
+    const query = c.req.valid("query");
+    const all = await listBroadcastRecipients(db, ws, id);
+    const counts: Record<string, number> = {
+      pending: 0, sent: 0, delivered: 0, read: 0, replied: 0, failed: 0, total: all.length,
+    };
+    for (const row of all) {
+      if (row.status in counts) counts[row.status] = (counts[row.status] ?? 0) + 1;
+    }
+    const filtered = query.status ? all.filter((r) => r.status === query.status) : all;
+    const limit = query.limit ?? 100;
+    const offset = query.offset ?? 0;
+    return c.json({
+      recipients: filtered.slice(offset, offset + limit).map((r) => ({
+        ...r,
+        sentAt: iso(r.sentAt),
+        deliveredAt: iso(r.deliveredAt),
+        readAt: iso(r.readAt),
+        repliedAt: iso(r.repliedAt),
+        createdAt: iso(r.createdAt),
+        updatedAt: iso(r.updatedAt),
+      })),
+      counts,
+      total: filtered.length,
+      limit,
+      offset,
+    });
+  });
+
+  const resendFailedBroadcastRoute = createRoute({
+    method: "post", path: "/broadcasts/{id}/resend-failed",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Failed recipients re-queued" } },
+  });
+  app.openapi(resendFailedBroadcastRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const broadcast = await getBroadcast(db, ws, id);
+    if (!broadcast) throw new AppError("NOT_FOUND", "Broadcast not found.", { status: 404 });
+    const contactIds = await listFailedBroadcastRecipientContactIds(db, ws, id);
+    if (contactIds.length === 0) return c.json({ resent: 0 });
+    // Reset first so a concurrent resend finds nothing left to queue;
+    // if the enqueue itself fails the rows go back to failed with the
+    // reason instead of dangling in pending forever.
+    await resetBroadcastRecipients(db, { broadcastId: id, contactIds, to: "pending" });
+    try {
+      await deps.broadcastEnqueuer.enqueueBroadcast(id, {
+        contactIds,
+        resendToken: crypto.randomUUID(),
+      });
+    } catch (err) {
+      await resetBroadcastRecipients(db, {
+        broadcastId: id, contactIds, to: "failed", error: "Resend could not be queued - try again.",
+      }).catch(() => undefined);
+      throw err;
+    }
+    return c.json({ resent: contactIds.length });
   });
 
   // ------------------------------------------------------- AI (Fase 2)
