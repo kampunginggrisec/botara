@@ -122,10 +122,26 @@ export interface MessageReferral {
   sourceId?: string;
 }
 
+/**
+ * One address-book contact carried by a coexistence state sync
+ * (WhatsApp `smb_app_state_sync`). `externalId` is the phone number /
+ * wa_id the contact is keyed by. `remove` means the contact was deleted
+ * from the Business app's address book - consumers decide what that
+ * means for their own records (Botara's dispatcher keeps the platform
+ * contact: conversation history and consent live on it).
+ */
+export interface SyncedContact {
+  externalId: string;
+  displayName?: string;
+  action: "add" | "remove" | "update";
+}
+
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
   | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral }
-  | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; receivedAt: string }
+  | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string }
+  | { type: "contacts.synced"; channel: ChannelKey; accountExternalId: string; contacts: SyncedContact[]; receivedAt: string }
+  | { type: "message.history"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; direction: "in" | "out"; text?: string; media?: MessageMedia; receivedAt: string }
   | { type: "comment.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId: string; text?: string; authorExternalId?: string; parentPostExternalId?: string; receivedAt: string }
   | { type: "mention.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId?: string; authorExternalId?: string; receivedAt: string }
   | { type: "postback.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; payload: string; title?: string; receivedAt: string }

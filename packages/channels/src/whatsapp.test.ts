@@ -220,6 +220,108 @@ describe("whatsapp webhook parsing", () => {
       type: "message.echo", contactExternalId: "62812", messageExternalId: "wamid.ECHO1", text: "dibalas dari HP",
     });
   });
+
+  test("coexistence echo with media -> message.echo carries media + caption as text", async () => {
+    const events = await wa.parseWebhook({
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "smb_message_echoes",
+          value: {
+            metadata: { phone_number_id: "1234567890" },
+            message_echoes: [{
+              id: "wamid.ECHO2", to: "62812", from: "1234567890", timestamp: "1760000300", type: "image",
+              image: { id: "media-9", mime_type: "image/jpeg", caption: "foto dari HP" },
+            }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "message.echo", contactExternalId: "62812", messageExternalId: "wamid.ECHO2", text: "foto dari HP",
+      media: { type: "image", id: "media-9", mimeType: "image/jpeg", caption: "foto dari HP" },
+    });
+  });
+
+  test("coexistence smb_app_state_sync -> one contacts.synced event (add/update/remove, name resolution)", async () => {
+    const events = await wa.parseWebhook({
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "smb_app_state_sync",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: { display_phone_number: "+62 812-0000", phone_number_id: "1234567890" },
+            state_sync: [
+              { type: "contact", action: "add", timestamp: "1760000400", contact: { full_name: "Sari Penuh", phone_number: "628111" } },
+              { type: "contact", action: "update", timestamp: "1760000500", contact: { first_name: "Budi", last_name: "Santoso", phone_number: "628222" } },
+              { type: "contact", action: "remove", timestamp: "1760000600", contact: { phone_number: "628333" } },
+              { type: "contact", action: "add", timestamp: "1760000600", contact: { first_name: "Tanpa Nomor" } },
+            ],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    const ev = events[0]!;
+    expect(ev).toMatchObject({ type: "contacts.synced", channel: "whatsapp", accountExternalId: "1234567890" });
+    if (ev.type === "contacts.synced") {
+      // The phone-less item is dropped; the rest ride in order.
+      expect(ev.contacts).toEqual([
+        { externalId: "628111", displayName: "Sari Penuh", action: "add" },
+        { externalId: "628222", displayName: "Budi Santoso", action: "update" },
+        { externalId: "628333", action: "remove" },
+      ]);
+      // receivedAt = the LATEST item timestamp (1760000600), not now.
+      expect(ev.receivedAt).toBe(new Date(1760000600 * 1000).toISOString());
+    }
+  });
+
+  test("coexistence history -> message.history events with direction, original timestamps; placeholders skipped", async () => {
+    const events = await wa.parseWebhook({
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "history",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: { display_phone_number: "+62 812-0000", phone_number_id: "1234567890" },
+            history: [{
+              metadata: { phase: 1, chunk_order: 1, progress: 50 },
+              threads: [{
+                id: "62812",
+                messages: [
+                  { id: "wamid.H1", from: "62812", timestamp: "1750000000", type: "text", text: { body: "halo lama" } },
+                  { id: "wamid.H2", from: "62812999999", timestamp: "1750000060", type: "text", text: { body: "balasan lama dari bisnis" } },
+                  { id: "wamid.H3", from: "62812999999", to: "62812", timestamp: "1750000120", type: "text", text: { body: "echo lama" } },
+                  { id: "wamid.H4", from: "62812", timestamp: "1750000180", type: "media_placeholder" },
+                  { id: "wamid.H5", from: "62812", timestamp: "1750000240", type: "image", image: { id: "media-h5", mime_type: "image/png", caption: "gambar lama" } },
+                ],
+              }],
+            }, {
+              // Sharing declined for this chunk: errors, no threads.
+              metadata: { phase: 1, chunk_order: 2, progress: 100 },
+              errors: [{ code: 2590000, title: "History sharing declined" }],
+            }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(4);
+    expect(events[0]).toMatchObject({
+      type: "message.history", contactExternalId: "62812", messageExternalId: "wamid.H1",
+      direction: "in", text: "halo lama", receivedAt: new Date(1750000000 * 1000).toISOString(),
+    });
+    // from != thread customer -> outbound (Business app message).
+    expect(events[1]).toMatchObject({ messageExternalId: "wamid.H2", direction: "out", text: "balasan lama dari bisnis" });
+    // A `to` marks an SMB echo -> outbound.
+    expect(events[2]).toMatchObject({ messageExternalId: "wamid.H3", direction: "out", text: "echo lama" });
+    expect(events[3]).toMatchObject({
+      messageExternalId: "wamid.H5", direction: "in", text: "gambar lama",
+      media: { type: "image", id: "media-h5", mimeType: "image/png" },
+    });
+  });
 });
 
 describe("whatsapp webhook security helpers", () => {

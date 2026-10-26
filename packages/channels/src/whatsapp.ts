@@ -7,7 +7,7 @@ import {
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
-  type PublishInput, type SendInput, type SendResult,
+  type PublishInput, type SendInput, type SendResult, type SyncedContact,
 } from "./types";
 import { richToPlainText, type RichBlock, type RichWarning } from "./rich";
 
@@ -111,6 +111,37 @@ export function verifyWebhookChallenge(
 
 const isoFromEpochSeconds = (ts: unknown): string =>
   new Date((typeof ts === "string" ? Number(ts) : (ts as number)) * 1000).toISOString();
+
+const WA_MEDIA_TYPES: readonly string[] = ["image", "video", "document", "audio", "sticker"];
+
+/**
+ * Normalize one WhatsApp message-shaped object (inbound message, Business
+ * app echo, or history-backfill message - all three share Meta's message
+ * shape) into the text/media parts of an InboundEvent.
+ */
+function waMessageParts(msg: Record<string, any>): { text?: string; media?: MessageMedia } {
+  if (msg.type === "text") return { text: msg.text?.body };
+  if (WA_MEDIA_TYPES.includes(msg.type as string)) {
+    const m = (msg[msg.type] ?? {}) as Record<string, any>;
+    const media: MessageMedia = {
+      type: msg.type,
+      id: m.id,
+      caption: m.caption,
+      mimeType: m.mime_type,
+      filename: m.filename,
+    };
+    return { media, ...(m.caption ? { text: m.caption } : {}) };
+  }
+  return {};
+}
+
+/** Display name from a state-sync contact: full_name wins, else first + last. */
+function syncedContactName(contact: Record<string, any>): string | undefined {
+  if (typeof contact.full_name === "string" && contact.full_name) return contact.full_name;
+  const parts = [contact.first_name, contact.last_name]
+    .filter((p): p is string => typeof p === "string" && p.length > 0);
+  return parts.length > 0 ? parts.join(" ") : undefined;
+}
 
 export class WhatsAppAdapter implements ChannelAdapter {
   readonly key = "whatsapp" as const;
@@ -465,10 +496,86 @@ export class WhatsAppAdapter implements ChannelAdapter {
               accountExternalId,
               contactExternalId: String(echo.to ?? ""),
               messageExternalId: String(echo.id ?? ""),
-              text: echo.text?.body,
+              ...waMessageParts(echo),
               receivedAt: isoFromEpochSeconds(echo.timestamp),
             });
           }
+        }
+
+        if (field === "smb_app_state_sync") {
+          // Coexistence contact sync: the Business app's address book,
+          // as add/update/remove items keyed by phone number. One
+          // normalized event carries the whole batch.
+          const synced: SyncedContact[] = [];
+          let latestTs: number | undefined;
+          for (const item of (value.state_sync as Array<Record<string, any>> | undefined) ?? []) {
+            if (item.type !== undefined && item.type !== "contact") continue;
+            const contact = (item.contact ?? {}) as Record<string, any>;
+            const phone = typeof contact.phone_number === "string" ? contact.phone_number : "";
+            if (!phone) continue;
+            const displayName = syncedContactName(contact);
+            const action = item.action === "remove" || item.action === "update" ? item.action : "add";
+            synced.push({ externalId: phone, ...(displayName ? { displayName } : {}), action });
+            const ts = Number(item.timestamp);
+            if (Number.isFinite(ts) && ts > 0) latestTs = Math.max(latestTs ?? 0, ts);
+          }
+          if (synced.length > 0) {
+            events.push({
+              type: "contacts.synced",
+              channel: "whatsapp",
+              accountExternalId,
+              contacts: synced,
+              receivedAt: latestTs ? new Date(latestTs * 1000).toISOString() : new Date().toISOString(),
+            });
+          }
+          continue;
+        }
+
+        if (field === "history") {
+          // Coexistence chat-history backfill: chunked replays of up to
+          // ~6 months of chats, requested once via smb_app_data after
+          // onboarding. Chunks repeat and overlap (dedupe downstream on
+          // the wamid); a chunk whose sharing the business declined
+          // carries `errors` instead of threads and yields nothing.
+          // Direction: history messages have no reliable from-me flag -
+          // a message is OUTBOUND when it carries a `to` (only Business
+          // app echoes do) or its `from` is not the thread's customer.
+          const chunks: Array<Record<string, any>> =
+            (value.history as Array<Record<string, any>> | undefined)
+            ?? (value.history_chunks as Array<Record<string, any>> | undefined)
+            ?? (Array.isArray(value.threads) ? [value] : []);
+          for (const chunk of chunks) {
+            const threads = (chunk.threads as Array<Record<string, any>> | undefined) ?? [];
+            for (const thread of threads) {
+              const customer = thread.id !== undefined ? String(thread.id) : "";
+              for (const msg of (thread.messages as Array<Record<string, any>> | undefined) ?? []) {
+                // Media placeholders are redelivered later with the real
+                // media under the same id; reactions are not messages.
+                if (msg.type === "media_placeholder" || msg.type === "reaction") continue;
+                const parts = waMessageParts(msg);
+                // System/unknown shapes carry no inbox content - skip
+                // them rather than persisting empty bubbles.
+                if (msg.type !== "text" && !parts.media) continue;
+                const to = typeof msg.to === "string" && msg.to ? msg.to : undefined;
+                const from = typeof msg.from === "string" ? msg.from : "";
+                const direction: "in" | "out" =
+                  to !== undefined || (from !== "" && from !== customer) ? "out" : "in";
+                const contactExternalId = customer || (direction === "in" ? from : (to ?? ""));
+                if (!contactExternalId || !msg.id) continue;
+                events.push({
+                  type: "message.history",
+                  channel: "whatsapp",
+                  accountExternalId,
+                  contactExternalId,
+                  messageExternalId: String(msg.id),
+                  direction,
+                  ...parts,
+                  receivedAt: isoFromEpochSeconds(msg.timestamp),
+                });
+              }
+            }
+          }
+          continue;
         }
 
         if (field !== "messages") continue;
