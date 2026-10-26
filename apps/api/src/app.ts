@@ -6,7 +6,7 @@ import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import {
   AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
-  buildVariableContext, checkOutboundWebhookUrl, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
+  buildVariableContext, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
   MessagingWindowClosedError, WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_TEST_EVENT, parseApiTokenScopes, parseWebhookEvents,
 } from "@botara/shared";
 import {
@@ -81,6 +81,7 @@ import {
 import {
   INVITABLE_ROLES, generateInviteToken, hashInviteToken, inviteDisplayPrefix, invitePath, inviteState,
 } from "./invites";
+import { checkOutboundWebhookUrl } from "@botara/shared/ssrf";
 import { createRedisPresenceReader, offlinePresenceReader, type PresenceReader } from "./presence";
 import {
   createOutboundWebhookEmitter, generateWebhookSecret, webhookEnvelope, webhookTestData,

@@ -647,6 +647,38 @@ export interface CreateApiTokenBody {
   expiresAt?: string;
 }
 
+/** Outbound webhook endpoint (#10) as the API returns it - never carries secret material. */
+export interface WebhookEndpointInfo {
+  id: string;
+  name: string;
+  url: string;
+  events: string[];
+  enabled: boolean;
+  consecutiveFailures: number;
+  disabledAt: string | null;
+  autoDisabled: boolean;
+  createdAt: string | null;
+  updatedAt: string | null;
+}
+
+/** Create response: the endpoint plus the signing secret, shown ONCE. */
+export interface CreatedWebhookEndpoint extends WebhookEndpointInfo {
+  secret: string;
+}
+
+/** One delivery attempt record for an endpoint (#10). */
+export interface WebhookDeliveryInfo {
+  id: string;
+  endpointId: string;
+  event: string;
+  status: "pending" | "delivered" | "failed";
+  responseStatus: number | null;
+  attempts: number;
+  lastError: string | null;
+  createdAt: string | null;
+  deliveredAt: string | null;
+}
+
 export interface ContactImportResult {
   inserted: number;
   updated: number;
@@ -897,6 +929,28 @@ export const api = {
   },
   revokeApiToken(id: string): Promise<{ revoked: boolean }> {
     return request(`/auth/tokens/${id}`, { method: "DELETE" });
+  },
+  // ------------------------------------------------- outbound webhooks
+  listWebhooks(): Promise<{ webhooks: WebhookEndpointInfo[] }> {
+    return request("/settings/webhooks");
+  },
+  createWebhook(body: { name: string; url: string; events: string[] }): Promise<CreatedWebhookEndpoint> {
+    return request("/settings/webhooks", { method: "POST", body: JSON.stringify(body) });
+  },
+  updateWebhook(id: string, body: { name?: string; url?: string; events?: string[]; enabled?: boolean }): Promise<WebhookEndpointInfo> {
+    return request(`/settings/webhooks/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  rotateWebhookSecret(id: string): Promise<CreatedWebhookEndpoint> {
+    return request(`/settings/webhooks/${id}/rotate-secret`, { method: "POST", body: "{}" });
+  },
+  deleteWebhook(id: string): Promise<{ deleted: boolean }> {
+    return request(`/settings/webhooks/${id}`, { method: "DELETE" });
+  },
+  listWebhookDeliveries(id: string): Promise<{ deliveries: WebhookDeliveryInfo[] }> {
+    return request(`/settings/webhooks/${id}/deliveries`);
+  },
+  testWebhook(id: string): Promise<WebhookDeliveryInfo> {
+    return request(`/settings/webhooks/${id}/test`, { method: "POST", body: "{}" });
   },
   listWorkspaces(): Promise<{ workspaces: WorkspaceSummary[] }> {
     return request("/workspaces");

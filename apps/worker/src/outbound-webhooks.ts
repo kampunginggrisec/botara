@@ -1,7 +1,8 @@
 import {
   WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_HTTP_TIMEOUT_MS, WEBHOOK_TEST_EVENT,
-  checkOutboundWebhookUrl, webhookSignatureHeader,
 } from "@botara/shared";
+import { checkOutboundWebhookUrl } from "@botara/shared/ssrf";
+import { webhookSignatureHeader } from "@botara/shared/webhook-signing";
 
 /**
  * Outbound event webhooks (adoption package #10) - the worker half:

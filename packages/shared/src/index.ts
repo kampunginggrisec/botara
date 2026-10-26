@@ -31,11 +31,9 @@ export {
   OUTBOUND_WEBHOOK_EVENTS, WEBHOOK_TEST_EVENT, isOutboundWebhookEvent, parseWebhookEvents,
   WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_AUTO_DISABLE_FAILURES, WEBHOOK_HTTP_TIMEOUT_MS,
   WEBHOOK_MESSAGE_PREVIEW_CHARS, webhookMessagePreview,
-  computeWebhookSignature, webhookSignatureHeader, verifyWebhookSignature,
-  WEBHOOK_SIGNATURE_TOLERANCE_SECONDS,
   type OutboundWebhookEvent, type WebhookDeliveryEvent,
 } from "./outbound-webhooks";
-export {
-  checkOutboundWebhookUrl, ipv4BlockReason, ipv6BlockReason, isLoopbackIp,
-  type DnsLookupFn, type OutboundUrlCheck,
-} from "./ssrf";
+// NOTE: ./webhook-signing (node:crypto) and ./ssrf (node:dns) are
+// deliberately NOT re-exported here - the root export is bundled into
+// the web app. Server code imports them via subpaths:
+//   "@botara/shared/webhook-signing", "@botara/shared/ssrf".

@@ -7,6 +7,14 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./webhook-signing": {
+      "types": "./src/webhook-signing.ts",
+      "default": "./src/webhook-signing.ts"
+    },
+    "./ssrf": {
+      "types": "./src/ssrf.ts",
+      "default": "./src/ssrf.ts"
     }
   },
   "scripts": {

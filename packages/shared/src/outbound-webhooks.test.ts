@@ -1,10 +1,12 @@
 import { describe, expect, test } from "bun:test";
 import { createHmac } from "node:crypto";
 import {
-  checkOutboundWebhookUrl, computeWebhookSignature, isOutboundWebhookEvent,
-  parseWebhookEvents, verifyWebhookSignature, webhookMessagePreview, webhookSignatureHeader,
-  type DnsLookupFn,
+  isOutboundWebhookEvent, parseWebhookEvents, webhookMessagePreview,
 } from "./index";
+import {
+  computeWebhookSignature, verifyWebhookSignature, webhookSignatureHeader,
+} from "./webhook-signing";
+import { checkOutboundWebhookUrl, type DnsLookupFn } from "./ssrf";
 
 /**
  * Outbound webhooks shared contract (package #10): signature scheme,

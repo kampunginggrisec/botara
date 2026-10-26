@@ -4,6 +4,7 @@ import {
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
   type AdminUserItem, type AdminWorkspaceItem,
   type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastRecipient,
+  type WebhookDeliveryInfo, type WebhookEndpointInfo,
   type BroadcastRecipientCounts, type BroadcastSummary,
   type CatalogProduct, type CatalogSummary,
   type ChannelAccount, type ConnectionInfo, type Contact,
@@ -32,6 +33,10 @@ import {
   TOKEN_RESOURCES, countPickedResources, defaultTokenFormState, emptyScopePicks, expiryIsoFromDays,
   picksToScopes, scopeParts, tokenIsExpired, type ScopePicks, type TokenResource,
 } from "./api-tokens";
+import {
+  WEBHOOK_EVENTS, defaultWebhookForm, emptyWebhookEventPicks, pickedWebhookEvents,
+  validateWebhookForm, webhookEndpointState, webhookEventLabelKey, type WebhookEventPicks,
+} from "./outbound-webhooks";
 import { SavedRepliesPicker } from "./saved-replies-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
@@ -5778,6 +5783,123 @@ function SettingsPage({ user, workspace, refreshSession }: {
     }
   };
 
+  // Outbound webhooks (#10): the API enforces owner/admin; the card
+  // renders for every member but the list simply stays empty on 403.
+  const [webhooks, setWebhooks] = useState<WebhookEndpointInfo[]>([]);
+  const [webhookName, setWebhookName] = useState("");
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [webhookPicks, setWebhookPicks] = useState<WebhookEventPicks>(() => emptyWebhookEventPicks());
+  const [newWebhookSecret, setNewWebhookSecret] = useState<string | null>(null);
+  const [webhookDeliveriesFor, setWebhookDeliveriesFor] = useState<string | null>(null);
+  const [webhookDeliveries, setWebhookDeliveries] = useState<WebhookDeliveryInfo[]>([]);
+
+  const loadWebhooks = useCallback(async () => {
+    try {
+      const res = await api.listWebhooks();
+      setWebhooks(res.webhooks);
+    } catch {
+      // Non-admin members get a 403 here - the card stays empty rather
+      // than erroring the whole settings page.
+      setWebhooks([]);
+    }
+  }, []);
+  useEffect(() => { void loadWebhooks(); }, [loadWebhooks]);
+
+  const loadWebhookDeliveries = useCallback(async (endpointId: string) => {
+    try {
+      const res = await api.listWebhookDeliveries(endpointId);
+      setWebhookDeliveries(res.deliveries);
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    }
+  }, [t]);
+
+  const createWebhook = async () => {
+    const invalid = validateWebhookForm({ name: webhookName, url: webhookUrl, picks: webhookPicks });
+    if (invalid) {
+      setError(t(
+        invalid === "name_required"
+          ? "settings.webhookNameRequired"
+          : invalid === "url_invalid"
+            ? "settings.webhookUrlInvalid"
+            : "settings.webhookEventsRequired",
+      ));
+      return;
+    }
+    setBusy(true); setError(null); setNotice(null);
+    try {
+      const res = await api.createWebhook({
+        name: webhookName.trim(),
+        url: webhookUrl.trim(),
+        events: pickedWebhookEvents(webhookPicks),
+      });
+      setNewWebhookSecret(res.secret);
+      // Same factory-default reset rule as the token form (#7 rider).
+      const fresh = defaultWebhookForm();
+      setWebhookName(fresh.name);
+      setWebhookUrl(fresh.url);
+      setWebhookPicks(fresh.picks);
+      await loadWebhooks();
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    } finally { setBusy(false); }
+  };
+
+  const toggleWebhook = async (endpoint: WebhookEndpointInfo, enabled: boolean) => {
+    try {
+      await api.updateWebhook(endpoint.id, { enabled });
+      await loadWebhooks();
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    }
+  };
+
+  const rotateWebhook = async (endpoint: WebhookEndpointInfo) => {
+    if (!window.confirm(t("settings.webhookRotateConfirm"))) return;
+    try {
+      const res = await api.rotateWebhookSecret(endpoint.id);
+      setNewWebhookSecret(res.secret);
+      await loadWebhooks();
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    }
+  };
+
+  const deleteWebhook = async (endpoint: WebhookEndpointInfo) => {
+    if (!window.confirm(t("settings.webhookDeleteConfirm"))) return;
+    try {
+      await api.deleteWebhook(endpoint.id);
+      if (webhookDeliveriesFor === endpoint.id) {
+        setWebhookDeliveriesFor(null);
+        setWebhookDeliveries([]);
+      }
+      await loadWebhooks();
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    }
+  };
+
+  const sendWebhookTest = async (endpoint: WebhookEndpointInfo) => {
+    setError(null); setNotice(null);
+    try {
+      await api.testWebhook(endpoint.id);
+      setNotice(t("settings.webhookTestSent"));
+      if (webhookDeliveriesFor === endpoint.id) await loadWebhookDeliveries(endpoint.id);
+    } catch (err) {
+      setError(errText(err, t("settings.webhooksFailed")));
+    }
+  };
+
+  const toggleWebhookDeliveries = async (endpoint: WebhookEndpointInfo) => {
+    if (webhookDeliveriesFor === endpoint.id) {
+      setWebhookDeliveriesFor(null);
+      setWebhookDeliveries([]);
+      return;
+    }
+    setWebhookDeliveriesFor(endpoint.id);
+    await loadWebhookDeliveries(endpoint.id);
+  };
+
   const loadMembers = useCallback(async () => {
     if (!workspace) return;
     try {
@@ -6180,6 +6302,161 @@ function SettingsPage({ user, workspace, refreshSession }: {
               })}
             </tbody>
           </table>
+        )}
+      </div>
+
+      <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+        <div className="font-medium text-sm">{t("settings.webhooksTitle")}</div>
+        <p className={`mt-1 ${mutedCls}`}>{t("settings.webhooksBody")}</p>
+        {newWebhookSecret && (
+          <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950">
+            <div className="text-xs font-medium text-amber-900 dark:text-amber-200">{t("settings.webhookSecretOnce")}</div>
+            <div className="mt-1 flex items-center gap-2">
+              <code className="flex-1 break-all rounded bg-white px-2 py-1 text-xs text-slate-900 dark:bg-slate-900 dark:text-slate-100">{newWebhookSecret}</code>
+              <button
+                onClick={() => void navigator.clipboard.writeText(newWebhookSecret)}
+                className="text-xs text-slate-700 underline dark:text-slate-200"
+              >
+                {t("common.copy")}
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="mt-3 flex flex-wrap items-end gap-2">
+          <input
+            value={webhookName}
+            onChange={(e) => setWebhookName(e.target.value)}
+            placeholder={t("settings.webhookNamePlaceholder")}
+            className="w-56 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+          <input
+            value={webhookUrl}
+            onChange={(e) => setWebhookUrl(e.target.value)}
+            placeholder={t("settings.webhookUrlPlaceholder")}
+            className="w-80 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+          />
+          <button
+            onClick={() => void createWebhook()}
+            disabled={busy || !webhookName.trim() || !webhookUrl.trim() || pickedWebhookEvents(webhookPicks).length === 0}
+            className={primaryBtn}
+          >
+            {t("settings.webhookCreate")}
+          </button>
+        </div>
+        <div className="mt-2 flex flex-wrap items-center gap-4">
+          <span className="text-xs font-medium text-slate-500 dark:text-slate-400">{t("settings.webhookEvents")}</span>
+          {WEBHOOK_EVENTS.map((event) => (
+            <label key={event} className="flex items-center gap-1.5 text-sm">
+              <input
+                type="checkbox"
+                checked={webhookPicks[event]}
+                onChange={(e) => setWebhookPicks((prev) => ({ ...prev, [event]: e.target.checked }))}
+              />
+              {t(`settings.webhookEvent.${event}`)}
+            </label>
+          ))}
+        </div>
+        {webhooks.length === 0 ? (
+          <p className={`mt-3 ${mutedCls}`}>{t("settings.webhooksEmpty")}</p>
+        ) : (
+          <div className="mt-3 space-y-3">
+            {webhooks.map((endpoint) => {
+              const state = webhookEndpointState(endpoint);
+              const deliveriesOpen = webhookDeliveriesFor === endpoint.id;
+              return (
+                <div key={endpoint.id} className="rounded-md border border-slate-200 p-3 dark:border-slate-800">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="text-sm font-medium">{endpoint.name}</span>
+                    {state === "auto_disabled" && (
+                      <span className="rounded bg-red-100 px-1.5 py-0.5 text-[11px] text-red-700 dark:bg-red-950 dark:text-red-300">
+                        {t("settings.webhookAutoDisabled")}
+                      </span>
+                    )}
+                    {!endpoint.enabled && state !== "auto_disabled" && (
+                      <span className="rounded bg-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                        {t("settings.webhookDisabled")}
+                      </span>
+                    )}
+                    {endpoint.enabled && endpoint.consecutiveFailures > 0 && (
+                      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-800 dark:bg-amber-950 dark:text-amber-300">
+                        {t("settings.webhookFailures", { count: endpoint.consecutiveFailures })}
+                      </span>
+                    )}
+                    <label className="ml-auto flex items-center gap-1.5 text-xs text-slate-500 dark:text-slate-400">
+                      {t("settings.webhookEnabled")}
+                      <input
+                        type="checkbox"
+                        checked={endpoint.enabled}
+                        onChange={(e) => void toggleWebhook(endpoint, e.target.checked)}
+                      />
+                    </label>
+                  </div>
+                  <div className="mt-1 break-all text-xs text-slate-500 dark:text-slate-400">{endpoint.url}</div>
+                  <div className="mt-2 flex flex-wrap gap-1.5">
+                    {endpoint.events.map((event) => {
+                      const labelKey = webhookEventLabelKey(event);
+                      return (
+                        <span key={event} className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">
+                          {labelKey ? t(labelKey) : event}
+                        </span>
+                      );
+                    })}
+                  </div>
+                  <div className="mt-2 flex flex-wrap gap-3 text-xs">
+                    <button onClick={() => void sendWebhookTest(endpoint)} className="text-slate-700 underline dark:text-slate-200">
+                      {t("settings.webhookTest")}
+                    </button>
+                    <button onClick={() => void toggleWebhookDeliveries(endpoint)} className="text-slate-700 underline dark:text-slate-200">
+                      {t("settings.webhookDeliveries")}
+                    </button>
+                    <button onClick={() => void rotateWebhook(endpoint)} className="text-slate-700 underline dark:text-slate-200">
+                      {t("settings.webhookRotate")}
+                    </button>
+                    <button onClick={() => void deleteWebhook(endpoint)} className="text-red-600 underline dark:text-red-400">
+                      {t("settings.webhookDelete")}
+                    </button>
+                  </div>
+                  {deliveriesOpen && (
+                    webhookDeliveries.length === 0 ? (
+                      <p className={`mt-2 ${mutedCls}`}>{t("settings.webhookDeliveriesEmpty")}</p>
+                    ) : (
+                      <table className="mt-2 w-full text-sm">
+                        <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                          <tr>
+                            <th className="px-3 py-2 font-medium">{t("settings.webhookDeliveryEvent")}</th>
+                            <th className="px-3 py-2 font-medium">{t("settings.webhookDeliveryStatus")}</th>
+                            <th className="px-3 py-2 font-medium">{t("settings.webhookDeliveryResponse")}</th>
+                            <th className="px-3 py-2 font-medium">{t("settings.webhookDeliveryAttempts")}</th>
+                            <th className="px-3 py-2 font-medium">{t("settings.webhookDeliveryTime")}</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {webhookDeliveries.map((delivery) => (
+                            <tr key={delivery.id} className="border-t border-slate-100 dark:border-slate-800">
+                              <td className="px-3 py-2 text-xs">{delivery.event}</td>
+                              <td className="px-3 py-2 text-xs">
+                                {t(`settings.webhookStatus.${delivery.status}`)}
+                                {delivery.lastError && (
+                                  <span className="block max-w-xs truncate text-[11px] text-red-600 dark:text-red-400" title={delivery.lastError}>
+                                    {delivery.lastError}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2 text-xs">{delivery.responseStatus ?? "-"}</td>
+                              <td className="px-3 py-2 text-xs">{delivery.attempts}</td>
+                              <td className="px-3 py-2 text-xs">
+                                {delivery.createdAt ? new Date(delivery.createdAt).toLocaleString() : "-"}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )
+                  )}
+                </div>
+              );
+            })}
+          </div>
         )}
       </div>
 
