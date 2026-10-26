@@ -1876,7 +1876,7 @@ function ChannelsPage() {
               <span className={chipCls}>{a.channel}</span>
               <span className="font-medium text-sm">{a.displayName ?? a.externalId}</span>
               <span className="text-xs text-slate-500 dark:text-slate-400">{a.status}</span>
-              {a.channel === "whatsapp" && (a as ChannelAccount & { isCoexistence?: boolean }).isCoexistence && (
+              {a.channel === "whatsapp" && a.isCoexistence && (
                 <span className="text-xs px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300">{t("channels.coexistence")}</span>
               )}
               <span className="text-xs text-slate-400 dark:text-slate-500">
