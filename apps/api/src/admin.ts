@@ -314,6 +314,26 @@ export interface AdminRouteDeps {
   authStore: AuthStore;
   adminStore: AdminStore;
   platformSettings: PlatformSettingsService;
+  /** app.ts's publicApiBase: the API's public base URL for this request. */
+  publicApiBase(c: Context<AppEnv>): string;
+}
+
+/**
+ * Connection reference payload (Admin → Settings): every callback URL an
+ * operator must paste into a provider dashboard, computed from the same
+ * public base the OAuth flows use. Verify-token entries carry the
+ * settings KEY NAME only — values are secrets and never leave the vault.
+ */
+export interface AdminConnectionInfo {
+  base: string;
+  webhooks: Array<{
+    id: string;
+    url: string;
+    verifyTokenKey: string | null;
+    /** True when Botara registers the webhook itself at connect time. */
+    autoConfigured: boolean;
+  }>;
+  oauthRedirects: Array<{ id: string; url: string }>;
 }
 
 interface SettingUpdateInput {
@@ -418,6 +438,37 @@ export function registerAdminRoutes(app: OpenAPIHono<AppEnv>, deps: AdminRouteDe
   app.get("/admin/audit", async (c) => {
     await guard(c);
     return c.json({ entries: await deps.adminStore.audit(parseLimit(c.req.query("limit"))) });
+  });
+
+  app.get("/admin/connection-info", async (c) => {
+    await guard(c);
+    const base = deps.publicApiBase(c);
+    const webhook = (
+      id: string,
+      path: string,
+      verifyTokenKey: string | null,
+      autoConfigured = false,
+    ): AdminConnectionInfo["webhooks"][number] => ({ id, url: `${base}${path}`, verifyTokenKey, autoConfigured });
+    const info: AdminConnectionInfo = {
+      base,
+      webhooks: [
+        webhook("whatsapp", "/webhooks/whatsapp", "WHATSAPP_VERIFY_TOKEN"),
+        webhook("messenger", "/webhooks/messenger", "META_VERIFY_TOKEN"),
+        webhook("instagram", "/webhooks/instagram", "META_VERIFY_TOKEN"),
+        webhook("threads", "/webhooks/threads", "THREADS_VERIFY_TOKEN"),
+        webhook("tiktok", "/webhooks/tiktok", null),
+        // Telegram: the connect flow calls setWebhook itself — the URL is
+        // listed so operators can verify what is registered, not paste it.
+        webhook("telegram", "/webhooks/telegram", null, true),
+        webhook("resend", "/webhooks/resend", null),
+        webhook("meta-data-deletion", "/webhooks/meta/data-deletion", null),
+      ],
+      oauthRedirects: ["messenger", "instagram", "threads", "tiktok"].map((id) => ({
+        id,
+        url: `${base}/channels/${id}/oauth/callback`,
+      })),
+    };
+    return c.json(info);
   });
 
   app.post("/admin/users/:id/platform-admin", async (c) => {

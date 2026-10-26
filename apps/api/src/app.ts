@@ -9,11 +9,11 @@ import {
   countConsecutiveOutbound, evaluateReplyWindow, MessagingWindowClosedError,
 } from "@botara/shared";
 import {
-  getDb, listContacts, createContact, updateContact, segmentCounts,
+  getDb, listContacts, getContact, createContact, updateContact, segmentCounts,
   listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
   touchConversationLastUserMessage,
   listTemplates, createTemplate, updateTemplateLatestCategory,
-  createBroadcast, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
+  createBroadcast, listBroadcasts, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
   deleteChannelAccount, channelAccountHasReferences, purgeChannelAccount, softDisconnectChannelAccount,
   applyTemplateCategoryChange,
@@ -195,7 +195,7 @@ export interface ApiDeps {
   /** Fase 3: readiness probes for /health/ready. */
   readiness: ReadinessChecker;
   /** Fase 3: in-process rate-limit overrides (tests use tiny limits). */
-  rateLimits?: { authPerMinute?: number; publicPerMinute?: number };
+  rateLimits?: { authPerMinute?: number; publicPerMinute?: number; utilityPerMinute?: number };
   /** Fase 4: flow-run enqueueing + inbound webhook dispatch (persist + match). */
   flowEnqueuer: FlowRunEnqueuer;
   flowDispatcher: InboundFlowDispatcher;
@@ -971,6 +971,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   };
   app.use("/auth/*", createRateLimiter("auth", deps.rateLimits?.authPerMinute ?? 20));
   app.use("/public/*", createRateLimiter("public", deps.rateLimits?.publicPerMinute ?? 120));
+  // Stateless operator utilities (moderation check) are metered too:
+  // authenticated does not mean unmetered (parity audit B2/R9).
+  app.use("/moderation", createRateLimiter("utility", deps.rateLimits?.utilityPerMinute ?? 60));
+  app.use("/moderation/*", createRateLimiter("utility", deps.rateLimits?.utilityPerMinute ?? 60));
 
   // ------------------------------------------------------------ auth helpers
   // Session token: Authorization Bearer wins, the httpOnly cookie is the
@@ -1133,7 +1137,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     );
   });
 
-  app.get("/", (c) => c.json({ name: "botara-api", phase: "Fase 3" }));
+  app.get("/", (c) => c.json({ name: "botara-api" }));
 
   // ---------------------------------------------------------------- auth
   const credentialsSchema = z.object({
@@ -1344,6 +1348,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     authStore: deps.authStore,
     adminStore: deps.adminStore,
     platformSettings: deps.platformSettings,
+    publicApiBase: (c) => publicApiBase(deps, c),
   });
 
 
@@ -1915,7 +1920,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   // verified workspace membership (see resolveAuthContext). Registered
   // BEFORE the routes it protects (Hono applies use() in order). The one
   // documented bypass is POST /broadcasts/estimate - a pure calculator over
-  // the request body that touches no workspace data.
+  // the request body that touches no workspace data. POST /moderation/check
+  // was a second, undocumented public surface until the parity audit (B2);
+  // it now sits behind this middleware like every other operator utility.
   const authMiddleware = async (c: Ctx, next: Next) => {
     if (c.req.path === "/broadcasts/estimate") return next();
     const auth = await resolveAuthContext(c);
@@ -1923,7 +1930,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (auth.workspaceId) c.set("workspaceId", auth.workspaceId);
     await next();
   };
-  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products"]) {
+  for (const prefix of ["/conversations", "/contacts", "/segments", "/templates", "/broadcasts", "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows", "/stats", "/growth-links", "/catalog-products", "/moderation"]) {
     app.use(prefix, authMiddleware);
     app.use(`${prefix}/*`, authMiddleware);
   }
@@ -2621,6 +2628,19 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ contact: { ...row, createdAt: iso(row.createdAt) } });
   });
 
+  const getContactRoute = createRoute({
+    method: "get", path: "/contacts/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "One contact" } },
+  });
+  app.openapi(getContactRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const row = await getContact(db, ws, c.req.valid("param").id);
+    if (!row) throw new AppError("NOT_FOUND", "Contact not found.", { status: 404 });
+    return c.json({ contact: { ...row, createdAt: iso(row.createdAt) } });
+  });
+
   // ------------------------------------- contact import / export (adopted)
   // Import: CSV (header-mapped) or JSON array, deduped within the file and
   // against the DB by (channel, externalId); per-row errors are reported,
@@ -3018,6 +3038,29 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       broadcast: { ...broadcast, status: "queued", createdAt: iso(broadcast.createdAt) },
       estimate,
     }, 201);
+  });
+
+  const listBroadcastsRoute = createRoute({
+    method: "get", path: "/broadcasts",
+    responses: { 200: { description: "Broadcasts of the workspace, newest first" } },
+  });
+  app.openapi(listBroadcastsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const rows = await listBroadcasts(db, ws);
+    // Delivery counts + estimate ride on the row; the realized cost is
+    // aggregated per broadcast so the history list shows spend without a
+    // detail fetch per row (ledger volume per broadcast is small).
+    const broadcasts = [];
+    for (const row of rows) {
+      const cost = await sumCostLedgerByReference(db, row.id);
+      broadcasts.push({
+        ...row,
+        createdAt: iso(row.createdAt),
+        totalCostUsd: cost.totalUsd,
+      });
+    }
+    return c.json({ broadcasts });
   });
 
   const getBroadcastRoute = createRoute({

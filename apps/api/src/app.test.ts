@@ -144,11 +144,12 @@ describe("api app - Fase 2 routes under Fase 3 auth", () => {
     expect(res.status).toBe(401);
   });
 
-  test("POST /moderation/check flags list terms without a database", async () => {
+  test("POST /moderation/check flags list terms without a database (authenticated since B2)", async () => {
     const app = createApp(testDeps());
+    const owner = await registerUser(app, "moderation@example.com");
     const res = await app.request("/moderation/check", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { ...owner.headers, "content-type": "application/json" },
       body: JSON.stringify({ text: "jangan bagikan kode otp kamu" }),
     });
     expect(res.status).toBe(200);
