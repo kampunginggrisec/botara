@@ -38,6 +38,46 @@ export function missingProductionEnv(
   return missing;
 }
 
+export interface ResolveBootEnvOptions {
+  /**
+   * Loads the panel (DB) overlay of the base env - injected by the caller
+   * so this package stays free of DB dependencies. Only invoked when the
+   * raw env carries both DATABASE_URL and TOKEN_VAULT_KEY (the overlay's
+   * own prerequisites).
+   */
+  loadEffective?: (
+    baseEnv: Record<string, string | undefined>,
+  ) => Promise<Record<string, string | undefined>>;
+  /** Notified when the overlay load fails and the raw env is used instead. */
+  onOverlayError?: (err: unknown) => void;
+}
+
+/**
+ * The env the production boot gate must judge: the process env overlaid
+ * with the admin-panel (DB) settings when those are loadable, so a secret
+ * stored ONLY in the panel satisfies the guard exactly like an env var -
+ * the effective env is what the runtime handlers actually read. Env-only
+ * installs (no DATABASE_URL / TOKEN_VAULT_KEY, or no loader wired)
+ * resolve to the raw process env unchanged, and a failed overlay load
+ * falls back to the raw env too: the gate then keeps its original
+ * refusal semantics instead of booting on a guess.
+ */
+export async function resolveBootEnv(
+  processEnv: Record<string, string | undefined>,
+  options: ResolveBootEnvOptions = {},
+): Promise<Record<string, string | undefined>> {
+  const { loadEffective, onOverlayError } = options;
+  if (!loadEffective || !hasValue(processEnv, "DATABASE_URL") || !hasValue(processEnv, "TOKEN_VAULT_KEY")) {
+    return processEnv;
+  }
+  try {
+    return await loadEffective(processEnv);
+  } catch (err) {
+    onOverlayError?.(err);
+    return processEnv;
+  }
+}
+
 /**
  * Throws an Error listing every missing required variable. Call at process
  * startup (API entrypoint) so a misconfigured production deploy crashes

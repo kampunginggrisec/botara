@@ -1,6 +1,6 @@
 import {
-  createTokenVault, getChannelAccountById, getDb, startEffectiveEnvRefresh, updateChannelAccountToken,
-  type EnvLike,
+  createTokenVault, getChannelAccountById, getDb, resolveEffectiveEnv, startEffectiveEnvRefresh,
+  updateChannelAccountToken, type EnvLike,
 } from "@botara/db";
 import {
   VaultCredentialProvider, configureAdapterCredentials, configureTikTokTokenPersistence,
@@ -8,7 +8,7 @@ import {
   envTelegramCredentials, envThreadsCredentials, envTikTokCredentials, envWhatsAppCredentials,
   type ChannelKey, type CredentialProvider,
 } from "@botara/channels";
-import { assertProductionEnv } from "@botara/config";
+import { assertProductionEnv, resolveBootEnv } from "@botara/config";
 import { createApp, defaultDeps } from "./app";
 
 /**
@@ -19,7 +19,9 @@ import { createApp, defaultDeps } from "./app";
  *
  * Fase 3 startup behaviour:
  * - NODE_ENV=production refuses to boot when DATABASE_URL, SESSION_SECRET
- *   or TOKEN_VAULT_KEY is missing (fail fast, never boot insecure).
+ *   or TOKEN_VAULT_KEY is missing (fail fast, never boot insecure). The
+ *   gate judges the EFFECTIVE env (admin-panel DB settings overlaid on the
+ *   process env), so panel-only secrets count exactly as env vars do.
  * - When the DB + vault key are configured, every channel adapter resolves
  *   secrets through the encrypted token vault (env vars remain the
  *   per-channel fallback for accounts without a vault ref).
@@ -44,8 +46,28 @@ import { createApp, defaultDeps } from "./app";
  *   CRUD /sequences + POST /sequences/:id/enroll
  */
 
+/**
+ * Boot gate on the EFFECTIVE env, not the raw process env: platform
+ * secrets may live ONLY in the admin panel (DB platform_settings) by
+ * design, and the runtime handlers read them through the same overlay
+ * (startEffectiveEnvRefresh below) - a panel-blind gate would refuse to
+ * boot a correctly configured install. When the overlay cannot be
+ * loaded, the raw env is gated instead, preserving the refusal.
+ */
+const bootEnv = await resolveBootEnv(process.env, {
+  loadEffective: (baseEnv) => {
+    const databaseUrl = baseEnv.DATABASE_URL;
+    // Unreachable in practice: resolveBootEnv only invokes the loader
+    // when DATABASE_URL and TOKEN_VAULT_KEY are both present.
+    if (!databaseUrl) return Promise.resolve(baseEnv);
+    return resolveEffectiveEnv(getDb(databaseUrl), baseEnv);
+  },
+  onOverlayError: (err) => console.error(
+    `[api] platform settings overlay unavailable for the boot gate; judging the raw env: ${err instanceof Error ? err.message : String(err)}`,
+  ),
+});
 try {
-  assertProductionEnv(process.env);
+  assertProductionEnv(bootEnv);
 } catch (err) {
   console.error(`[api] ${err instanceof Error ? err.message : String(err)}`);
   process.exit(1);
