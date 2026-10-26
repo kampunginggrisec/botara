@@ -77,6 +77,24 @@ describe("countConsecutiveOutbound (TikTok 10-message cap)", () => {
     expect(countConsecutiveOutbound(rows("out", "out"))).toBe(2);
   });
 
+  test("internal notes are transparent: they neither count nor reset the run", () => {
+    const mixed = (
+      ...entries: Array<{ direction: string; kind?: string }>
+    ) => entries;
+    // A note after the last send does not extend the business's run.
+    expect(countConsecutiveOutbound(mixed(
+      { direction: "in" }, { direction: "out" }, { direction: "out", kind: "note" },
+    ))).toBe(1);
+    // A note between sends does not break the run either.
+    expect(countConsecutiveOutbound(mixed(
+      { direction: "in" }, { direction: "out" }, { direction: "out", kind: "note" }, { direction: "out" },
+    ))).toBe(2);
+    // Notes alone after an inbound message keep the count at zero.
+    expect(countConsecutiveOutbound(mixed(
+      { direction: "in" }, { direction: "out", kind: "note" }, { direction: "out", kind: "note" },
+    ))).toBe(0);
+  });
+
   test("ConsecutiveSendCapError carries cap details", () => {
     const err = new ConsecutiveSendCapError("tiktok", 10, 10);
     expect(err.code).toBe("CONSECUTIVE_SEND_CAP");

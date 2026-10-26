@@ -100,10 +100,16 @@ export class MessagingWindowClosedError extends AppError {
  * may send at most 10 consecutive messages before the customer speaks
  * again. Pure helper - the API reply route and the worker send processor
  * both count through it so the rule can never drift between call sites.
+ *
+ * Internal notes (kind "note", package #2) are TRANSPARENT to the count:
+ * they never reach the customer, so they neither increment the counter
+ * nor reset it - the walk simply steps over them. Rows without a `kind`
+ * (legacy rows, other callers' projections) count as messages.
  */
-export function countConsecutiveOutbound(rows: Array<{ direction: string }>): number {
+export function countConsecutiveOutbound(rows: Array<{ direction: string; kind?: string }>): number {
   let count = 0;
   for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i]!.kind === "note") continue;
     if (rows[i]!.direction !== "out") break;
     count++;
   }
