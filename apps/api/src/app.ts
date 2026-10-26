@@ -1558,7 +1558,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         `[api] data-deletion purge failed for request ${confirmationCode}: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-    const base = (deps.env.APP_PUBLIC_URL ?? new URL(c.req.url).origin).replace(/\/$/, "");
+    const base = publicApiBase(deps, c);
     return c.json({
       url: `${base}/data-deletion/status/${confirmationCode}`,
       confirmation_code: confirmationCode,

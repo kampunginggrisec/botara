@@ -41,13 +41,14 @@ function fakeStore() {
   return { store, records, purged };
 }
 
-function deletionApp() {
+function deletionApp(extraEnv: Record<string, string> = {}) {
   const fake = fakeStore();
   const app = createApp(testDeps({
     env: {
       SESSION_SECRET: "test-session-secret",
       META_APP_SECRET: APP_SECRET,
       APP_PUBLIC_URL: "https://botara.example.com",
+      ...extraEnv,
     },
     dataDeletionStore: fake.store,
   }));
@@ -77,6 +78,20 @@ describe("Meta data-deletion callback", () => {
     const statusBody = (await status.json()) as { status: string; confirmation_code: string };
     expect(statusBody.status).toBe("completed");
     expect(statusBody.confirmation_code).toBe(body.confirmation_code);
+  });
+
+  test("the returned status url uses PUBLIC_WEBHOOK_BASE_URL (the /api mount) when set", async () => {
+    const { app } = deletionApp({ PUBLIC_WEBHOOK_BASE_URL: "https://botara.example.com/api" });
+    const res = await app.request("/webhooks/meta/data-deletion", {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        signed_request: signedRequest({ user_id: "fb-user-43", algorithm: "HMAC-SHA256", issued_at: 1760000000 }),
+      }).toString(),
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string; confirmation_code: string };
+    expect(body.url).toBe(`https://botara.example.com/api/data-deletion/status/${body.confirmation_code}`);
   });
 
   test("JSON posts are accepted too", async () => {
