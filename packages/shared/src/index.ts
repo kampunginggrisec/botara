@@ -27,3 +27,15 @@ export {
 export {
   PRESENCE_KEY_PREFIX, PRESENCE_HEARTBEAT_MS, PRESENCE_TTL_SECONDS, presenceKey,
 } from "./presence";
+export {
+  OUTBOUND_WEBHOOK_EVENTS, WEBHOOK_TEST_EVENT, isOutboundWebhookEvent, parseWebhookEvents,
+  WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_AUTO_DISABLE_FAILURES, WEBHOOK_HTTP_TIMEOUT_MS,
+  WEBHOOK_MESSAGE_PREVIEW_CHARS, webhookMessagePreview,
+  computeWebhookSignature, webhookSignatureHeader, verifyWebhookSignature,
+  WEBHOOK_SIGNATURE_TOLERANCE_SECONDS,
+  type OutboundWebhookEvent, type WebhookDeliveryEvent,
+} from "./outbound-webhooks";
+export {
+  checkOutboundWebhookUrl, ipv4BlockReason, ipv6BlockReason, isLoopbackIp,
+  type DnsLookupFn, type OutboundUrlCheck,
+} from "./ssrf";
