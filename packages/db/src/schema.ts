@@ -110,6 +110,28 @@ export const conversations = pgTable("conversations", {
   assignedUserId: uuid("assigned_user_id").references(() => users.id),
   /** Drives messaging-window enforcement (Meta 24h window, human-agent 7d). */
   lastUserMessageAt: timestamp("last_user_message_at", { withTimezone: true }),
+  /**
+   * AI copilot analysis (package #7): written ONLY by POST
+   * /conversations/:id/ai-analyze from a real model response - never
+   * fabricated, never updated by heuristics. aiSummary is the model's
+   * short thread summary; aiIntent one of the closed label set in
+   * @botara/ai (inquiry|purchase_intent|support|complaint|spam|other);
+   * aiIntentScore its 0-100 confidence. All four stay null until the
+   * first successful analysis; aiSummaryAt stamps that write.
+   */
+  aiSummary: text("ai_summary"),
+  aiSummaryAt: timestamp("ai_summary_at", { withTimezone: true }),
+  aiIntent: varchar("ai_intent", { length: 40 }),
+  aiIntentScore: integer("ai_intent_score"),
+  /**
+   * AI takeover (package #7): while set, AUTOMATIC AI sends on this
+   * conversation (flow ai_reply nodes) are paused - the worker port
+   * returns null before calling the model and the flow sends its
+   * authored fallback. Agent-invoked AI tools (suggest/analyze) are NOT
+   * blocked. Stamped by POST /ai-pause and automatically by any human
+   * inbox reply (classic takeover); cleared by POST /ai-resume.
+   */
+  aiPausedAt: timestamp("ai_paused_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [
   index("conversations_ws_idx").on(t.workspaceId),
@@ -144,6 +166,16 @@ export const messages = pgTable("messages", {
    * sends; the inbox resolves the display name from the member list.
    */
   authorUserId: uuid("author_user_id").references(() => users.id),
+  /**
+   * WHO produced this row (package #7): "human" for everything a person
+   * or an authored automation (flows, sequences, broadcasts, templates)
+   * wrote; "ai" ONLY for text a model generated (flow ai_reply nodes) -
+   * the badge is stamped at the send seam by origin, never inferred from
+   * content. The inbox renders an "AI" chip on ai rows. Default "human"
+   * keeps every pre-#7 row honest: none of them were model-generated
+   * through a badged path.
+   */
+  authorKind: varchar("author_kind", { length: 20 }).notNull().default("human"), // human|ai
   type: varchar("type", { length: 40 }).notNull().default("text"),
   body: text("body"),
   /**
@@ -668,11 +700,20 @@ export const costLedger = pgTable("cost_ledger", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
   channelAccountId: uuid("channel_account_id").references(() => channelAccounts.id),
   channel: varchar("channel", { length: 40 }).notNull(),
-  category: varchar("category", { length: 40 }).notNull(), // marketing|utility|authentication|service|...
+  category: varchar("category", { length: 40 }).notNull(), // marketing|utility|authentication|service|ai|...
   country: varchar("country", { length: 8 }), // recipient country (dial code / ISO) used for rating
-  units: integer("units").notNull().default(1), // messages, tokens, etc.
+  /**
+   * Billable units: delivered messages for sends; TOTAL TOKENS for AI
+   * rows (package #7) when the provider returned usage. NULL means "the
+   * provider reported no usage" - an honest unknown, never a fabricated
+   * 0/1. (Was NOT NULL DEFAULT 1 until #7; send writers still always
+   * pass an explicit count.)
+   */
+  units: integer("units"),
   amount: numeric("amount", { precision: 14, scale: 6 }).notNull().default("0"),
   currency: varchar("currency", { length: 8 }).notNull().default("USD"),
+  /** Model that produced an AI row's usage (package #7); null for send rows. */
+  model: varchar("model", { length: 120 }),
   referenceId: varchar("reference_id", { length: 200 }), // message id / job id
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("cost_ledger_ws_created_idx").on(t.workspaceId, t.createdAt)]);

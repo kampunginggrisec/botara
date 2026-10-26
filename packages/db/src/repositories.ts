@@ -220,6 +220,54 @@ export async function getConversation(
   return rows.find((r) => r.id === id) ?? null;
 }
 
+/**
+ * Persist one AI analysis (package #7): the summary/intent/score a real
+ * model returned for this conversation, stamped with the write time.
+ * Workspace-scoped like every conversation mutation; null when the
+ * conversation does not belong to the workspace. Callers validate the
+ * model output BEFORE calling - this writer stores, never judges.
+ */
+export async function updateConversationAiAnalysis(
+  db: Database,
+  workspaceId: string,
+  conversationId: string,
+  input: { summary: string; intent: string; intentScore: number },
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .update(conversations)
+    .set({
+      aiSummary: input.summary,
+      aiIntent: input.intent,
+      aiIntentScore: input.intentScore,
+      aiSummaryAt: new Date(),
+    })
+    .where(and(eq(conversations.id, conversationId), eq(conversations.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * Set or clear the AI takeover pause (package #7). Workspace-scoped;
+ * null when the conversation does not belong to the workspace. A plain
+ * set on purpose: idempotency (re-pausing keeps the original stamp) is
+ * the CALLER's job - the pause route and the reply route both hold the
+ * loaded conversation row and skip the write when already paused.
+ */
+export async function setConversationAiPaused(
+  db: Database,
+  workspaceId: string,
+  conversationId: string,
+  paused: boolean,
+  now: Date = new Date(),
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .update(conversations)
+    .set({ aiPausedAt: paused ? now : null })
+    .where(and(eq(conversations.id, conversationId), eq(conversations.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
+}
+
 // ---------------------------------------------------------------- messages
 
 export type MessageRow = typeof messages.$inferSelect;
@@ -241,6 +289,12 @@ export async function createMessage(
     kind?: "message" | "note";
     /** Authoring workspace user (internal notes); null for traffic. */
     authorUserId?: string;
+    /**
+     * Producer kind (package #7): "ai" only for model-generated text
+     * stamped at the send seam; defaults to "human" in code (not just
+     * the DB default) so every writer - real or fake DB - records it.
+     */
+    authorKind?: "human" | "ai";
     type?: string;
     body?: string;
     /** Rich block (outbound sends) or { buttonPayload } (webchat clicks). */
@@ -266,6 +320,7 @@ export async function createMessage(
       direction: input.direction,
       kind: input.kind ?? "message",
       authorUserId: input.authorUserId,
+      authorKind: input.authorKind ?? "human",
       type: input.type ?? "text",
       body: input.body,
       payload: input.payload ?? null,
@@ -849,9 +904,16 @@ export async function insertCostLedger(
     channel: string;
     category: string;
     country?: string;
-    units?: number;
+    /**
+     * Billable units. Omitted = 1 (the send-writer default); an explicit
+     * null writes SQL NULL - "usage unknown" for AI rows (package #7),
+     * never a fabricated count.
+     */
+    units?: number | null;
     amountUsd: number;
     referenceId?: string;
+    /** Producing model for AI rows (package #7); omitted for sends. */
+    model?: string;
   },
 ): Promise<void> {
   await db.insert(costLedger).values({
@@ -860,9 +922,41 @@ export async function insertCostLedger(
     channel: input.channel,
     category: input.category,
     country: input.country,
-    units: input.units ?? 1,
+    units: input.units === undefined ? 1 : input.units,
     amount: input.amountUsd.toFixed(6),
     currency: "USD",
+    model: input.model,
+    referenceId: input.referenceId,
+  });
+}
+
+/**
+ * Record one AI call in the cost ledger (package #7). Category "ai";
+ * amount is ALWAYS 0 - the codebase has no per-model chat rate card, so
+ * tokens are the recorded truth and no price is ever invented. Units are
+ * the call's total tokens when the provider returned usage, else NULL
+ * ("the provider reported no usage"). The model is always stamped so a
+ * usage row can be attributed without guessing from the reference.
+ */
+export async function insertAiUsageLedger(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channelAccountId?: string;
+    channel: string;
+    model: string;
+    totalTokens: number | null;
+    referenceId: string;
+  },
+): Promise<void> {
+  await insertCostLedger(db, {
+    workspaceId: input.workspaceId,
+    channelAccountId: input.channelAccountId,
+    channel: input.channel,
+    category: "ai",
+    units: input.totalTokens,
+    amountUsd: 0,
+    model: input.model,
     referenceId: input.referenceId,
   });
 }
@@ -878,7 +972,7 @@ export async function sumCostLedgerByReference(
     .where(eq(costLedger.referenceId, referenceId));
   return {
     totalUsd: rows.reduce((sum, r) => sum + Number(r.amount), 0),
-    units: rows.reduce((sum, r) => sum + r.units, 0),
+    units: rows.reduce((sum, r) => sum + (r.units ?? 0), 0),
     entries: rows.length,
   };
 }
@@ -2048,7 +2142,9 @@ export async function countServiceUnitsInRange(
         sql`${costLedger.createdAt} < ${to}`,
       ),
     );
-  return rows.reduce((sum, r) => sum + r.units, 0);
+  // AI rows (category "ai") can carry NULL units and never match the
+  // "service" filter; the ?? 0 keeps the sum honest regardless.
+  return rows.reduce((sum, r) => sum + (r.units ?? 0), 0);
 }
 
 // ------------------------------------------------------------- readiness (Fase 3)
