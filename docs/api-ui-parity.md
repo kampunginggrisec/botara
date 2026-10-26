@@ -71,6 +71,11 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 | PATCH /conversations/{}/assign | UI | Inbox header assignee select |
 | PATCH /conversations/{}/status | UI | Inbox header status select |
 | POST /conversations/{}/ai-suggest | UI | Inbox composer "AI suggest" (F4) — fills the draft, never auto-sends; honest 503 toast when no AI provider is configured |
+| POST /conversations/{}/notes | UI | Inbox composer Note mode (package #2) — internal timeline notes, never sent |
+| GET /saved-replies | UI | Inbox composer saved-replies picker (package #2) |
+| POST /saved-replies | UI | Saved-replies picker → New form |
+| PATCH /saved-replies/{} | UI | Saved-replies picker → Edit form |
+| DELETE /saved-replies/{} | UI | Saved-replies picker → per-item Delete |
 | POST /moderation/check | UI | Inbox composer "Check" (F9). Behind session auth + the utility rate limit since the parity fix (B2) — it was a public, unmetered endpoint before |
 | GET /contacts | UI | Contacts table |
 | POST /contacts | UI | Contacts → "Add contact" (F3) |
