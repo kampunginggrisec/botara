@@ -5,6 +5,7 @@ import {
 } from "@botara/ai";
 import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
+  ensureBroadcastRecipients, advanceBroadcastRecipient,
   getFlowById, getContact, getWorkspaceById,
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
@@ -31,7 +32,7 @@ import { countConsecutiveOutbound } from "@botara/shared";
 import { putObject } from "@botara/media";
 import {
   isFlowWaitTimeout, processBroadcast, processFlowRun, processFlowWaitTimeout, processSendMessage,
-  type BroadcastSnapshot, type FlowRunJobData, type FlowRunRef, type SendMessageJobData, type WorkerPorts,
+  type BroadcastJobData, type BroadcastSnapshot, type FlowRunJobData, type FlowRunRef, type SendMessageJobData, type WorkerPorts,
 } from "./processors";
 import { firstSendMessageOf, storedGraphSchema, toRunnableFlow, type FlowState } from "@botara/flow-engine";
 import {
@@ -346,7 +347,25 @@ function buildProdPorts(db: Database): WorkerPorts {
         channelDisplayName: account.displayName,
       };
     },
-    async listBroadcastTargets(broadcast) {
+    async listBroadcastTargets(broadcast, onlyContactIds) {
+      // Resend mode (package #4): target exactly the given contacts -
+      // the original audience may have changed since the first pass.
+      if (onlyContactIds) {
+        const targets = [];
+        for (const contactId of onlyContactIds) {
+          const r = await getContact(db, broadcast.workspaceId, contactId);
+          if (!r) continue;
+          targets.push({
+            contactId: r.id,
+            externalId: r.externalId,
+            displayName: r.displayName,
+            channel: r.channel,
+            tags: (r.tags as string[]) ?? [],
+            customFields: (r.customFields as Record<string, unknown>) ?? {},
+          });
+        }
+        return targets;
+      }
       if (!broadcast.tag) return [];
       const rows = await listContacts(db, broadcast.workspaceId, { tag: broadcast.tag });
       return rows.map((r) => ({
@@ -357,6 +376,16 @@ function buildProdPorts(db: Database): WorkerPorts {
         tags: (r.tags as string[]) ?? [],
         customFields: (r.customFields as Record<string, unknown>) ?? {},
       }));
+    },
+    async ensureBroadcastRecipients(broadcastId, workspaceId, contactIds) {
+      await ensureBroadcastRecipients(db, { broadcastId, workspaceId, contactIds });
+    },
+    async updateBroadcastRecipient({ broadcastId, contactId, to, providerMessageId, error }) {
+      await advanceBroadcastRecipient(db, {
+        broadcastId, contactId, to,
+        ...(providerMessageId ? { providerMessageId } : {}),
+        ...(error !== undefined ? { error } : {}),
+      });
     },
     async enqueueSendMessage(data: SendMessageJobData) {
       const queue = queueByName.get("send-message");
@@ -866,7 +895,7 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
     case "send-message":
       return processSendMessage(buildProdPorts(db), job.data as SendMessageJobData);
     case "broadcast":
-      return processBroadcast(buildProdPorts(db), job.data as { broadcastId: string });
+      return processBroadcast(buildProdPorts(db), job.data as BroadcastJobData);
     case "flow-run":
       // Collect-input timeout markers share the queue with runs: a
       // marker claims its wait and (usually) enqueues the real resume.

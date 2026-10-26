@@ -42,6 +42,13 @@ export interface SendMessageJobData {
   messageId?: string;
   /** Broadcast id this send belongs to (cost ledger reference + counters). */
   referenceId?: string;
+  /**
+   * Explicit broadcast context (package #4): when set together with
+   * contactId, the send outcome is recorded on the broadcast_recipients
+   * row for (broadcastId, contactId). referenceId alone is NOT used for
+   * this - it stays a pure billing/counter reference.
+   */
+  broadcastId?: string;
   /** Botara contact id (flow runs), used by conversation-scoped send guards. */
   contactId?: string;
   /**
@@ -209,7 +216,29 @@ export interface WorkerPorts {
     conversationExternalId?: string;
   }): Promise<number>;
   loadBroadcast(broadcastId: string): Promise<BroadcastSnapshot | null>;
-  listBroadcastTargets(broadcast: BroadcastSnapshot): Promise<BroadcastTarget[]>;
+  /**
+   * Fan-out targets. Without `onlyContactIds`, the broadcast's audience
+   * (its tag) decides; with it (resend-to-failed), exactly those
+   * contacts are targeted, whatever the tag matches today.
+   */
+  listBroadcastTargets(broadcast: BroadcastSnapshot, onlyContactIds?: string[]): Promise<BroadcastTarget[]>;
+  /**
+   * Per-recipient records (package #4): create the pending rows for a
+   * fan-out (idempotent). Optional - without it, sends proceed exactly
+   * as before, just without per-recipient truth.
+   */
+  ensureBroadcastRecipients?(broadcastId: string, workspaceId: string, contactIds: string[]): Promise<void>;
+  /**
+   * Record one broadcast send's outcome on its recipient row (package
+   * #4). Optional, same rationale as ensureBroadcastRecipients.
+   */
+  updateBroadcastRecipient?(input: {
+    broadcastId: string;
+    contactId: string;
+    to: "sent" | "failed";
+    providerMessageId?: string;
+    error?: string;
+  }): Promise<void>;
   /**
    * Live status of a channel account (the send choke point's disconnect
    * guard). Optional: without it, sends rely on the enqueue-time
@@ -284,6 +313,15 @@ export async function processSendMessage(
   data: SendMessageJobData,
 ): Promise<{ externalMessageId: string; costUsd: number; skipped?: boolean }> {
   const category = billingCategory(data);
+  // Per-recipient broadcast record (package #4): only broadcast fan-out
+  // jobs carry both ids. Bookkeeping is best-effort, exactly like the
+  // aggregate counters - a recipient-row failure never fails the send.
+  const recordRecipient = async (to: "sent" | "failed", extra: { providerMessageId?: string; error?: string }) => {
+    if (!data.broadcastId || !data.contactId || !ports.updateBroadcastRecipient) return;
+    await ports.updateBroadcastRecipient({
+      broadcastId: data.broadcastId, contactId: data.contactId, to, ...extra,
+    }).catch(() => undefined);
+  };
   try {
     // Disconnected-account guard: a soft-disconnected (or purged)
     // account must not send, whatever surface queued the job (flow,
@@ -295,6 +333,7 @@ export async function processSendMessage(
       if (accountStatus !== "connected") {
         if (data.messageId) await ports.updateMessageStatus(data.messageId, "failed").catch(() => undefined);
         if (data.referenceId) await ports.incrementBroadcastCounts(data.referenceId, { failed: 1 }).catch(() => undefined);
+        await recordRecipient("failed", { error: "Channel account is not connected." });
         return { externalMessageId: "", costUsd: 0, skipped: true };
       }
     }
@@ -362,22 +401,44 @@ export async function processSendMessage(
     });
     if (data.messageId) await ports.updateMessageStatus(data.messageId, "sent", result.externalMessageId);
     if (data.referenceId) await ports.incrementBroadcastCounts(data.referenceId, { sent: 1 });
+    await recordRecipient("sent", { providerMessageId: result.externalMessageId });
     return { externalMessageId: result.externalMessageId, costUsd };
   } catch (err) {
     if (data.messageId) await ports.updateMessageStatus(data.messageId, "failed").catch(() => undefined);
     if (data.referenceId) await ports.incrementBroadcastCounts(data.referenceId, { failed: 1 }).catch(() => undefined);
+    await recordRecipient("failed", { error: err instanceof Error ? err.message : String(err) });
     throw err;
   }
+}
+
+/**
+ * Broadcast fan-out job (package #4 adds the resend mode): a plain
+ * `{ broadcastId }` fans out to the broadcast's whole audience; a job
+ * carrying `contactIds` (from POST /broadcasts/:id/resend-failed) sends
+ * ONLY to those contacts - the resend re-renders the original template
+ * + params per recipient exactly like the first pass, but its send jobs
+ * carry a `:resend:{token}` idempotency suffix because BullMQ keeps the
+ * original `${broadcastId}:${contactId}` jobs and would silently drop a
+ * same-id re-add.
+ */
+export interface BroadcastJobData {
+  broadcastId: string;
+  /** Resend mode: restrict the fan-out to these contacts. */
+  contactIds?: string[];
+  /** Resend mode: per-request token making the send job ids unique. */
+  resendToken?: string;
 }
 
 /**
  * "broadcast": fan-out. For each target contact, enqueue one send-message
  * job whose idempotency key is the stable `${broadcastId}:${contactId}` -
  * re-running the fan-out (retry, crash recovery) can never double-send.
+ * A pending broadcast_recipients row is ensured per target BEFORE the
+ * send is enqueued, so the send outcome always has a row to land on.
  */
 export async function processBroadcast(
   ports: WorkerPorts,
-  data: { broadcastId: string },
+  data: BroadcastJobData,
 ): Promise<{ enqueued: number }> {
   const broadcast = await ports.loadBroadcast(data.broadcastId);
   if (!broadcast) throw new Error(`Broadcast ${data.broadcastId} not found`);
@@ -397,7 +458,13 @@ export async function processBroadcast(
     await ports.updateBroadcastStatus?.(broadcast.id, "failed").catch(() => undefined);
     return { enqueued: 0 };
   }
-  const targets = await ports.listBroadcastTargets(broadcast);
+  const resendOnly = data.contactIds !== undefined;
+  const targets = await ports.listBroadcastTargets(broadcast, data.contactIds);
+  if (ports.ensureBroadcastRecipients && targets.length > 0) {
+    await ports.ensureBroadcastRecipients(
+      broadcast.id, broadcast.workspaceId, targets.map((t) => t.contactId),
+    );
+  }
   const paramTemplates = broadcast.templateParams ?? [];
   for (const target of targets) {
     // Per-recipient template parameters (variables #1): each param
@@ -440,7 +507,11 @@ export async function processBroadcast(
       template,
       country: target.country ?? broadcast.country,
       referenceId: broadcast.id,
-      idempotencyKey: `${broadcast.id}:${target.contactId}`,
+      broadcastId: broadcast.id,
+      contactId: target.contactId,
+      idempotencyKey: resendOnly
+        ? `${broadcast.id}:${target.contactId}:resend:${data.resendToken ?? "1"}`
+        : `${broadcast.id}:${target.contactId}`,
     });
   }
   return { enqueued: targets.length };

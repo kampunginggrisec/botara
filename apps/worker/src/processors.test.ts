@@ -11,6 +11,10 @@ function fakePorts(overrides: Partial<WorkerPorts> = {}) {
   const increments: Array<{ id: string; sent?: number; failed?: number }> = [];
   const fields: Array<{ contactId: string; field: string; value: string }> = [];
   const resumes: Array<{ seconds: number }> = [];
+  const ensured: Array<{ broadcastId: string; workspaceId: string; contactIds: string[] }> = [];
+  const recipientUpdates: Array<{
+    broadcastId: string; contactId: string; to: string; providerMessageId?: string; error?: string;
+  }> = [];
   const broadcast: BroadcastSnapshot = {
     id: "b1", workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
     accountExternalId: "62812", template: { name: "promo", language: "id", latestCategory: "marketing" },
@@ -29,12 +33,16 @@ function fakePorts(overrides: Partial<WorkerPorts> = {}) {
       ];
     },
     async enqueueSendMessage(data) { sent.push(data); },
+    async ensureBroadcastRecipients(broadcastId, workspaceId, contactIds) {
+      ensured.push({ broadcastId, workspaceId, contactIds });
+    },
+    async updateBroadcastRecipient(update) { recipientUpdates.push(update); },
     async setContactField(_ws, contactId, field, value) { fields.push({ contactId, field, value }); },
     async httpFetch() {},
     async scheduleFlowResume(_job, seconds) { resumes.push({ seconds }); },
     ...overrides,
   };
-  return { ports, sent, costs, statuses, increments, fields, resumes };
+  return { ports, sent, costs, statuses, increments, fields, resumes, ensured, recipientUpdates };
 }
 
 describe("worker processors (fake ports)", () => {
@@ -369,5 +377,101 @@ describe("variables package #1 (broadcast params + flow context)", () => {
     expect(f.sent).toHaveLength(1);
     expect(f.sent[0]).toMatchObject({ text: "Halo Bima, kode K-9 dari Toko Uji!" });
     expect(result.warnings).toEqual([]);
+  });
+});
+
+describe("broadcast recipient records (package #4)", () => {
+  test("fan-out: ensures one pending row per target BEFORE enqueueing, jobs carry the broadcast context", async () => {
+    const f = fakePorts();
+    const result = await processBroadcast(f.ports, { broadcastId: "b1" });
+    expect(result.enqueued).toBe(2);
+    expect(f.ensured).toEqual([{ broadcastId: "b1", workspaceId: "ws1", contactIds: ["c1", "c2"] }]);
+    expect(f.sent.map((s) => [s.broadcastId, s.contactId])).toEqual([["b1", "c1"], ["b1", "c2"]]);
+  });
+
+  test("fan-out retry safety: re-running the fan-out re-ensures the same rows (repository upsert-ignores)", async () => {
+    const f = fakePorts();
+    await processBroadcast(f.ports, { broadcastId: "b1" });
+    await processBroadcast(f.ports, { broadcastId: "b1" });
+    expect(f.ensured).toEqual([
+      { broadcastId: "b1", workspaceId: "ws1", contactIds: ["c1", "c2"] },
+      { broadcastId: "b1", workspaceId: "ws1", contactIds: ["c1", "c2"] },
+    ]);
+    // Send job ids stay the stable originals, so BullMQ dedupes the sends.
+    expect(f.sent.map((s) => s.idempotencyKey)).toEqual(["b1:c1", "b1:c2", "b1:c1", "b1:c2"]);
+  });
+
+  test("resend mode: only the given contacts are targeted and the send keys are resend-scoped", async () => {
+    const f = fakePorts({
+      async listBroadcastTargets(_broadcast, onlyContactIds) {
+        const all = [
+          { contactId: "c1", externalId: "628111" },
+          { contactId: "c2", externalId: "628222" },
+        ];
+        return onlyContactIds ? all.filter((t) => onlyContactIds.includes(t.contactId)) : all;
+      },
+    });
+    const result = await processBroadcast(f.ports, {
+      broadcastId: "b1", contactIds: ["c2"], resendToken: "tok-1",
+    });
+    expect(result.enqueued).toBe(1);
+    expect(f.ensured).toEqual([{ broadcastId: "b1", workspaceId: "ws1", contactIds: ["c2"] }]);
+    expect(f.sent[0]).toMatchObject({ broadcastId: "b1", contactId: "c2", toExternalId: "628222" });
+    expect(f.sent[0]!.idempotencyKey).toBe("b1:c2:resend:tok-1");
+  });
+
+  test("send success: recipient flips to sent with the provider message id", async () => {
+    const f = fakePorts();
+    await processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+      accountExternalId: "62812", toExternalId: "628111",
+      template: { name: "promo", language: "id", latestCategory: "marketing" },
+      country: "ID", referenceId: "b1", broadcastId: "b1", contactId: "c1",
+      idempotencyKey: "b1:c1",
+    });
+    expect(f.recipientUpdates).toEqual([
+      { broadcastId: "b1", contactId: "c1", to: "sent", providerMessageId: "wamid.1" },
+    ]);
+  });
+
+  test("send failure: recipient flips to failed with the error, send still rethrows", async () => {
+    const f = fakePorts({
+      async send() { throw new Error("provider down"); },
+    });
+    await expect(processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+      accountExternalId: "62812", toExternalId: "628111",
+      template: { name: "promo", language: "id", latestCategory: "marketing" },
+      country: "ID", referenceId: "b1", broadcastId: "b1", contactId: "c1",
+      idempotencyKey: "b1:c1",
+    })).rejects.toThrow("provider down");
+    expect(f.recipientUpdates).toEqual([
+      { broadcastId: "b1", contactId: "c1", to: "failed", error: "provider down" },
+    ]);
+  });
+
+  test("disconnected skip: recipient flips to failed with the not-connected reason", async () => {
+    const f = fakePorts({
+      async resolveAccountStatus() { return "disconnected"; },
+    });
+    const result = await processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+      accountExternalId: "62812", toExternalId: "628111", text: "hi",
+      referenceId: "b1", broadcastId: "b1", contactId: "c1", idempotencyKey: "b1:c1",
+    });
+    expect(result.skipped).toBe(true);
+    expect(f.recipientUpdates).toEqual([
+      { broadcastId: "b1", contactId: "c1", to: "failed", error: "Channel account is not connected." },
+    ]);
+  });
+
+  test("non-broadcast sends record nothing (no broadcast context on the job)", async () => {
+    const f = fakePorts();
+    await processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "telegram",
+      accountExternalId: "bot", toExternalId: "42", text: "hi",
+      messageId: "m1", idempotencyKey: "k1",
+    });
+    expect(f.recipientUpdates).toEqual([]);
   });
 });
