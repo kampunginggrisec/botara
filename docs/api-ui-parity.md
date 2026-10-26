@@ -49,6 +49,12 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 | POST /auth/tokens | UI | Settings → API tokens |
 | DELETE /auth/tokens/{} | UI | Settings → API tokens |
 
+> Adoption #5 (scoped API tokens): the token routes themselves are
+> unchanged, but POST /auth/tokens now also accepts `workspaceId`,
+> `scopes`, and `expiresAt`, and GET /auth/tokens returns those fields
+> in its metadata. The Settings form drives all of them. Semantics:
+> [api-tokens.md](api-tokens.md).
+
 ### Workspaces & members
 
 | Route | Class | UI location / reason |

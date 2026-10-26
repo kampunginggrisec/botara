@@ -1,9 +1,10 @@
 /**
  * Botara REST client for the MCP server. The MCP process holds ONE
- * personal API token (BOTARA_API_TOKEN, a `bta_...` token created in
- * Botara Settings) and talks to the Botara API exactly like any other API
- * client - all authorization, workspace membership, and messaging-window
- * rules are enforced server-side by the API, never re-implemented here.
+ * API token (BOTARA_API_TOKEN, a `bta_...` token created in Botara
+ * Settings - personal or scoped, see docs/api-tokens.md) and talks to
+ * the Botara API exactly like any other API client - all authorization,
+ * workspace membership, scope, and messaging-window rules are enforced
+ * server-side by the API, never re-implemented here.
  */
 
 export interface BotaraClientConfig {

@@ -96,10 +96,17 @@ natively; Claude Desktop needs a stdio bridge such as `mcp-remote`).
 
 ## Security notes
 
-- **The token is full API access for its user.** Every workspace the user
+- **A personal token is full API access for its user.** Every workspace the user
   belongs to, with the user's role. Treat it like a password: never commit
   it, never share it, prefer one token per machine/purpose so revocation
   is painless.
+- **Prefer a scoped token for MCP.** At creation you can bind the token to
+  one workspace, limit it to specific scopes, and set an expiry
+  ([api-tokens.md](api-tokens.md)). Enforcement is the API's: a tool call
+  outside the token's scopes surfaces the API's `403 FORBIDDEN` as the
+  tool error. Note `list_workspaces` needs `/auth/me`, which restricted
+  tokens cannot call - with a bound token, pass its workspace id to the
+  other tools directly.
 - Revoke in **Settings -> API tokens** - revocation is immediate (the API
   checks the hash on every request) and `last_used_at` shows whether a
   token is still active.

@@ -85,6 +85,32 @@ describe("tool handlers (fake REST client)", () => {
     expect((err as BotaraApiError).status).toBe(422);
   });
 
+  test("a scoped token's 403 surfaces unchanged (adoption #5: the client adds no auth logic)", async () => {
+    // With BOTARA_API_TOKEN set to a scoped token lacking
+    // conversations:write, the API answers 403 FORBIDDEN with the
+    // required scope in details; the MCP layer must surface exactly
+    // that - enforcement lives server-side only.
+    const { client, calls } = fakeClient(() => ({
+      status: 403,
+      body: {
+        error: {
+          code: "FORBIDDEN",
+          message: "This API token lacks the required scope: conversations:write.",
+          details: { requiredScope: "conversations:write", grantedScopes: ["conversations:read"] },
+        },
+      },
+    }));
+    const err = await def("send_reply")
+      .run(client, { workspaceId: "ws1", conversationId: "c9", text: "hi" })
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BotaraApiError);
+    expect((err as BotaraApiError).code).toBe("FORBIDDEN");
+    expect((err as BotaraApiError).status).toBe(403);
+    // The call itself was the ordinary REST call - no pre-flight, no retry.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ method: "POST", url: "http://api.test/api/conversations/c9/reply" });
+  });
+
   test("test_run_flow and enroll_sequence hit their endpoints", async () => {
     const { client, calls } = fakeClient(() => ({ status: 200, body: { ok: true } }));
     await def("test_run_flow").run(client, { workspaceId: "ws1", flowId: "f1", text: "price" });
