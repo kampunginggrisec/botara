@@ -1623,7 +1623,7 @@ export type KbChunkRow = typeof kbChunks.$inferSelect;
 
 export async function createKbDocument(
   db: Database,
-  input: { workspaceId: string; title: string; sourceText: string },
+  input: { workspaceId: string; title: string; sourceText: string; sourceFilename?: string | null },
 ): Promise<KbDocumentRow> {
   const [row] = await db.insert(kbDocuments).values(input).returning();
   return row!;

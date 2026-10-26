@@ -329,6 +329,8 @@ export const kbDocuments = pgTable("kb_documents", {
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
   title: varchar("title", { length: 300 }).notNull(),
   sourceText: text("source_text").notNull(),
+  /** Original filename when the document came from a file upload (provenance only; the file itself is never stored). Null for typed documents. */
+  sourceFilename: text("source_filename"),
   status: varchar("status", { length: 40 }).notNull().default("pending"), // pending|processing|ready|failed
   chunkCount: integer("chunk_count").notNull().default(0),
   /** Last ingestion failure reason (status = failed), for the admin UI. */
