@@ -337,6 +337,7 @@ export interface PublicConfig {
   whatsappEmbeddedConfigId: string | null;
   instagramAppId: string | null;
   threadsAppId: string | null;
+  tiktokAppId: string | null;
   publicWebhookBaseUrl: string | null;
 }
 

@@ -1474,7 +1474,8 @@ function SequencesPage() {
   const openNew = () => {
     setEditingId(null);
     setName("");
-    setAccountId(accounts[0]?.id ?? "");
+    // TikTok accounts are excluded (reactive-only channel, no sequences).
+    setAccountId(accounts.find((a) => a.channel !== "tiktok")?.id ?? "");
     setSteps([emptyStep()]);
     setShowForm(true);
   };
@@ -1552,11 +1553,11 @@ function SequencesPage() {
               <label className={labelCls}>{t("sequences.accountLabel")}</label>
               <select value={accountId} onChange={(e) => setAccountId(e.target.value)} className={inputCls} disabled={Boolean(editingId)}>
                 <option value="">-</option>
-                {accounts.map((a) => (
+                {accounts.filter((a) => a.channel !== "tiktok").map((a) => (
                   <option key={a.id} value={a.id}>{a.channel} · {a.displayName ?? a.externalId}</option>
                 ))}
               </select>
-              {accounts.length === 0 && <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{t("sequences.noAccounts")}</p>}
+              {accounts.filter((a) => a.channel !== "tiktok").length === 0 && <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">{t("sequences.noAccounts")}</p>}
             </div>
           </div>
           <div>
@@ -2005,6 +2006,22 @@ function ChannelsPage() {
         </div>
 
         <div className={connectCard}>
+          <div className="font-medium text-sm">{t("channels.tiktok.title")}</div>
+          <p className={`mt-1 ${mutedCls}`}>{t("channels.tiktok.body")}</p>
+          <p className="mt-2 text-xs text-slate-500 dark:text-slate-400">{t("channels.tiktok.hint")}</p>
+          {config?.tiktokAppId ? (
+            <>
+              <a href={oauthHref("tiktok")} className={`mt-3 inline-block ${primaryBtn}`}>{t("channels.tiktok.button")}</a>
+              <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">{t("channels.oauth.openNote", { provider: "TikTok" })}</p>
+            </>
+          ) : (
+            <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+              {t("channels.tiktok.notConfigured")}
+            </div>
+          )}
+        </div>
+
+        <div className={connectCard}>
           <div className="font-medium text-sm">{t("channels.webchat.title")}</div>
           <p className={`mt-1 ${mutedCls}`}>{t("channels.webchat.body")}</p>
           <pre className="mt-3 overflow-x-auto rounded-md bg-slate-50 p-3 font-mono text-[11px] text-slate-700 dark:bg-slate-800 dark:text-slate-200">{widgetSnippet}</pre>
@@ -2117,7 +2134,7 @@ function GrowthPage() {
             <label className={labelCls}>{t("growth.account")}</label>
             <select value={accountId} onChange={(e) => setAccountId(e.target.value)} className={inputCls}>
               <option value="">{t("growth.selectAccount")}</option>
-              {accounts.map((a) => (
+              {accounts.filter((a) => a.channel !== "tiktok").map((a) => (
                 <option key={a.id} value={a.id}>{a.channel} · {a.displayName ?? a.externalId}</option>
               ))}
             </select>

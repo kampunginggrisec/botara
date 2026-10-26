@@ -30,7 +30,7 @@ not started; *Not planned* = deliberately out of scope for now.
 | Telegram bots | All plans | **Implemented** | Bot API adapter + dashboard token connect (getMe-validated, vaulted, webhook auto-set) |
 | Email | All plans | **Implemented** | Resend send + inbound: domain routing, Receiving API fetch, attachments copied to R2, filed into the inbox |
 | Website live-chat widget | All plans | **Implemented** | Self-built embeddable widget (`docs/webchat.md`), `data-lang` EN/ID + `data-theme` light/dark/auto. (Meta's own Customer Chat Plugin retired 2024-05-09.) |
-| TikTok messaging + comment automation | All plans (pricing table) | **Not planned** | Not in Botara's blueprint channel set |
+| TikTok messaging + comment automation | All plans (pricing table) | **Implemented (reactive-only)** | Business Messaging API v1.3 (Open Beta, access gated on TikTok's approval of the platform app): DM inbox + flows with the 48h window and 10-consecutive-message cap enforced, QA reply-card rich buttons, inbound media to storage, comment-to-DM for ID/VN/TH-registered businesses (TikTok-flagged high-intent comments only, not arbitrary keywords). No business-initiated messages exist on TikTok, so broadcasts/sequences/growth links exclude it by capability. Some payload details are SDK-sourced pending gated-doc confirmation - see docs/tiktok.md |
 | Zalo OA | All plans (pricing table) | **Not planned** | — |
 | API as a channel | All plans | **Partial** | Botara exposes a full REST API; treating the API itself as a routable channel is planned |
 | WhatsApp Calling (history, recordings, AI summaries) | Claimed (docs API overview) | **Not planned** | — |
@@ -116,8 +116,9 @@ not started; *Not planned* = deliberately out of scope for now.
 - **Instagram via Facebook Login** resolves the IG business account
   through the Page list at connect time; accounts whose Page lacks a
   linked IG business account get an honest error redirect.
-- **TikTok and Zalo** are ChatbotX channels Botara does not offer; the
-  table marks them Not planned rather than pretending coverage.
+- **Zalo** is a ChatbotX channel Botara does not offer; the table marks
+  it Not planned rather than pretending coverage. (TikTok IS offered -
+  reactive DM only, per the table row and docs/tiktok.md.)
 - Items marked Partial above (analytics depth, flow export/import UI,
   API-as-channel) are real subsets — nothing in this table claims more
   than the code does.
