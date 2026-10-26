@@ -1,14 +1,18 @@
 import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { createApp, parseMetaSignedRequest, type DataDeletionStore } from "./app";
+import { createApp, dataDeletionAppSecrets, parseMetaSignedRequest, type DataDeletionStore } from "./app";
 import { testDeps } from "./test-helpers";
 
 /**
  * Fase 3: Meta data-deletion callback - a hard App Review requirement.
- * Requests arrive as a signed_request verified against META_APP_SECRET.
+ * Requests arrive as a signed_request; the same URL is registered in the
+ * Meta, Instagram Login and Threads app consoles, so verification accepts
+ * a signature from any of the three app secrets.
  */
 
 const APP_SECRET = "meta-app-secret";
+const INSTAGRAM_SECRET = "instagram-app-secret";
+const THREADS_SECRET = "threads-app-secret";
 
 function signedRequest(payload: Record<string, unknown>, secret = APP_SECRET): string {
   const payloadPart = Buffer.from(JSON.stringify(payload)).toString("base64url");
@@ -53,6 +57,28 @@ function deletionApp(extraEnv: Record<string, string> = {}) {
     dataDeletionStore: fake.store,
   }));
   return { app, fake };
+}
+
+/** App whose env is EXACTLY the given app-secret keys (no implicit META). */
+function deletionAppWithEnv(env: Record<string, string>) {
+  const fake = fakeStore();
+  const app = createApp(testDeps({
+    env: {
+      SESSION_SECRET: "test-session-secret",
+      APP_PUBLIC_URL: "https://botara.example.com",
+      ...env,
+    },
+    dataDeletionStore: fake.store,
+  }));
+  return { app, fake };
+}
+
+async function postDeletion(app: ReturnType<typeof createApp>, signedReq: string) {
+  return app.request("/webhooks/meta/data-deletion", {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ signed_request: signedReq }).toString(),
+  });
 }
 
 describe("Meta data-deletion callback", () => {
@@ -119,7 +145,71 @@ describe("Meta data-deletion callback", () => {
     expect(fake.purged).toHaveLength(0);
   });
 
-  test("without META_APP_SECRET the callback fails closed (503)", async () => {
+  test("a request signed with the Instagram app secret verifies", async () => {
+    const { app, fake } = deletionApp({ INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET });
+    const res = await postDeletion(app, signedRequest(
+      { user_id: "ig-user-99", algorithm: "HMAC-SHA256", issued_at: 1760000000 },
+      INSTAGRAM_SECRET,
+    ));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string; confirmation_code: string };
+    expect(body.confirmation_code).toBeTruthy();
+    expect(body.url).toBe(`https://botara.example.com/data-deletion/status/${body.confirmation_code}`);
+    expect(fake.purged).toEqual(["ig-user-99"]);
+    expect(fake.records.get(body.confirmation_code)?.status).toBe("completed");
+  });
+
+  test("a request signed with the Threads app secret verifies", async () => {
+    const { app, fake } = deletionApp({ THREADS_APP_SECRET: THREADS_SECRET });
+    const res = await postDeletion(app, signedRequest(
+      { user_id: "threads-user-5", algorithm: "HMAC-SHA256", issued_at: 1760000000 },
+      THREADS_SECRET,
+    ));
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { url: string; confirmation_code: string };
+    expect(body.confirmation_code).toBeTruthy();
+    expect(body.url).toBe(`https://botara.example.com/data-deletion/status/${body.confirmation_code}`);
+    expect(fake.purged).toEqual(["threads-user-5"]);
+    expect(fake.records.get(body.confirmation_code)?.status).toBe("completed");
+  });
+
+  test("an Instagram-only deployment (no META_APP_SECRET) still verifies its app's requests", async () => {
+    const { app, fake } = deletionAppWithEnv({ INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET });
+    const res = await postDeletion(app, signedRequest(
+      { user_id: "ig-user-100", algorithm: "HMAC-SHA256" },
+      INSTAGRAM_SECRET,
+    ));
+    expect(res.status).toBe(200);
+    expect(fake.purged).toEqual(["ig-user-100"]);
+  });
+
+  test("a Threads-only deployment (no META_APP_SECRET) still verifies its app's requests", async () => {
+    const { app, fake } = deletionAppWithEnv({ THREADS_APP_SECRET: THREADS_SECRET });
+    const res = await postDeletion(app, signedRequest(
+      { user_id: "threads-user-6", algorithm: "HMAC-SHA256" },
+      THREADS_SECRET,
+    ));
+    expect(res.status).toBe(200);
+    expect(fake.purged).toEqual(["threads-user-6"]);
+  });
+
+  test("a signature from an unknown secret fails even with all three app secrets configured", async () => {
+    const { app, fake } = deletionApp({
+      INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET,
+      THREADS_APP_SECRET: THREADS_SECRET,
+    });
+    const forged = signedRequest({ user_id: "fb-user-42", algorithm: "HMAC-SHA256" }, "unknown-secret");
+    const res = await postDeletion(app, forged);
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error: { message: string } };
+    // Same generic error as the single-secret failure - no hint which
+    // secrets were tried.
+    expect(body.error.message).toBe("Invalid signed_request signature.");
+    expect(fake.records.size).toBe(0);
+    expect(fake.purged).toHaveLength(0);
+  });
+
+  test("without any app secret the callback fails closed (503)", async () => {
     const app = createApp(testDeps({
       env: { SESSION_SECRET: "test-session-secret" },
     }));
@@ -142,5 +232,45 @@ describe("Meta data-deletion callback", () => {
     expect(parseMetaSignedRequest(sr, APP_SECRET)?.user_id).toBe("u-1");
     expect(parseMetaSignedRequest("not-a-signed-request", APP_SECRET)).toBeNull();
     expect(parseMetaSignedRequest(sr, "other-secret")).toBeNull();
+  });
+});
+
+describe("dataDeletionAppSecrets", () => {
+  test("no secrets configured -> empty list (endpoint fails closed)", () => {
+    expect(dataDeletionAppSecrets({})).toEqual([]);
+    expect(dataDeletionAppSecrets({ SESSION_SECRET: "unrelated" })).toEqual([]);
+  });
+
+  test("only META_APP_SECRET -> just it (fallbacks resolve to it and dedupe)", () => {
+    expect(dataDeletionAppSecrets({ META_APP_SECRET: APP_SECRET })).toEqual([APP_SECRET]);
+  });
+
+  test("three distinct secrets -> all three, Meta first", () => {
+    expect(dataDeletionAppSecrets({
+      META_APP_SECRET: APP_SECRET,
+      INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET,
+      THREADS_APP_SECRET: THREADS_SECRET,
+    })).toEqual([APP_SECRET, INSTAGRAM_SECRET, THREADS_SECRET]);
+  });
+
+  test("a per-app secret equal to the Meta secret dedupes", () => {
+    expect(dataDeletionAppSecrets({
+      META_APP_SECRET: APP_SECRET,
+      INSTAGRAM_APP_SECRET: APP_SECRET,
+      THREADS_APP_SECRET: THREADS_SECRET,
+    })).toEqual([APP_SECRET, THREADS_SECRET]);
+  });
+
+  test("a single per-app secret works without META_APP_SECRET", () => {
+    expect(dataDeletionAppSecrets({ INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET })).toEqual([INSTAGRAM_SECRET]);
+    expect(dataDeletionAppSecrets({ THREADS_APP_SECRET: THREADS_SECRET })).toEqual([THREADS_SECRET]);
+  });
+
+  test("empty-string values are filtered out (treated as unset)", () => {
+    expect(dataDeletionAppSecrets({ META_APP_SECRET: "" })).toEqual([]);
+    expect(dataDeletionAppSecrets({
+      META_APP_SECRET: "",
+      INSTAGRAM_APP_SECRET: INSTAGRAM_SECRET,
+    })).toEqual([INSTAGRAM_SECRET]);
   });
 });

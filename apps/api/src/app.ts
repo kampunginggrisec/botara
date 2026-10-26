@@ -627,6 +627,33 @@ export function parseMetaSignedRequest(
   }
 }
 
+/**
+ * App secrets that may have signed a Meta-platform `signed_request` to
+ * the data-deletion callback. Instagram Login and Threads are SEPARATE
+ * Meta apps with their own secrets, yet Meta sends their deletion
+ * requests to the same registered URL - signed with THAT app's secret.
+ * The per-app resolution mirrors the OAuth/webhook handlers:
+ * INSTAGRAM_APP_SECRET and THREADS_APP_SECRET each fall back to
+ * META_APP_SECRET. Returns the deduped, non-empty candidates (an empty
+ * list means no app secret is configured at all).
+ */
+export function dataDeletionAppSecrets(
+  env: Record<string, string | undefined>,
+): string[] {
+  const candidates = [
+    env.META_APP_SECRET,
+    env.INSTAGRAM_APP_SECRET ?? env.META_APP_SECRET,
+    env.THREADS_APP_SECRET ?? env.META_APP_SECRET,
+  ];
+  return [
+    ...new Set(
+      candidates.filter(
+        (value): value is string => typeof value === "string" && value.length > 0,
+      ),
+    ),
+  ];
+}
+
 // ------------------------------------------------------------------- types
 
 export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
@@ -1572,11 +1599,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   // Meta REQUIRES this callback for app approval: a user asking Meta to
   // delete their data triggers a POST with a signed_request; we answer
   // with a public status URL + confirmation code, record the request, and
-  // purge the provider user's contact data best-effort.
+  // purge the provider user's contact data best-effort. The SAME URL is
+  // registered in the Meta, Instagram Login and Threads app consoles, so
+  // verification accepts a signature from any of the three app secrets
+  // (see dataDeletionAppSecrets).
 
   app.post("/webhooks/meta/data-deletion", async (c) => {
-    const appSecret = deps.env.META_APP_SECRET;
-    if (!appSecret) {
+    const appSecrets = dataDeletionAppSecrets(deps.env);
+    if (appSecrets.length === 0) {
       throw new AppError(
         "CONFIGURATION",
         "META_APP_SECRET is not configured; data-deletion requests cannot be verified.",
@@ -1595,7 +1625,15 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (!signedRequest) {
       throw new AppError("VALIDATION", "Missing signed_request in data-deletion callback.", { status: 400 });
     }
-    const payload = parseMetaSignedRequest(signedRequest, appSecret);
+    // A request verifies when ANY configured app secret validates its
+    // signature (the signing app is whichever console the user acted in).
+    // The failure stays the same generic 401 - it never reveals which
+    // secrets were tried.
+    let payload: ReturnType<typeof parseMetaSignedRequest> = null;
+    for (const secret of appSecrets) {
+      payload = parseMetaSignedRequest(signedRequest, secret);
+      if (payload) break;
+    }
     if (!payload?.user_id) {
       throw new AppError("UNAUTHORIZED", "Invalid signed_request signature.", { status: 401 });
     }
