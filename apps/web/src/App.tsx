@@ -4675,6 +4675,9 @@ function AuthedApp() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
   const [workspaceId, setWorkspaceIdState] = useState(getWorkspaceId());
+  const [showNewWorkspace, setShowNewWorkspace] = useState(false);
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
 
   const loadSession = useCallback(async () => {
     if (!getToken()) {
@@ -4755,10 +4758,8 @@ function AuthedApp() {
 
   // Create workspace (F7): the switcher's "+ New workspace" entry opens
   // a small name modal; on success the app switches to the new workspace.
-  const [showNewWorkspace, setShowNewWorkspace] = useState(false);
-  const [newWorkspaceName, setNewWorkspaceName] = useState("");
-  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
-
+  // (State hooks live with the other AuthedApp hooks above the early
+  // returns — hooks after a conditional return crash React (#310).)
   const createWorkspace = async () => {
     setCreatingWorkspace(true);
     try {
