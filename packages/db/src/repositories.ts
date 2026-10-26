@@ -580,6 +580,111 @@ export async function deleteChannelAccount(
   return existing;
 }
 
+/**
+ * Does anything reference this channel account? Every FK into
+ * channel_accounts is ON DELETE NO ACTION (baseline migration), so ANY
+ * referencing row - a conversation, a template, a cost-ledger entry, a
+ * domain link - means the account carries data and may only be
+ * soft-disconnected, never hard-deleted. Grandchildren (messages,
+ * enrollments) hang off conversations/sequences, so probing the direct
+ * children is sufficient.
+ */
+export async function channelAccountHasReferences(db: Database, accountId: string): Promise<boolean> {
+  const probes = await Promise.all([
+    db.select().from(conversations).where(eq(conversations.channelAccountId, accountId)).limit(1),
+    db.select().from(templates).where(eq(templates.channelAccountId, accountId)).limit(1),
+    db.select().from(broadcasts).where(eq(broadcasts.channelAccountId, accountId)).limit(1),
+    db.select().from(sequences).where(eq(sequences.channelAccountId, accountId)).limit(1),
+    db.select().from(processedComments).where(eq(processedComments.channelAccountId, accountId)).limit(1),
+    db.select().from(growthLinks).where(eq(growthLinks.channelAccountId, accountId)).limit(1),
+    db.select().from(catalogProducts).where(eq(catalogProducts.channelAccountId, accountId)).limit(1),
+    db.select().from(costLedger).where(eq(costLedger.channelAccountId, accountId)).limit(1),
+    db.select().from(workspaceDomains).where(eq(workspaceDomains.channelAccountId, accountId)).limit(1),
+  ]);
+  return probes.some((rows) => rows.length > 0);
+}
+
+/**
+ * Soft-disconnect one channel account in a single transaction: the row
+ * (and ALL its attached data) survives, but the account is marked
+ * "disconnected" and its vault reference is dropped - the caller deletes
+ * the vault entry itself (the vault is an API-layer port) using the
+ * tokenVaultRef of the row it read BEFORE calling this. Reconnecting the
+ * same (channel, externalId) reactivates the row (see the connect
+ * upserts). Returns the updated row, or null when not found in the
+ * workspace.
+ */
+export async function softDisconnectChannelAccount(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<ChannelAccountRow | null> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Database;
+    const existing = await getChannelAccount(txDb, workspaceId, id);
+    if (!existing) return null;
+    await txDb
+      .update(channelAccounts)
+      .set({ status: "disconnected", tokenVaultRef: null })
+      .where(and(eq(channelAccounts.id, id), eq(channelAccounts.workspaceId, workspaceId)));
+    return { ...existing, status: "disconnected", tokenVaultRef: null };
+  });
+}
+
+/**
+ * Permanently delete a channel account AND its attached data in one
+ * transaction (Channels "delete permanently", allowed only after a soft
+ * disconnect - enforced by the caller). Deletion order is FK-safe for
+ * the schema's all-NO-ACTION foreign keys: grandchildren first
+ * (messages/webchat sessions per conversation, enrollments per
+ * sequence), then the direct children (broadcasts before the templates
+ * they reference), then the account row. Two referencing tables are
+ * UNLINKED instead of deleted: cost_ledger (billing history is platform
+ * evidence; its channel_account_id is nullable) and workspace_domains
+ * (the domain registration belongs to the workspace, only the account
+ * link is cleared; also nullable). Contacts and flows are shared
+ * workspace data and are never touched. Returns the deleted row, or
+ * null when not found in the workspace.
+ */
+export async function purgeChannelAccount(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<ChannelAccountRow | null> {
+  return db.transaction(async (tx) => {
+    const txDb = tx as unknown as Database;
+    const existing = await getChannelAccount(txDb, workspaceId, id);
+    if (!existing) return null;
+
+    const convs = await txDb.select().from(conversations).where(eq(conversations.channelAccountId, id));
+    for (const conv of convs) {
+      await txDb.delete(messages).where(eq(messages.conversationId, conv.id));
+      await txDb.delete(webchatSessions).where(eq(webchatSessions.conversationId, conv.id));
+    }
+    await txDb.delete(conversations).where(eq(conversations.channelAccountId, id));
+
+    const seqs = await txDb.select().from(sequences).where(eq(sequences.channelAccountId, id));
+    for (const seq of seqs) {
+      await txDb.delete(sequenceEnrollments).where(eq(sequenceEnrollments.sequenceId, seq.id));
+    }
+    await txDb.delete(sequences).where(eq(sequences.channelAccountId, id));
+
+    await txDb.delete(broadcasts).where(eq(broadcasts.channelAccountId, id));
+    await txDb.delete(templates).where(eq(templates.channelAccountId, id));
+    await txDb.delete(processedComments).where(eq(processedComments.channelAccountId, id));
+    await txDb.delete(growthLinks).where(eq(growthLinks.channelAccountId, id));
+    await txDb.delete(catalogProducts).where(eq(catalogProducts.channelAccountId, id));
+
+    await txDb.update(costLedger).set({ channelAccountId: null }).where(eq(costLedger.channelAccountId, id));
+    await txDb.update(workspaceDomains).set({ channelAccountId: null }).where(eq(workspaceDomains.channelAccountId, id));
+
+    await txDb
+      .delete(channelAccounts)
+      .where(and(eq(channelAccounts.id, id), eq(channelAccounts.workspaceId, workspaceId)));
+    return existing;
+  });
+}
+
 /** Worker-side lookup by provider identity (webhooks carry no workspace). */
 export async function findChannelAccountByExternal(
   db: Database,
