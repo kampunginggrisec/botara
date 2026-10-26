@@ -144,6 +144,8 @@ export function createDbWhatsAppAccountPersister(
       await updateChannelAccountToken(db, existing.id, {
         tokenVaultRef: input.tokenVaultRef,
         status: "connected",
+        // Item G: reconnecting cancels the retention countdown.
+        disconnectedAt: null,
       });
       if (input.avatarUrl) {
         await updateChannelAccountAvatar(db, existing.id, input.avatarUrl);

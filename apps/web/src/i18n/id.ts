@@ -335,6 +335,7 @@ export const id: Dictionary = {
   "channels.disconnectFailed": "Gagal memutuskan akun.",
   "channels.disconnectedKeptData": "{name} diputuskan. Riwayatnya dipertahankan — hubungkan lagi kapan saja, atau hapus permanen dari kartunya.",
   "channels.deletePermanently": "Hapus permanen",
+  "channels.autoPurgeNote": "Dihapus permanen pada {date} kecuali dihubungkan lagi.",
   "channels.deletePermanentlyConfirm": "Yakin hapus permanen?",
   "channels.deletePermanentlyWarning": "Tindakan ini menghapus akun beserta percakapan dan seluruh data terkaitnya secara permanen. Tindakan ini tidak dapat dibatalkan.",
   "channels.purged": "{name} dihapus permanen.",

@@ -337,6 +337,7 @@ export const en = {
   "channels.disconnectFailed": "Failed to disconnect the account.",
   "channels.disconnectedKeptData": "{name} disconnected. Its history is kept — reconnect anytime, or delete it permanently from the card.",
   "channels.deletePermanently": "Delete permanently",
+  "channels.autoPurgeNote": "Permanently deleted on {date} unless reconnected.",
   "channels.deletePermanentlyConfirm": "Confirm permanent delete?",
   "channels.deletePermanentlyWarning": "This permanently deletes the account together with its conversations and all attached data. This cannot be undone.",
   "channels.purged": "{name} permanently deleted.",

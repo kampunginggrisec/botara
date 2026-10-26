@@ -6,7 +6,7 @@ import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import {
   AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
-  countConsecutiveOutbound, evaluateReplyWindow, MessagingWindowClosedError,
+  countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, MessagingWindowClosedError,
 } from "@botara/shared";
 import {
   getDb, listContacts, getContact, createContact, updateContact, segmentCounts,
@@ -1678,6 +1678,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         tokenVaultRef: input.tokenVaultRef,
         tokenExpiresAt: input.tokenExpiresAt ?? null,
         status: "connected",
+        // Item G: reconnecting cancels the retention countdown.
+        disconnectedAt: null,
       });
       // Re-connect refreshes the picture when the provider gave one; a
       // missing picture keeps the previously captured URL.
@@ -3202,6 +3204,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           hasCredential: Boolean(r.tokenVaultRef),
           createdAt: iso(r.createdAt),
           tokenExpiresAt: iso(r.tokenExpiresAt),
+          // Item G: when the account was soft-disconnected, and the
+          // instant the retention sweeper will permanently purge it
+          // (disconnectedAt + DISCONNECT_RETENTION_DAYS) unless it is
+          // reconnected first. Null while connected.
+          disconnectedAt: iso(r.disconnectedAt),
+          purgeAt: r.status === "disconnected" ? iso(disconnectPurgeAt(r.disconnectedAt)) : null,
         };
       }),
     });
@@ -3240,7 +3248,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       await deps.authStore.audit({
         workspaceId: ws, userId,
         action: "channel.purged",
-        details: { channel: account.channel, externalId: account.externalId },
+        details: { channel: account.channel, externalId: account.externalId, reason: "manual" },
       }).catch(() => undefined);
       return c.json({ mode: "purged" });
     }

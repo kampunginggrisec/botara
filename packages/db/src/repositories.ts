@@ -636,12 +636,61 @@ export async function softDisconnectChannelAccount(
     const txDb = tx as unknown as Database;
     const existing = await getChannelAccount(txDb, workspaceId, id);
     if (!existing) return null;
+    // Item G: stamp the disconnect time — the retention sweeper purges
+    // the account once the stamp is older than the retention window.
+    const disconnectedAt = new Date();
     await txDb
       .update(channelAccounts)
-      .set({ status: "disconnected", tokenVaultRef: null })
+      .set({ status: "disconnected", tokenVaultRef: null, disconnectedAt })
       .where(and(eq(channelAccounts.id, id), eq(channelAccounts.workspaceId, workspaceId)));
-    return { ...existing, status: "disconnected", tokenVaultRef: null };
+    return { ...existing, status: "disconnected", tokenVaultRef: null, disconnectedAt };
   });
+}
+
+/**
+ * Accounts whose soft disconnect has expired at `cutoff` (item G):
+ * status "disconnected" with a disconnected_at stamp at or before the
+ * cutoff. The timestamp comparison runs in JS after an eq status query
+ * so it behaves identically on SQL and in-memory backends (the same
+ * pattern listContacts/listConversations use for non-eq filters).
+ */
+export async function listExpiredDisconnectedAccounts(
+  db: Database,
+  cutoff: Date,
+): Promise<ChannelAccountRow[]> {
+  const rows = await db
+    .select()
+    .from(channelAccounts)
+    .where(eq(channelAccounts.status, "disconnected"));
+  return rows.filter(
+    (r) => r.disconnectedAt != null && r.disconnectedAt.getTime() <= cutoff.getTime(),
+  );
+}
+
+/**
+ * Retention purge (item G): permanently delete every expired
+ * disconnected account via purgeChannelAccount's FK-safe semantics and
+ * write one `channel.purged` audit entry per account with
+ * details.reason "retention_expired" (manual purge uses "manual").
+ * Returns the purged rows.
+ */
+export async function purgeExpiredDisconnectedAccounts(
+  db: Database,
+  cutoff: Date,
+): Promise<ChannelAccountRow[]> {
+  const expired = await listExpiredDisconnectedAccounts(db, cutoff);
+  const purged: ChannelAccountRow[] = [];
+  for (const account of expired) {
+    const row = await purgeChannelAccount(db, account.workspaceId, account.id);
+    if (!row) continue;
+    purged.push(row);
+    await insertAuditLog(db, {
+      workspaceId: account.workspaceId,
+      action: "channel.purged",
+      details: { channel: account.channel, externalId: account.externalId, reason: "retention_expired" },
+    });
+  }
+  return purged;
 }
 
 /**
@@ -732,7 +781,13 @@ export async function updateChannelAccountAvatar(
 export async function updateChannelAccountToken(
   db: Database,
   accountId: string,
-  patch: { tokenExpiresAt?: Date | null; tokenVaultRef?: string; status?: string },
+  patch: {
+    tokenExpiresAt?: Date | null;
+    tokenVaultRef?: string;
+    status?: string;
+    /** Item G: reactivation upserts clear the disconnect stamp. */
+    disconnectedAt?: Date | null;
+  },
 ): Promise<void> {
   await db
     .update(channelAccounts)
@@ -740,6 +795,7 @@ export async function updateChannelAccountToken(
       ...(patch.tokenExpiresAt !== undefined ? { tokenExpiresAt: patch.tokenExpiresAt } : {}),
       ...(patch.tokenVaultRef !== undefined ? { tokenVaultRef: patch.tokenVaultRef } : {}),
       ...(patch.status !== undefined ? { status: patch.status } : {}),
+      ...(patch.disconnectedAt !== undefined ? { disconnectedAt: patch.disconnectedAt } : {}),
     })
     .where(eq(channelAccounts.id, accountId));
 }

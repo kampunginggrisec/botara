@@ -1,5 +1,5 @@
 import {
-  broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
+  auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, growthLinks,
   messages, processedComments, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains,
   type Database,
@@ -286,6 +286,7 @@ export interface FakeDatabase {
     costLedger: Row[];
     workspaceDomains: Row[];
     scheduledPosts: Row[];
+    auditLog: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
 }
@@ -307,6 +308,7 @@ export function createFakeDatabase(): FakeDatabase {
     costLedger: [] as Row[],
     workspaceDomains: [] as Row[],
     scheduledPosts: [] as Row[],
+    auditLog: [] as Row[],
   };
   const core = new FakeCore();
   core.register(messages, store.messages);
@@ -324,6 +326,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(costLedger, store.costLedger);
   core.register(workspaceDomains, store.workspaceDomains);
   core.register(scheduledPosts, store.scheduledPosts);
+  core.register(auditLog, store.auditLog);
 
   const impl = {
     select: (projection?: Record<string, unknown>) => new FakeSelect(core, projection),

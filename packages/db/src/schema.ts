@@ -67,6 +67,10 @@ export const channelAccounts = pgTable("channel_accounts", {
   tokenVaultRef: varchar("token_vault_ref", { length: 200 }),
   tokenExpiresAt: timestamp("token_expires_at", { withTimezone: true }),
   status: varchar("status", { length: 40 }).notNull().default("connected"),
+  // When the account was soft-disconnected (item G): the retention
+  // sweeper permanently purges the account once this is older than
+  // DISCONNECT_RETENTION_DAYS. NULL while connected.
+  disconnectedAt: timestamp("disconnected_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("channel_accounts_ws_idx").on(t.workspaceId)]);
 

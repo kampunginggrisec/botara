@@ -257,11 +257,23 @@ they are not lost):
   gained `contactId`/`contactTags`; a broader audit of serializer shapes
   (e.g. exposing full contact objects) remains open.
 
-## Retention note (disconnected channel accounts)
+## Retention note (disconnected channel accounts, item G)
 
-See the disconnect row under "Channels & email domains": a soft
-disconnect keeps the account's history. Disconnected accounts are not
-kept forever — after a retention window they are permanently purged by
-a worker sweeper (item G; details in the row's implementation notes in
-`docs/` and the serializer's `purgeAt` field, which the Channels card
-shows as "Permanently deleted on {date} unless reconnected.").
+A soft disconnect keeps the account's history, but not forever:
+
+- Disconnecting stamps `channel_accounts.disconnected_at`; reconnecting
+  (any connect upsert) clears it back to NULL.
+- The retention window is **30 days**: `DISCONNECT_RETENTION_DAYS` in
+  `packages/shared/src/retention.ts` (with the `disconnectPurgeAt` /
+  `disconnectRetentionCutoff` helpers).
+- A worker sweeper — the `retention` job on the token-refresh queue,
+  scheduled daily at 03:30 via a BullMQ job scheduler — permanently
+  purges accounts past the cutoff, reusing the manual purge's FK-safe
+  semantics (children deleted; cost ledger and workspace domains
+  unlinked, never deleted) and writing a `channel.purged` audit entry
+  with `details.reason = "retention_expired"` (manual purges record
+  `reason = "manual"`).
+- The accounts serializer exposes `disconnectedAt` and `purgeAt`
+  (stamp + 30 days); a disconnected account's Channels card shows the
+  muted note "Permanently deleted on {date} unless reconnected." The
+  manual Delete permanently button is unchanged.

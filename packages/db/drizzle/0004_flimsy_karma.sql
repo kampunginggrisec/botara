@@ -1,0 +1,1 @@
+ALTER TABLE "channel_accounts" ADD COLUMN "disconnected_at" timestamp with time zone;

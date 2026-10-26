@@ -3107,6 +3107,11 @@ function ChannelsPage() {
                   </div>
                 )}
                 {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
+                {a.status === "disconnected" && a.purgeAt && (
+                  <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
+                    {t("channels.autoPurgeNote", { date: new Date(a.purgeAt).toLocaleDateString() })}
+                  </p>
+                )}
                 <div className="mt-auto pt-4">
                   {a.status === "disconnected" ? (
                     confirmPurgeId === a.id ? (

@@ -9,7 +9,7 @@ import {
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
   getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
-  listChannelAccountsDueForRefresh, updateChannelAccountToken,
+  listChannelAccountsDueForRefresh, updateChannelAccountToken, purgeExpiredDisconnectedAccounts,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
   getContactByExternal, createContact, listConversations, findOpenConversation,
@@ -44,6 +44,7 @@ import {
   type PublishPorts, type ScheduledPostSnapshot,
 } from "./publish";
 import { processSequenceAdvance, type SequencePorts } from "./sequences";
+import { processRetentionScan } from "./retention";
 import { processEmailInbound, type EmailInboundJobData, type EmailInboundPorts } from "./email-inbound";
 import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-ingest";
 
@@ -735,9 +736,17 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
     case "flow-run":
       return processFlowRun(buildProdPorts(db), job.data as FlowRunJobData | FlowRunRef);
     case "token-refresh":
-      return job.name === "scan"
-        ? processTokenRefreshScan(buildTokenRefreshPorts(db), new Date())
-        : processTokenRefreshAccount(buildTokenRefreshPorts(db), job.data as { accountId: string });
+      if (job.name === "scan") {
+        return processTokenRefreshScan(buildTokenRefreshPorts(db), new Date());
+      }
+      if (job.name === "retention") {
+        // Item G: daily retention sweep for soft-disconnected accounts.
+        return processRetentionScan(
+          { purgeExpired: (cutoff) => purgeExpiredDisconnectedAccounts(db, cutoff) },
+          new Date(),
+        );
+      }
+      return processTokenRefreshAccount(buildTokenRefreshPorts(db), job.data as { accountId: string });
     case "publish":
       return job.name === "scan"
         ? processPublishScan(buildPublishPorts(db), new Date())
@@ -821,13 +830,16 @@ async function registerSchedulers(): Promise<void> {
     await queueByName.get("token-refresh")!.upsertJobScheduler(
       "token-refresh-daily", { pattern: "0 3 * * *" }, { name: "scan", data: {} },
     );
+    await queueByName.get("token-refresh")!.upsertJobScheduler(
+      "retention-daily", { pattern: "30 3 * * *" }, { name: "retention", data: {} },
+    );
     await queueByName.get("sequence")!.upsertJobScheduler(
       "sequence-advance", { pattern: "* * * * *" }, { name: "advance", data: {} },
     );
     await queueByName.get("publish")!.upsertJobScheduler(
       "publish-scan", { pattern: "* * * * *" }, { name: "scan", data: {} },
     );
-    console.log("[worker] job schedulers registered (token-refresh daily 03:00, sequence + publish scans every minute)");
+    console.log("[worker] job schedulers registered (token-refresh daily 03:00, retention daily 03:30, sequence + publish scans every minute)");
   } catch (err) {
     console.error(`[worker] scheduler registration failed: ${fmtErr(err as Error)}`);
   }

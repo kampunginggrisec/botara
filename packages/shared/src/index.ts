@@ -11,3 +11,6 @@ export {
   countConsecutiveOutbound, ConsecutiveSendCapError,
   WHATSAPP_FREE_FORM_WINDOW_HOURS, type ReplyKind, type ReplyWindowDecision,
 } from "./window";
+export {
+  DISCONNECT_RETENTION_DAYS, disconnectPurgeAt, disconnectRetentionCutoff,
+} from "./retention";

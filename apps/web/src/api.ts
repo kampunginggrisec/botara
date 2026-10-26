@@ -368,6 +368,9 @@ export interface ChannelAccount {
   /** WhatsApp coexistence (Business App + Cloud API on the same number). */
   isCoexistence?: boolean;
   tokenExpiresAt: string | null;
+  /** Item G: soft-disconnect stamp + the retention purge instant (null while connected). */
+  disconnectedAt: string | null;
+  purgeAt: string | null;
   createdAt: string;
 }
 
