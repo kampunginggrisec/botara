@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   api, ApiError, BASE_URL, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
@@ -17,6 +17,7 @@ import {
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
+import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 
 type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
@@ -48,6 +49,45 @@ function ErrorBox({ error }: { error: string }) {
   return (
     <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-900 dark:border-red-900 dark:bg-red-950 dark:text-red-200">
       {error}
+    </div>
+  );
+}
+
+/** Transient success/failure alerts (top-right stack, auto-dismiss). */
+function Toasts() {
+  const toasts = useSyncExternalStore(subscribeToasts, getToasts);
+  if (toasts.length === 0) return null;
+  return (
+    <div className="fixed right-4 top-4 z-[100] flex w-80 max-w-[calc(100vw-2rem)] flex-col gap-2">
+      {toasts.map((item) => (
+        <div
+          key={item.id}
+          role={item.kind === "err" ? "alert" : "status"}
+          className={`flex items-start gap-2 rounded-lg border px-3 py-2.5 shadow-lg ${
+            item.kind === "err"
+              ? "border-red-300 bg-red-50 text-red-900 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+              : "border-emerald-300 bg-emerald-50 text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200"
+          }`}
+        >
+          <span
+            aria-hidden
+            className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold text-white ${
+              item.kind === "err" ? "bg-red-500" : "bg-emerald-500"
+            }`}
+          >
+            {item.kind === "err" ? "!" : "✓"}
+          </span>
+          <span className="flex-1 text-sm leading-snug">{item.text}</span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            onClick={() => dismissToast(item.id)}
+            className="shrink-0 px-1 text-base leading-none opacity-60 hover:opacity-100"
+          >
+            ×
+          </button>
+        </div>
+      ))}
     </div>
   );
 }
@@ -1794,11 +1834,15 @@ function ChannelsPage() {
     const connected = params.get("connected");
     const errorCode = params.get("error");
     if (connected) {
-      setBanner({ kind: "ok", text: t("channels.connectedBanner", { channel: connected }) });
+      const text = t("channels.connectedBanner", { channel: connected });
+      setBanner({ kind: "ok", text });
+      pushToast("ok", text);
       void load();
     } else if (errorCode) {
       const reasonKey = `channels.error.${errorCode}` as never;
-      setBanner({ kind: "err", text: t("channels.errorBanner", { reason: t(reasonKey) }) });
+      const text = t("channels.errorBanner", { reason: t(reasonKey) });
+      setBanner({ kind: "err", text });
+      pushToast("err", text);
     }
     if (params.get("messenger") === "select") {
       api.getMessengerPendingPages()
@@ -1814,12 +1858,16 @@ function ChannelsPage() {
     setNotice(null);
     try {
       const res = await api.connectTelegram({ botToken: tgToken.trim(), label: tgLabel.trim() || undefined });
-      setNotice(t("channels.telegram.connected", { name: res.account.displayName }));
+      const text = t("channels.telegram.connected", { name: res.account.displayName });
+      setNotice(text);
+      pushToast("ok", text);
       setTgToken("");
       setTgLabel("");
       await load();
     } catch (err) {
-      setError(errText(err, t("channels.telegram.connectFailed")));
+      const text = errText(err, t("channels.telegram.connectFailed"));
+      setError(text);
+      pushToast("err", text);
     } finally {
       setBusy(false);
     }
@@ -1859,7 +1907,9 @@ function ChannelsPage() {
         });
       });
       if (!code) {
-        setError(t("channels.whatsapp.noCode"));
+        const text = t("channels.whatsapp.noCode");
+        setError(text);
+        pushToast("err", text);
         return;
       }
       const session = await Promise.race([
@@ -1867,10 +1917,14 @@ function ChannelsPage() {
         new Promise<Record<string, never>>((resolve) => setTimeout(() => resolve({}), 1500)),
       ]);
       await api.exchangeWhatsAppSignup({ code, sessionInfo: session });
-      setNotice(t("channels.whatsapp.exchanged"));
+      const text = t("channels.whatsapp.exchanged");
+      setNotice(text);
+      pushToast("ok", text);
       await load();
     } catch (err) {
-      setError(errText(err, t("channels.whatsapp.exchangeFailed")));
+      const text = errText(err, t("channels.whatsapp.exchangeFailed"));
+      setError(text);
+      pushToast("err", text);
     }
   };
 
@@ -1879,10 +1933,14 @@ function ChannelsPage() {
     try {
       await api.selectMessengerPage(pageId);
       setPendingPages(null);
-      setBanner({ kind: "ok", text: t("channels.connectedBanner", { channel: "messenger" }) });
+      const text = t("channels.connectedBanner", { channel: "messenger" });
+      setBanner({ kind: "ok", text });
+      pushToast("ok", text);
       await load();
     } catch (err) {
-      setError(errText(err, t("channels.messenger.selectFailed")));
+      const text = errText(err, t("channels.messenger.selectFailed"));
+      setError(text);
+      pushToast("err", text);
     } finally {
       setBusy(false);
     }
@@ -3408,6 +3466,7 @@ function AuthedApp() {
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 flex">
+      <Toasts />
       <aside className="w-60 shrink-0 bg-slate-900 text-slate-100 flex flex-col dark:border-r dark:border-slate-800">
         <div className="px-5 py-5 border-b border-slate-700">
           <div className="text-xl font-bold tracking-tight">Botara</div>
