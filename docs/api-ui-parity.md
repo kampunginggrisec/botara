@@ -33,7 +33,7 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 
 ## Parity table (post-fix state, 2026-10-26)
 
-119 routes: 95 UI · 16 WEBHOOK · 8 API-ONLY.
+119 routes: 92 UI · 18 WEBHOOK · 9 API-ONLY.
 
 ### Auth & session
 
