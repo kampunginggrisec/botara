@@ -67,6 +67,15 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
       "/v26.0/oauth/access_token",
       "/v26.0/debug_token",
       "/v26.0/waba-1/phone_numbers",
+      // Coexistence session: contacts + history sync requested per number.
+      "/v26.0/pn-1/smb_app_data",
+      "/v26.0/pn-1/smb_app_data",
+      "/v26.0/pn-2/smb_app_data",
+      "/v26.0/pn-2/smb_app_data",
+    ]);
+    expect(result.syncRequests).toEqual([
+      { phoneNumberId: "pn-1", smbAppStateSync: "requested", history: "requested" },
+      { phoneNumberId: "pn-2", smbAppStateSync: "requested", history: "requested" },
     ]);
     expect(result.wabaId).toBe("waba-1");
     expect(result.isCoexistence).toBe(true);
@@ -94,6 +103,59 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
     });
     expect(result.accounts).toHaveLength(1);
     expect(persisted[0]!.externalId).toBe("pn-2");
+  });
+
+  test("a NON-coexistence signup requests no syncs", async () => {
+    const { deps, calls } = fakeDeps();
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.isCoexistence).toBe(false);
+    expect(result.syncRequests).toBeUndefined();
+    expect(calls.some((c) => c.url.includes("smb_app_data"))).toBe(false);
+  });
+
+  test("coexistence sync: Meta 135000 (already requested) counts as done, not failure", async () => {
+    const fetchFn: FetchLike = async (input) => {
+      const url = String(input);
+      if (url.includes("/oauth/access_token")) return new Response(JSON.stringify({ access_token: "tok" }), { status: 200 });
+      if (url.includes("/waba-1/phone_numbers")) {
+        return new Response(JSON.stringify({ data: [{ id: "pn-1" }] }), { status: 200 });
+      }
+      if (url.includes("/smb_app_data")) {
+        return new Response(
+          JSON.stringify({ error: { code: 135000, message: "A sync was already requested" } }),
+          { status: 400 },
+        );
+      }
+      return new Response("{}", { status: 200 });
+    };
+    const { deps } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", {
+      code: "c", sessionInfo: { wabaId: "waba-1", isCoexistence: true, phoneNumberId: "pn-1" },
+    });
+    expect(result.accounts).toHaveLength(1);
+    expect(result.syncRequests).toEqual([
+      { phoneNumberId: "pn-1", smbAppStateSync: "already-requested", history: "already-requested" },
+    ]);
+  });
+
+  test("coexistence sync: a failing smb_app_data call never fails the onboarding", async () => {
+    const fetchFn: FetchLike = async (input) => {
+      const url = String(input);
+      if (url.includes("/oauth/access_token")) return new Response(JSON.stringify({ access_token: "tok" }), { status: 200 });
+      if (url.includes("/waba-1/phone_numbers")) {
+        return new Response(JSON.stringify({ data: [{ id: "pn-1" }] }), { status: 200 });
+      }
+      if (url.includes("/smb_app_data")) return new Response("boom", { status: 500 });
+      return new Response("{}", { status: 200 });
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", {
+      code: "c", sessionInfo: { wabaId: "waba-1", isCoexistence: true, phoneNumberId: "pn-1" },
+    });
+    expect(persisted).toHaveLength(1);
+    expect(result.syncRequests).toEqual([
+      { phoneNumberId: "pn-1", smbAppStateSync: "failed", history: "failed" },
+    ]);
   });
 
   test("missing app credentials -> 503 CONFIGURATION before any HTTP call", async () => {

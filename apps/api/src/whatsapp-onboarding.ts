@@ -13,6 +13,8 @@ import { CHANNEL_CAPABILITIES, type FetchLike } from "@botara/channels";
  *   3. GET /{version}/{wabaId}/phone_numbers    discover the onboarded numbers
  *   4. vault.store(token)                       raw token goes ONLY into the vault
  *   5. persist one channel_accounts row per phone number (vault ref, never the token)
+ *   6. coexistence only: POST /{phone}/smb_app_data for both sync types
+ *      (contacts + history) - best-effort, outcomes reported in the result
  *
  * The returned summary contains NO token material - a test asserts this.
  */
@@ -66,10 +68,25 @@ export interface OnboardedPhoneNumber {
   channelAccountId: string;
 }
 
+/** Outcome of one coexistence sync request (POST /{phone}/smb_app_data). */
+export type CoexistenceSyncOutcome = "requested" | "already-requested" | "failed";
+
+export interface CoexistenceSyncRequests {
+  phoneNumberId: string;
+  smbAppStateSync: CoexistenceSyncOutcome;
+  history: CoexistenceSyncOutcome;
+}
+
 export interface EmbeddedSignupResult {
   wabaId: string;
   isCoexistence: boolean;
   accounts: OnboardedPhoneNumber[];
+  /**
+   * Coexistence only: the contact + history sync requests issued to
+   * Meta right after provisioning (nothing is delivered until asked).
+   * Best-effort - a "failed" outcome never fails the onboarding itself.
+   */
+  syncRequests?: CoexistenceSyncRequests[];
   // Deliberately NO access token / vault internals in this summary.
 }
 
@@ -212,5 +229,42 @@ export async function exchangeEmbeddedSignup(
     });
   }
 
-  return { wabaId, isCoexistence, accounts };
+  // 6) Coexistence: ask Meta for the phone's contacts and chat history.
+  // Nothing arrives until requested (POST /{phone-number-id}/smb_app_data),
+  // Meta only accepts the request shortly after onboarding, and each sync
+  // type can be requested once - error 135000 means it was already
+  // requested and counts as done. Best-effort by design: the webhooks
+  // (smb_app_state_sync / history) are ingested by the dispatcher whenever
+  // they arrive, and a failed request must not roll back a good signup.
+  let syncRequests: CoexistenceSyncRequests[] | undefined;
+  if (isCoexistence) {
+    const requestSync = async (
+      phoneNumberId: string,
+      syncType: "smb_app_state_sync" | "history",
+    ): Promise<CoexistenceSyncOutcome> => {
+      try {
+        const res = await deps.fetchFn(`${base}/${version}/${phoneNumberId}/smb_app_data`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ messaging_product: "whatsapp", sync_type: syncType }),
+        });
+        const json = (await res.json().catch(() => ({}))) as GraphJson;
+        if (res.ok && !json.error) return "requested";
+        if (json.error?.code === 135000) return "already-requested";
+        return "failed";
+      } catch {
+        return "failed";
+      }
+    };
+    syncRequests = [];
+    for (const account of accounts) {
+      syncRequests.push({
+        phoneNumberId: account.phoneNumberId,
+        smbAppStateSync: await requestSync(account.phoneNumberId, "smb_app_state_sync"),
+        history: await requestSync(account.phoneNumberId, "history"),
+      });
+    }
+  }
+
+  return { wabaId, isCoexistence, accounts, ...(syncRequests ? { syncRequests } : {}) };
 }
