@@ -301,6 +301,8 @@ export interface ChannelAccount {
   channel: string;
   externalId: string;
   displayName: string | null;
+  /** Public profile-picture URL captured at connect time; null when none (telegram is proxied instead). */
+  avatarUrl: string | null;
   authMode: string | null;
   status: string;
   hasCredential: boolean;

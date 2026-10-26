@@ -264,7 +264,7 @@ export const id: Dictionary = {
   "channels.disconnected": "{name} diputuskan.",
   "channels.disconnectFailed": "Gagal memutuskan akun.",
   "channels.connectedTitle": "Akun terhubung",
-  "channels.connectedEmpty": "Belum ada akun channel terhubung. Gunakan kartu koneksi di bawah.",
+  "channels.connectedEmpty": "Belum ada akun channel terhubung. Gunakan tombol Hubungkan Akun di atas untuk menambahkan.",
   "channels.coexistence": "Coexistence",
   "channels.hasCredential": "kredensial tersimpan",
   "channels.noCredential": "tanpa kredensial",

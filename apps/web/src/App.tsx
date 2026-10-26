@@ -1816,6 +1816,35 @@ function channelMeta(channel: string): { label: string; glyph: string; accent: s
   return CHANNEL_META[channel] ?? { label: channel, glyph: channel.charAt(0).toUpperCase(), accent: "bg-slate-500" };
 }
 
+/**
+ * Account avatar for a Channels card: the real profile picture when the
+ * platform provided one (avatarUrl for Meta channels; the authenticated
+ * API proxy for telegram, whose file URLs embed the bot token), falling
+ * back to the platform initial chip when there is no picture or the
+ * image fails to load.
+ */
+function ChannelAccountAvatar({ account }: { account: ChannelAccount }) {
+  const meta = channelMeta(account.channel);
+  const [failed, setFailed] = useState(false);
+  const src = account.avatarUrl
+    ?? (account.channel === "telegram"
+      ? `${BASE_URL}/channels/accounts/${account.id}/avatar?workspace_id=${encodeURIComponent(getWorkspaceId())}`
+      : undefined);
+  if (src && !failed) {
+    return (
+      <img
+        src={src}
+        alt=""
+        onError={() => setFailed(true)}
+        className="h-10 w-10 shrink-0 rounded-full object-cover"
+      />
+    );
+  }
+  return (
+    <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white ${meta.accent}`}>{meta.glyph}</span>
+  );
+}
+
 function ChannelsPage() {
   const { t } = useI18n();
   const [accounts, setAccounts] = useState<ChannelAccount[]>([]);
@@ -1831,6 +1860,7 @@ function ChannelsPage() {
   const [platformFilter, setPlatformFilter] = useState<string>("all");
   const [confirmDisconnectId, setConfirmDisconnectId] = useState<string | null>(null);
   const [disconnectBusyId, setDisconnectBusyId] = useState<string | null>(null);
+  const [connectOpen, setConnectOpen] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -1843,6 +1873,20 @@ function ChannelsPage() {
     }
   }, [t]);
   useEffect(() => { void load(); }, [load]);
+
+  // The connect modal closes on Escape while open.
+  useEffect(() => {
+    if (!connectOpen) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setConnectOpen(false); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [connectOpen]);
+
+  // A pending Messenger Page selection (OAuth round-trip) opens the
+  // connect modal so the picker stays discoverable.
+  useEffect(() => {
+    if (pendingPages !== null) setConnectOpen(true);
+  }, [pendingPages]);
 
   // OAuth round-trip signals arrive in the hash: #/channels?connected=...
   useEffect(() => {
@@ -1883,6 +1927,7 @@ function ChannelsPage() {
       setTgToken("");
       setTgLabel("");
       await load();
+      setConnectOpen(false);
     } catch (err) {
       const text = errText(err, t("channels.telegram.connectFailed"));
       setError(text);
@@ -1940,6 +1985,7 @@ function ChannelsPage() {
       setNotice(text);
       pushToast("ok", text);
       await load();
+      setConnectOpen(false);
     } catch (err) {
       const text = errText(err, t("channels.whatsapp.exchangeFailed"));
       setError(text);
@@ -2010,7 +2056,7 @@ function ChannelsPage() {
         </div>
         <button
           type="button"
-          onClick={() => document.getElementById("connect-channels")?.scrollIntoView({ behavior: "smooth", block: "start" })}
+          onClick={() => setConnectOpen(true)}
           className="shrink-0 rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900"
         >
           {`+ ${t("channels.connectAccount")}`}
@@ -2087,7 +2133,7 @@ function ChannelsPage() {
             return (
               <div key={a.id} className={`flex flex-col ${cardCls} p-4`}>
                 <div className="flex items-center gap-2.5">
-                  <span className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white ${meta.accent}`}>{meta.glyph}</span>
+                  <ChannelAccountAvatar account={a} />
                   <span className="font-medium text-sm">{meta.label}</span>
                   <span
                     className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
@@ -2161,8 +2207,31 @@ function ChannelsPage() {
         </div>
       )}
 
+      {connectOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4"
+          onClick={() => setConnectOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={t("channels.connectTitle")}
+            className="max-h-[90vh] w-full max-w-3xl overflow-y-auto rounded-xl bg-white p-5 shadow-xl dark:bg-slate-900"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-4">
+              <h2 className="text-base font-semibold">{t("channels.connectTitle")}</h2>
+              <button
+                type="button"
+                onClick={() => setConnectOpen(false)}
+                aria-label={t("common.close")}
+                className="-mr-1 -mt-1 rounded-full px-2.5 py-1 text-lg leading-none text-slate-500 hover:bg-slate-100 hover:text-slate-800 dark:text-slate-400 dark:hover:bg-slate-800 dark:hover:text-slate-100"
+              >
+                ×
+              </button>
+            </div>
       {pendingPages !== null && (
-        <div className="mt-6 max-w-3xl rounded-lg border border-sky-300 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950">
+        <div className="mt-4 rounded-lg border border-sky-300 bg-sky-50 p-4 dark:border-sky-900 dark:bg-sky-950">
           <div className="font-medium text-sm text-sky-900 dark:text-sky-100">{t("channels.messenger.selectTitle")}</div>
           <p className="mt-1 text-sm text-sky-800 dark:text-sky-200">{t("channels.messenger.selectBody")}</p>
           <div className="mt-3 space-y-2">
@@ -2177,10 +2246,7 @@ function ChannelsPage() {
           </div>
         </div>
       )}
-
-      <div id="connect-channels" className="scroll-mt-6">
-      <h2 className="mt-8 text-base font-semibold">{t("channels.connectTitle")}</h2>
-      <div className="mt-3 grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+            <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
         <div className={connectCard}>
           <div className="font-medium text-sm">{t("channels.whatsapp.title")}</div>
           <p className={`mt-1 ${mutedCls}`}>{t("channels.whatsapp.body")}</p>
@@ -2259,8 +2325,10 @@ function ChannelsPage() {
             {copied ? t("channels.webchat.copied") : t("channels.webchat.copy")}
           </button>
         </div>
-      </div>
-      </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

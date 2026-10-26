@@ -266,7 +266,7 @@ export const en = {
   "channels.disconnected": "{name} disconnected.",
   "channels.disconnectFailed": "Failed to disconnect the account.",
   "channels.connectedTitle": "Connected accounts",
-  "channels.connectedEmpty": "No channel accounts connected yet. Use the connect cards below.",
+  "channels.connectedEmpty": "No channel accounts connected yet. Use the Connect Account button above to add one.",
   "channels.coexistence": "Coexistence",
   "channels.hasCredential": "credential stored",
   "channels.noCredential": "no credential",
