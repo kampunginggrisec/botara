@@ -14,3 +14,8 @@ export {
 export {
   DISCONNECT_RETENTION_DAYS, disconnectPurgeAt, disconnectRetentionCutoff,
 } from "./retention";
+export {
+  interpolate, buildVariableContext,
+  type InterpolationWarning, type InterpolationResult, type VariableContext,
+  type InterpolationContactInput, type InterpolationChannelInput,
+} from "./variables";
