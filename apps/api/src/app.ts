@@ -3068,7 +3068,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     guardMutator(c);
     const ws = workspaceId(c);
     const db = deps.getDatabase();
-    const row = await createTemplate(db, { workspaceId: ws, ...c.req.valid("json") });
+    const body = c.req.valid("json");
+    // Validate the account BEFORE the insert (same idiom as broadcasts /
+    // sequences / growth-links): a bogus or cross-workspace id must be a
+    // typed 404, not a raw FK violation surfacing as a 500.
+    const account = await getChannelAccount(db, ws, body.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    const row = await createTemplate(db, { workspaceId: ws, ...body });
     return c.json({ template: { ...row, createdAt: iso(row.createdAt) } }, 201);
   });
 
