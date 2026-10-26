@@ -48,6 +48,7 @@ import {
   createDbFlowDispatcher, noopFlowDispatcher,
   type CommentActionEnqueuer, type FlowRunEnqueuer, type InboundFlowDispatcher,
 } from "./flows-dispatch";
+import { createInboundMediaPort } from "./inbound-media";
 import {
   ADMIN_ROLES, API_TOKEN_PREFIX, MUTATOR_ROLES, ROLES, SESSION_COOKIE, SESSION_TTL_SECONDS,
   DbAuthStore, hashPassword, requireRole, signSessionToken, slugify, verifyPassword,
@@ -492,6 +493,10 @@ export function defaultDeps(): ApiDeps {
       flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
       commentEnqueuer: createBullMqCommentActionEnqueuer(redisUrl),
       publisher: realtimePublisher,
+      // Inbound media pipeline: copies channel media bytes into R2 at
+      // ingest. Degrades silently to caption-only when R2 is not
+      // configured - the port never throws (see inbound-media.ts).
+      mediaPort: createInboundMediaPort(),
     }),
     vault,
     realtimePublisher,

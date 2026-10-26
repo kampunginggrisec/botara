@@ -8,7 +8,7 @@ import {
 import {
   commentTriggerConfig, flowTriggerMatches, type FlowTrigger,
 } from "@botara/flow-engine";
-import type { InboundEvent } from "@botara/channels";
+import type { InboundEvent, MessageMedia } from "@botara/channels";
 import type { RealtimePublisher } from "./realtime-publish";
 
 /**
@@ -46,6 +46,14 @@ import type { RealtimePublisher } from "./realtime-publish";
  * (never flow-triggering, never window-opening, never billed),
  * app-state syncs upsert contacts by phone, and history backfill
  * persists with original provider timestamps, deduped on the wamid.
+ *
+ * Inbound MEDIA (any of the paths above): when a media port is wired,
+ * the bytes behind a message's media reference are copied into Botara
+ * storage BEFORE persistence and the row records mediaUrls/mediaKeys -
+ * provider media ids/URLs expire, so ingest is the only moment the
+ * bytes are guaranteed reachable. The copy is strictly best-effort:
+ * any failure degrades to the caption-only row that used to be all
+ * there was, and dispatch still succeeds.
  *
  * Persistence goes through the DispatchStore port: production wires the
  * Drizzle repositories, tests wire the in-memory store below.
@@ -110,6 +118,37 @@ export interface InboundFlowDispatcher {
   dispatchPersistedWebchat(input: PersistedWebchatInput): Promise<void>;
 }
 
+/** References to one inbound media item copied into Botara's storage. */
+export interface StoredInboundMedia {
+  /** Public URLs the SPA renders (empty when no public base is configured). */
+  urls: string[];
+  /** Storage object keys backing the URLs (the durable reference). */
+  keys: string[];
+}
+
+/**
+ * Inbound media pipeline port: fetch the bytes behind a normalized
+ * media reference (per channel, via the channel adapter or the
+ * attachment URL) and store them permanently, returning the references
+ * to persist on the message row. Provider media ids/URLs expire, so
+ * the copy must happen at ingest.
+ *
+ * CONTRACT: implementations NEVER throw and return null on ANY failure
+ * (storage unconfigured, provider error, oversize) - the dispatcher
+ * then persists the message caption-only, exactly as before this
+ * pipeline existed. A media failure must never lose a message or fail
+ * a webhook.
+ */
+export interface InboundMediaPort {
+  fetchAndStore(input: {
+    workspaceId: string;
+    account: DispatchAccount;
+    channel: string;
+    media: MessageMedia;
+    messageExternalId: string;
+  }): Promise<StoredInboundMedia | null>;
+}
+
 // ------------------------------------------------------------ store port
 
 export interface DispatchAccount {
@@ -146,7 +185,7 @@ export interface DispatchStore {
   findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string } | null>;
   createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string }>;
   findMessageByExternalId(conversationId: string, externalId: string): Promise<{ id: string } | null>;
-  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date }): Promise<{ id: string }>;
+  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }): Promise<{ id: string }>;
   touchConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
   /** Forward-only window anchor move, for backfilled inbound messages. */
   advanceConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
@@ -241,7 +280,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   readonly accounts: DispatchAccount[] = [];
   readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string }>();
   readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; lastUserMessageAt?: string }>();
-  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string }> = [];
+  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
   readonly conversions = new Map<string, number>();
@@ -298,7 +337,7 @@ export class InMemoryDispatchStore implements DispatchStore {
     return found ? { id: externalId } : null;
   }
 
-  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date }) {
+  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }) {
     const id = crypto.randomUUID();
     const { createdAt, ...rest } = input;
     this.messages.push({ id, ...rest, createdAt: (createdAt ?? new Date()).toISOString() });
@@ -359,6 +398,13 @@ export interface FlowDispatcherDeps {
   commentEnqueuer?: CommentActionEnqueuer;
   /** Inbox live updates: notified once per newly persisted inbound message. */
   publisher?: RealtimePublisher;
+  /**
+   * Inbound media pipeline (optional): when wired, media-carrying
+   * inbound messages, echoes and history items get their bytes copied
+   * into Botara storage before persistence. Absent = caption-only
+   * persistence, exactly as before.
+   */
+  mediaPort?: InboundMediaPort;
 }
 
 export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispatcher {
@@ -396,6 +442,33 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     const existing = await deps.store.findOpenConversation({ workspaceId, channelAccountId: accountId, contactId });
     if (existing) return existing;
     return deps.store.createConversation({ workspaceId, channelAccountId: accountId, contactId });
+  }
+
+  /**
+   * Copy one event's media bytes into Botara storage via the media
+   * port. Graceful degradation is the contract: no port wired, no
+   * media on the event, or ANY port failure (the port itself already
+   * never throws - this catch is belt-and-braces) all resolve to empty
+   * references, and the caller persists the message caption-only
+   * exactly as it did before the pipeline existed.
+   */
+  async function resolveMedia(
+    account: DispatchAccount,
+    channel: string,
+    media: MessageMedia | undefined,
+    messageExternalId: string,
+  ): Promise<{ mediaUrls: string[]; mediaKeys: string[] }> {
+    const empty = { mediaUrls: [] as string[], mediaKeys: [] as string[] };
+    if (!media || !deps.mediaPort) return empty;
+    try {
+      const stored = await deps.mediaPort.fetchAndStore({
+        workspaceId: account.workspaceId, account, channel, media, messageExternalId,
+      });
+      return stored ? { mediaUrls: stored.urls, mediaKeys: stored.keys } : empty;
+    } catch (err) {
+      log({ event: "inbound_media_failed", channel, messageExternalId, error: err instanceof Error ? err.message : String(err) });
+      return empty;
+    }
   }
 
   /**
@@ -456,6 +529,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     if (event.type === "message.received") {
       const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
       if (!existing) {
+        const { mediaUrls, mediaKeys } = await resolveMedia(account, event.channel, event.media, event.messageExternalId);
         const created = await deps.store.createMessage({
           conversationId: conversation.id,
           direction: "in",
@@ -463,6 +537,8 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           body: event.text,
           externalId: event.messageExternalId,
           status: "delivered",
+          mediaUrls,
+          mediaKeys,
         });
         await deps.store.touchConversationLastUserMessage(conversation.id, new Date(event.receivedAt));
         // Live inbox: exactly one event per NEWLY persisted message -
@@ -595,6 +671,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
 
     const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
     if (existing) return;
+    const { mediaUrls, mediaKeys } = await resolveMedia(account, event.channel, event.media, event.messageExternalId);
     const created = await deps.store.createMessage({
       conversationId: conversation.id,
       direction: "out",
@@ -602,6 +679,8 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       body: event.text,
       externalId: event.messageExternalId,
       status: "sent",
+      mediaUrls,
+      mediaKeys,
     });
     if (deps.publisher) {
       await deps.publisher.publishInboxMessage({
@@ -659,6 +738,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
     if (existing) return;
     const at = new Date(event.receivedAt);
+    const { mediaUrls, mediaKeys } = await resolveMedia(account, event.channel, event.media, event.messageExternalId);
     await deps.store.createMessage({
       conversationId: conversation.id,
       direction: event.direction,
@@ -667,6 +747,8 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       externalId: event.messageExternalId,
       status: event.direction === "in" ? "delivered" : "sent",
       createdAt: at,
+      mediaUrls,
+      mediaKeys,
     });
     if (event.direction === "in") {
       await deps.store.advanceConversationLastUserMessage(conversation.id, at);
@@ -747,6 +829,7 @@ export interface DbFlowDispatcherDeps {
   flowEnqueuer: FlowRunEnqueuer;
   commentEnqueuer?: CommentActionEnqueuer;
   publisher?: RealtimePublisher;
+  mediaPort?: InboundMediaPort;
 }
 
 export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowDispatcher {
@@ -755,6 +838,7 @@ export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowD
     flowEnqueuer: deps.flowEnqueuer,
     commentEnqueuer: deps.commentEnqueuer,
     publisher: deps.publisher,
+    mediaPort: deps.mediaPort,
   });
 }
 

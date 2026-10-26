@@ -378,3 +378,150 @@ describe("whatsapp coexistence dispatch", () => {
     expect(conversation.lastUserMessageAt).toBe("2026-10-25T10:00:00.000Z");
   });
 });
+
+describe("inbound media pipeline", () => {
+  interface MediaCall {
+    workspaceId: string;
+    channel: string;
+    media: unknown;
+    messageExternalId: string;
+  }
+
+  function mediaSetup(portResult: { urls: string[]; keys: string[] } | null | "throw") {
+    const store = new InMemoryDispatchStore();
+    store.accounts.push(
+      { id: "acc-wa", workspaceId: "ws-1", channel: "whatsapp", externalId: "10987", status: "connected" },
+      { id: "acc-tg", workspaceId: "ws-1", channel: "telegram", externalId: "555", status: "connected" },
+      { id: "acc-msg", workspaceId: "ws-1", channel: "messenger", externalId: "page-1", status: "connected" },
+    );
+    const calls: MediaCall[] = [];
+    const dispatcher = createFlowDispatcher({
+      store,
+      flowEnqueuer: { async enqueueFlowRun() {} },
+      mediaPort: {
+        async fetchAndStore(input) {
+          calls.push({
+            workspaceId: input.workspaceId, channel: input.channel,
+            media: input.media, messageExternalId: input.messageExternalId,
+          });
+          if (portResult === "throw") throw new Error("storage exploded");
+          return portResult;
+        },
+      },
+    });
+    return { store, dispatcher, calls };
+  }
+
+  const waPhoto: InboundEvent = {
+    type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+    contactExternalId: "62812", messageExternalId: "wamid.M1",
+    text: "foto kerusakan", media: { type: "image", id: "wa-media-1", caption: "foto kerusakan", mimeType: "image/jpeg" },
+    receivedAt: new Date().toISOString(),
+  };
+
+  test("whatsapp id-based media: bytes stored, urls+keys persist on the message row", async () => {
+    const { store, dispatcher, calls } = mediaSetup({
+      urls: ["https://media.botara.example/workspaces/ws-1/inbound/wamid.M1/image.jpg"],
+      keys: ["workspaces/ws-1/inbound/wamid.M1/image.jpg"],
+    });
+    await dispatcher.dispatch([waPhoto]);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({ workspaceId: "ws-1", channel: "whatsapp", messageExternalId: "wamid.M1" });
+    expect(calls[0]!.media).toMatchObject({ id: "wa-media-1" });
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({
+      type: "media", body: "foto kerusakan",
+      mediaUrls: ["https://media.botara.example/workspaces/ws-1/inbound/wamid.M1/image.jpg"],
+      mediaKeys: ["workspaces/ws-1/inbound/wamid.M1/image.jpg"],
+    });
+  });
+
+  test("telegram file-based and messenger url-based media reach the port with their shapes", async () => {
+    const { store, dispatcher, calls } = mediaSetup({ urls: ["https://m.example/x"], keys: ["k/x"] });
+    await dispatcher.dispatch([
+      {
+        type: "message.received", channel: "telegram", accountExternalId: "",
+        contactExternalId: "777", messageExternalId: "tg-9",
+        text: "invoice", media: { type: "document", id: "file-9", filename: "invoice.pdf", mimeType: "application/pdf" },
+        receivedAt: new Date().toISOString(),
+      },
+      {
+        type: "message.received", channel: "messenger", accountExternalId: "page-1",
+        contactExternalId: "psid-1", messageExternalId: "mid-9",
+        media: { type: "image", url: "https://cdn.example.com/x.jpg" },
+        receivedAt: new Date().toISOString(),
+      },
+    ]);
+    expect(calls.map((c) => c.channel)).toEqual(["telegram", "messenger"]);
+    expect(calls[0]!.media).toMatchObject({ id: "file-9" });
+    expect(calls[1]!.media).toMatchObject({ url: "https://cdn.example.com/x.jpg" });
+    expect(store.messages).toHaveLength(2);
+    expect(store.messages.every((m) => (m.mediaKeys ?? []).length === 1)).toBe(true);
+  });
+
+  test("port returns null (storage unconfigured / fetch failed): caption-only, dispatch succeeds", async () => {
+    const { store, dispatcher } = mediaSetup(null);
+    await dispatcher.dispatch([waPhoto]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ type: "media", body: "foto kerusakan", mediaUrls: [], mediaKeys: [] });
+  });
+
+  test("a throwing port still never loses the message", async () => {
+    const { store, dispatcher } = mediaSetup("throw");
+    await dispatcher.dispatch([waPhoto]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ mediaUrls: [], mediaKeys: [] });
+  });
+
+  test("no media port wired: media messages persist caption-only as before", async () => {
+    const store = new InMemoryDispatchStore();
+    store.accounts.push({ id: "acc-wa", workspaceId: "ws-1", channel: "whatsapp", externalId: "10987", status: "connected" });
+    const dispatcher = createFlowDispatcher({ store, flowEnqueuer: { async enqueueFlowRun() {} } });
+    await dispatcher.dispatch([waPhoto]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ type: "media", mediaUrls: [], mediaKeys: [] });
+  });
+
+  test("a redelivered media message does not re-fetch (dedupe first)", async () => {
+    const { store, dispatcher, calls } = mediaSetup({ urls: ["https://m.example/x"], keys: ["k/x"] });
+    await dispatcher.dispatch([waPhoto]);
+    await dispatcher.dispatch([waPhoto]);
+    expect(store.messages).toHaveLength(1);
+    expect(calls).toHaveLength(1);
+  });
+
+  test("a coexistence echo with media goes through the same pipeline", async () => {
+    const { store, dispatcher, calls } = mediaSetup({ urls: ["https://m.example/e"], keys: ["k/e"] });
+    await dispatcher.dispatch([{
+      type: "message.echo", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.E-MEDIA",
+      text: "bukti transfer", media: { type: "image", id: "wa-media-2", caption: "bukti transfer" },
+      receivedAt: new Date().toISOString(),
+    }]);
+    expect(calls).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ direction: "out", mediaKeys: ["k/e"] });
+  });
+
+  test("a history item with media goes through the pipeline and keeps its original timestamp", async () => {
+    const { store, dispatcher, calls } = mediaSetup({ urls: ["https://m.example/h"], keys: ["k/h"] });
+    const old = "2026-08-15T09:30:00.000Z";
+    await dispatcher.dispatch([{
+      type: "message.history", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.H-MEDIA", direction: "in",
+      media: { type: "document", id: "wa-media-3", filename: "kontrak.pdf", mimeType: "application/pdf" },
+      receivedAt: old,
+    }]);
+    expect(calls).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ createdAt: old, mediaUrls: ["https://m.example/h"], mediaKeys: ["k/h"] });
+  });
+
+  test("plain text messages never touch the media port", async () => {
+    const { dispatcher, calls } = mediaSetup({ urls: ["https://m.example/x"], keys: ["k/x"] });
+    await dispatcher.dispatch([{
+      type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.T1", text: "halo",
+      receivedAt: new Date().toISOString(),
+    }]);
+    expect(calls).toHaveLength(0);
+  });
+});
