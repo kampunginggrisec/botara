@@ -3383,6 +3383,15 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
 
   // ------------------------------------------------------------ broadcasts
+  /**
+   * postgres-js returns drizzle `numeric` columns as strings, so a raw
+   * broadcast row carries estimatedCostUsd as "0.100000" (or null).
+   * Money crosses the wire as a JSON number or null - the same
+   * Number(...) normalization every other cost serializer applies.
+   */
+  const usdOrNull = (value: string | null | undefined): number | null =>
+    value === null || value === undefined ? null : Number(value);
+
   const createBroadcastRoute = createRoute({
     method: "post", path: "/broadcasts",
     request: {
@@ -3475,7 +3484,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     }
 
     return c.json({
-      broadcast: { ...broadcast, status: "queued", createdAt: iso(broadcast.createdAt) },
+      broadcast: {
+        ...broadcast,
+        status: "queued",
+        estimatedCostUsd: usdOrNull(broadcast.estimatedCostUsd),
+        createdAt: iso(broadcast.createdAt),
+      },
       estimate,
     }, 201);
   });
@@ -3496,6 +3510,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       const cost = await sumCostLedgerByReference(db, row.id);
       broadcasts.push({
         ...row,
+        estimatedCostUsd: usdOrNull(row.estimatedCostUsd),
         createdAt: iso(row.createdAt),
         totalCostUsd: cost.totalUsd,
       });
@@ -3516,7 +3531,11 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (!broadcast) throw new AppError("NOT_FOUND", "Broadcast not found.", { status: 404 });
     const cost = await sumCostLedgerByReference(db, id);
     return c.json({
-      broadcast: { ...broadcast, createdAt: iso(broadcast.createdAt) },
+      broadcast: {
+        ...broadcast,
+        estimatedCostUsd: usdOrNull(broadcast.estimatedCostUsd),
+        createdAt: iso(broadcast.createdAt),
+      },
       sentCount: broadcast.sentCount,
       failedCount: broadcast.failedCount,
       totalCostUsd: cost.totalUsd,

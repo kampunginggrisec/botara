@@ -54,13 +54,14 @@ export function recipientStatusTone(status: string): string {
 }
 
 /**
- * Money on broadcast rows. `estimatedCostUsd` is a NULLABLE numeric
- * column and the API passes the raw row through; postgres-js returns
- * numerics as strings, so over the wire the value is a number, a
- * numeric string, or null. Rendering must never call `.toFixed` on it
+ * Money on broadcast rows. `estimatedCostUsd` backs onto a NULLABLE
+ * numeric column; the API normalizes it to a JSON number or null, but
+ * a raw postgres-js pass-through (older servers) would deliver a
+ * numeric string instead. Rendering must never call `.toFixed` on it
  * raw - a null (or string) value used to white-screen the whole
  * Broadcast page. These helpers are the only sanctioned way to turn
- * broadcast money fields into display text.
+ * broadcast money fields into display text, and usdNumber keeps
+ * coercing strings defensively for those older payloads.
  */
 export type UsdValue = number | string | null | undefined;
 
