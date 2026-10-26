@@ -17,6 +17,7 @@ import {
   isCommentProcessed, markCommentProcessed,
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
   findMessageByIdempotencyKey, getWebchatSessionById, createTokenVault,
+  startEffectiveEnvRefresh,
   type Database,
 } from "@botara/db";
 import {
@@ -66,6 +67,31 @@ export const QUEUE_NAMES = [
 export type QueueName = (typeof QUEUE_NAMES)[number];
 
 const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
+
+/**
+ * Platform settings overlay (admin panel): DB settings win over env
+ * (resolution DB -> env -> unset). The worker reads managed keys from
+ * process.env at JOB time (AI provider + models, R2 media via the media
+ * package defaults, channel credential fallbacks), so overlaying
+ * process.env itself - refreshed every 60s - is the whole integration.
+ * Fire-and-forget: a settings read failure never takes the worker down;
+ * the env fallback simply keeps applying.
+ */
+if (process.env.DATABASE_URL) {
+  try {
+    const refresher = startEffectiveEnvRefresh({
+      db: getDb(process.env.DATABASE_URL),
+      target: process.env,
+      onError: (err) => console.error(
+        `[worker] platform settings refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    });
+    void refresher.refreshNow();
+    console.log("[worker] platform settings overlay active (DB -> env fallback, 60s refresh)");
+  } catch (err) {
+    console.error(`[worker] platform settings overlay failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 // ioredis aggregate errors can have an empty .message - fall back to the code.
 const fmtErr = (err: Error): string =>
