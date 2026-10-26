@@ -32,7 +32,7 @@ import {
   purgeExternalUserData,
   createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument,
   listKbChunks, listKbChunksByWorkspace,
-  createFlow, listFlows, getFlow, updateFlow, deleteFlow,
+  createFlow, listFlows, getFlow, updateFlow, deleteFlow, deleteFlowWaitsForConversation,
   deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
   updateChannelAccountToken, updateChannelAccountAvatar,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
@@ -2289,6 +2289,16 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       async scheduleDelay() { /* recorded */ },
       async httpWebhook() { /* recorded */ },
       async setContactField() { /* recorded */ },
+      // Action steps (package #3): record-only like everything above -
+      // a test run never tags, assigns, enrolls, or waits for input;
+      // the intended actions appear in the returned action list.
+      async addTag() { /* recorded */ },
+      async removeTag() { /* recorded */ },
+      async assignConversation() { return true; },
+      async setConversationStatus() { /* recorded */ },
+      async subscribeSequence() { return true; },
+      async unsubscribeSequence() { /* recorded */ },
+      async awaitInput() { /* recorded: the run reports paused */ },
       async aiReply(input: { prompt: string }) {
         return `[test-run AI reply] ${input.prompt}`.trim();
       },
@@ -2319,6 +2329,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       actions,
       variables: result.state.variables,
       warnings: result.warnings,
+      actionWarnings: result.actionWarnings,
     });
   });
 
@@ -2760,6 +2771,12 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     // resolved -> open is how a thread gets reopened).
     const updated = await updateConversationStatus(db, ws, id, status);
     if (!updated) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    if (status === "resolved") {
+      // Collect-input waits (package #3) on a resolved thread end
+      // quietly: drop them so a later reopen + reply never resumes a
+      // run whose conversation was closed underneath it.
+      await deleteFlowWaitsForConversation(db, id).catch(() => undefined);
+    }
 
     // Other open inboxes refresh their list + thread header; the new
     // status rides along as a hint (clients still refetch for truth).

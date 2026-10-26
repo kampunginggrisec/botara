@@ -1,13 +1,13 @@
 import {
-  addContactTag, advanceConversationLastUserMessage, createContact, createConversation, createMessage,
+  addContactTag, advanceConversationLastUserMessage, claimFlowWaitByConversation, createContact, createConversation, createMessage,
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
-  listGrowthLinksByAccount, touchConversationLastUserMessage, updateConversationExternalId,
+  listGrowthLinksByAccount, touchConversationLastUserMessage, updateContact, updateConversationExternalId,
   upsertContactByExternal, type Database,
 } from "@botara/db";
 import {
-  commentTriggerConfig, flowTriggerMatches, type FlowTrigger,
+  commentTriggerConfig, flowTriggerMatches, type FlowState, type FlowTrigger,
 } from "@botara/flow-engine";
 import type { InboundEvent, MessageMedia } from "@botara/channels";
 import type { RealtimePublisher } from "./realtime-publish";
@@ -28,6 +28,13 @@ import type { RealtimePublisher } from "./realtime-publish";
  *      keyword matching,
  *   4. matches ACTIVE flows whose keyword/postback trigger fits, and
  *      enqueues one flow-run job per match.
+ *
+ * Between 2 and 3 sits collect-input capture (package #3): when a flow
+ * run is waiting at a collect_input node on the conversation, the
+ * newly persisted message is claimed as that run's answer (atomic
+ * claim on the wait row; the worker's timeout job races the same
+ * claim) and a resume job is enqueued INSTEAD of steps 3-4 - a
+ * captured reply never double-fires triggers.
  *
  * Comment events (Instagram + Messenger) match flows with a
  * "comment_keyword" trigger: the dispatcher enqueues a "comment-action"
@@ -70,6 +77,29 @@ export interface FlowRunJobPayload {
   conversationId: string;
   channelAccountId: string;
   triggerText?: string;
+  /**
+   * Collect-input resume (package #3): set when this job resumes a run
+   * that was waiting at a collect_input node - the worker restarts from
+   * `resumeState` with `resumeVariables` (the captured answer) merged.
+   */
+  resumeState?: FlowState;
+  resumeVariables?: Record<string, string>;
+}
+
+/**
+ * A claimed collect-input wait (package #3): the marker row is deleted
+ * by the claim, so the holder is the wait's ONLY resumer - the reply
+ * path here and the worker's timeout job race on the same claim.
+ */
+export interface ClaimedFlowWait {
+  id: string;
+  workspaceId: string;
+  contactId: string;
+  channelAccountId: string;
+  flowId: string;
+  variable: string;
+  saveToContactField?: string | null;
+  resumeState: FlowState;
 }
 
 export interface FlowRunEnqueuer {
@@ -208,6 +238,15 @@ export interface DispatchStore {
   /** Returns true when the tag was newly added (first attribution). */
   addContactTag(workspaceId: string, contactId: string, tag: string): Promise<boolean>;
   isCommentProcessed(input: { channelAccountId: string; commentExternalId: string; flowId: string }): Promise<boolean>;
+  /**
+   * Atomically claim the oldest collect-input wait on a conversation
+   * (package #3): deletes the marker and returns it, or null when no
+   * run is waiting. Racing the worker's timeout claim is safe - the
+   * row can only be claimed once.
+   */
+  claimFlowWait(conversationId: string): Promise<ClaimedFlowWait | null>;
+  /** Persist one contact custom field (collect_input's save-to-field). */
+  setContactField(workspaceId: string, contactId: string, field: string, value: string): Promise<void>;
 }
 
 /** Production DispatchStore over the Drizzle repositories. */
@@ -287,13 +326,29 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
     async isCommentProcessed(input) {
       return isCommentProcessed(getDatabase(), input);
     },
+    async claimFlowWait(conversationId) {
+      const row = await claimFlowWaitByConversation(getDatabase(), conversationId);
+      return row
+        ? {
+            id: row.id, workspaceId: row.workspaceId, contactId: row.contactId,
+            channelAccountId: row.channelAccountId, flowId: row.flowId,
+            variable: row.variable, saveToContactField: row.saveToContactField,
+            resumeState: row.resumeState as unknown as FlowState,
+          }
+        : null;
+    },
+    async setContactField(workspaceId, contactId, field, value) {
+      await updateContact(getDatabase(), workspaceId, contactId, { customFields: { [field]: value } });
+    },
   };
 }
 
 /** In-memory DispatchStore for tests (and only tests). */
 export class InMemoryDispatchStore implements DispatchStore {
   readonly accounts: DispatchAccount[] = [];
-  readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string }>();
+  readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string; customFields: Record<string, unknown> }>();
+  /** Collect-input waits in creation order (claim = oldest first). */
+  readonly flowWaits: Array<ClaimedFlowWait & { conversationId: string }> = [];
   readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; externalId?: string | null; lastUserMessageAt?: string }>();
   readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
@@ -318,7 +373,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   }
 
   async createContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }) {
-    const contact = { id: crypto.randomUUID(), tags: [] as string[], ...input };
+    const contact = { id: crypto.randomUUID(), tags: [] as string[], customFields: {} as Record<string, unknown>, ...input };
     this.contacts.set(this.contactKey(input.workspaceId, input.channel, input.externalId), contact);
     return contact;
   }
@@ -402,6 +457,18 @@ export class InMemoryDispatchStore implements DispatchStore {
 
   async isCommentProcessed(input: { channelAccountId: string; commentExternalId: string; flowId: string }) {
     return this.processedComments.has(`${input.channelAccountId}:${input.commentExternalId}:${input.flowId}`);
+  }
+
+  async claimFlowWait(conversationId: string) {
+    const idx = this.flowWaits.findIndex((w) => w.conversationId === conversationId);
+    if (idx < 0) return null;
+    const [wait] = this.flowWaits.splice(idx, 1);
+    return wait!;
+  }
+
+  async setContactField(_workspaceId: string, contactId: string, field: string, value: string) {
+    const contact = [...this.contacts.values()].find((ct) => ct.id === contactId);
+    if (contact) contact.customFields[field] = value;
   }
 }
 
@@ -527,6 +594,57 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
 
 
   /**
+   * Collect-input capture (package #3): when a flow run is WAITING at a
+   * collect_input node on this conversation, the contact's next message
+   * belongs to that run - claim the wait and enqueue the resume BEFORE
+   * any growth/keyword matching (the caller returns early on true, so
+   * the captured reply never ALSO fires triggers for the same message;
+   * the message itself is already persisted in the inbox as usual).
+   * The captured value is the message text; a textless (media-only)
+   * reply resumes with an empty value + a logged warning instead of
+   * leaving the run stuck. Returns true when a wait was claimed.
+   */
+  async function tryResumeWaitingRun(input: {
+    conversationId: string;
+    text?: string;
+  }): Promise<boolean> {
+    let wait: ClaimedFlowWait | null;
+    try {
+      wait = await deps.store.claimFlowWait(input.conversationId);
+    } catch (err) {
+      log({ event: "flow_wait_claim_failed", conversationId: input.conversationId, error: String(err) });
+      return false;
+    }
+    if (!wait) return false;
+    const value = input.text ?? "";
+    if (!input.text) {
+      log({ event: "flow_wait_empty_reply", waitId: wait.id, flowId: wait.flowId, conversationId: input.conversationId });
+    }
+    if (wait.saveToContactField && value) {
+      try {
+        await deps.store.setContactField(wait.workspaceId, wait.contactId, wait.saveToContactField, value);
+      } catch (err) {
+        log({ event: "flow_wait_field_save_failed", waitId: wait.id, error: String(err) });
+      }
+    }
+    try {
+      await deps.flowEnqueuer.enqueueFlowRun({
+        flowId: wait.flowId,
+        workspaceId: wait.workspaceId,
+        contactId: wait.contactId,
+        conversationId: input.conversationId,
+        channelAccountId: wait.channelAccountId,
+        triggerText: input.text,
+        resumeState: wait.resumeState,
+        resumeVariables: { [wait.variable]: value },
+      });
+    } catch (err) {
+      log({ event: "flow_wait_resume_enqueue_failed", waitId: wait.id, flowId: wait.flowId, error: String(err) });
+    }
+    return true;
+  }
+
+  /**
    * Growth attribution for one event: resolve the link (when any), tag
    * the contact, count the conversion once per contact, and - when the
    * link binds a flow - enqueue that flow INSTEAD of keyword matching.
@@ -584,6 +702,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       event.type === "message.received" ? event.conversationExternalId : undefined,
     );
 
+    let messagePersisted = false;
     if (event.type === "message.received") {
       const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
       if (!existing) {
@@ -601,6 +720,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           mediaKeys,
         });
         await deps.store.touchConversationLastUserMessage(conversation.id, new Date(event.receivedAt));
+        messagePersisted = true;
         // Live inbox: exactly one event per NEWLY persisted message -
         // webhook redeliveries (the `existing` branch) publish nothing.
         if (deps.publisher) {
@@ -612,6 +732,16 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           }).catch(() => undefined);
         }
       }
+    }
+
+    // --- collect-input capture (package #3): a waiting run claims the
+    // reply BEFORE growth attribution and keyword matching; only NEWLY
+    // persisted messages capture (a webhook redelivery must not resume
+    // a run twice - the claim is atomic, but the first delivery owns
+    // the reply by construction here).
+    if (event.type === "message.received" && messagePersisted) {
+      const resumed = await tryResumeWaitingRun({ conversationId: conversation.id, text: event.text });
+      if (resumed) return;
     }
 
     // --- growth attribution (priority over keyword matching) -----------
@@ -831,6 +961,12 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
    */
   async function dispatchPersistedWebchat(input: PersistedWebchatInput): Promise<void> {
     try {
+      // Collect-input capture first (package #3), exactly like the
+      // webhook channels: a waiting run claims the visitor's reply
+      // (typed text, or a button tap's title) and trigger matching is
+      // skipped for this message.
+      const resumed = await tryResumeWaitingRun({ conversationId: input.conversationId, text: input.text });
+      if (resumed) return;
       const flows = await deps.store.listActiveFlows(input.workspaceId);
       for (const flow of flows) {
         const trigger = flow.trigger as FlowTrigger;

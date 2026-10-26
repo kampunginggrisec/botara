@@ -62,6 +62,113 @@ describe("keyword dispatch (regression)", () => {
   });
 });
 
+describe("collect-input capture (package #3)", () => {
+  /** Open a conversation with a first message, then park a wait on it. */
+  async function setupWaitingRun() {
+    const rig = setup();
+    await rig.dispatcher.dispatch([igMessage("mulai")]);
+    const conversation = [...rig.store.conversations.values()][0]!;
+    const contact = [...rig.store.contacts.values()][0]!;
+    rig.store.flowWaits.push({
+      id: "wait-1", workspaceId: "ws-1", contactId: contact.id, channelAccountId: "acc-ig",
+      conversationId: conversation.id,
+      flowId: "f-survey", variable: "city", saveToContactField: "city",
+      resumeState: { flowId: "f-survey", currentNodeId: "s1", variables: {}, status: "waiting" },
+    });
+    return { ...rig, conversationId: conversation.id, contactId: contact.id };
+  }
+
+  test("a waiting run claims the reply: resume enqueued, keyword trigger does NOT also fire", async () => {
+    const { store, dispatcher, flowRuns, conversationId } = await setupWaitingRun();
+    // A keyword flow that WOULD match the reply text on its own.
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "jakarta" } } });
+    const runsBefore = flowRuns.length;
+    await dispatcher.dispatch([igMessage("jakarta")]);
+    const newRuns = flowRuns.slice(runsBefore);
+    expect(newRuns).toHaveLength(1);
+    expect(newRuns[0]).toMatchObject({
+      flowId: "f-survey",
+      conversationId,
+      triggerText: "jakarta",
+      resumeVariables: { city: "jakarta" },
+    });
+    expect(newRuns[0]!.resumeState?.currentNodeId).toBe("s1");
+    // The reply still landed in the inbox, and the wait is gone.
+    expect(store.messages.map((m) => m.body)).toContain("jakarta");
+    expect(store.flowWaits).toHaveLength(0);
+  });
+
+  test("the captured answer is also saved to the contact field", async () => {
+    const { store, dispatcher, contactId } = await setupWaitingRun();
+    await dispatcher.dispatch([igMessage("Bandung")]);
+    const contact = [...store.contacts.values()].find((c) => c.id === contactId)!;
+    expect(contact.customFields.city).toBe("Bandung");
+  });
+
+  test("a media-only reply resumes with an empty value (never leaves the run stuck)", async () => {
+    const { store, dispatcher, flowRuns } = await setupWaitingRun();
+    const runsBefore = flowRuns.length;
+    await dispatcher.dispatch([{
+      type: "message.received", channel: "instagram", accountExternalId: "ig-1",
+      contactExternalId: "u-1", messageExternalId: "m-media-1",
+      media: { type: "image", id: "ig-media-1" },
+      receivedAt: new Date().toISOString(),
+    }]);
+    const newRuns = flowRuns.slice(runsBefore);
+    expect(newRuns).toHaveLength(1);
+    expect(newRuns[0]!.resumeVariables).toEqual({ city: "" });
+    expect(store.flowWaits).toHaveLength(0);
+  });
+
+  test("a webhook redelivery does NOT capture a later wait", async () => {
+    const { store, dispatcher, flowRuns, conversationId, contactId } = await setupWaitingRun();
+    const reply: InboundEvent = {
+      type: "message.received", channel: "instagram", accountExternalId: "ig-1",
+      contactExternalId: "u-1", messageExternalId: "m-reply-1", text: "jakarta",
+      receivedAt: new Date().toISOString(),
+    };
+    await dispatcher.dispatch([reply]);
+    expect(flowRuns).toHaveLength(1);
+    // A SECOND wait parks on the same conversation (a later collect
+    // step); the redelivered copy of the same message must not claim it.
+    store.flowWaits.push({
+      id: "wait-2", workspaceId: "ws-1", contactId, channelAccountId: "acc-ig",
+      conversationId,
+      flowId: "f-survey", variable: "district",
+      resumeState: { flowId: "f-survey", currentNodeId: "s2", variables: {}, status: "waiting" },
+    });
+    await dispatcher.dispatch([reply]);
+    expect(flowRuns).toHaveLength(1);
+    expect(store.flowWaits).toHaveLength(1);
+    expect(store.flowWaits[0]!.conversationId).toBe(conversationId);
+  });
+
+  test("no wait on the conversation: keyword matching proceeds as usual", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "price" } } });
+    await dispatcher.dispatch([igMessage("what is the price?")]);
+    expect(flowRuns).toHaveLength(1);
+    expect(flowRuns[0]).toMatchObject({ flowId: "f-kw" });
+    expect(flowRuns[0]!.resumeState).toBeUndefined();
+  });
+
+  test("webchat: a waiting run claims the persisted reply before trigger matching", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "jakarta" } } });
+    store.flowWaits.push({
+      id: "wait-wc", workspaceId: "ws-1", contactId: "ct-wc", channelAccountId: "acc-wc",
+      flowId: "f-survey", variable: "city", conversationId: "conv-wc",
+      resumeState: { flowId: "f-survey", currentNodeId: "s1", variables: {}, status: "waiting" },
+    });
+    await dispatcher.dispatchPersistedWebchat({
+      workspaceId: "ws-1", channelAccountId: "acc-wc", contactId: "ct-wc",
+      conversationId: "conv-wc", text: "jakarta",
+    });
+    expect(flowRuns).toHaveLength(1);
+    expect(flowRuns[0]).toMatchObject({ flowId: "f-survey", resumeVariables: { city: "jakarta" } });
+  });
+});
+
 describe("comment automation dispatch", () => {
   test("a matching comment enqueues ONE comment-action with the trigger config", async () => {
     const { store, dispatcher, commentActions, flowRuns } = setup();

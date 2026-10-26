@@ -4,7 +4,7 @@ export {
   conversations, messages, savedReplies, templates, broadcasts, costLedger,
   webchatSessions, scheduledPosts, sequences, sequenceEnrollments,
   tokenVault, workspaceDomains, auditLog, kbDocuments, kbChunks,
-  dataDeletionRequests, flows, apiTokens, processedComments, growthLinks,
+  dataDeletionRequests, flows, flowWaits, apiTokens, processedComments, growthLinks,
   catalogProducts, platformSettings,
 } from "./schema";
 export { getDb, closeDb, type Database } from "./client";

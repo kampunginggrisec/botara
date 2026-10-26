@@ -1,5 +1,5 @@
 import {
-  auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, flowWaits, growthLinks,
+  auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, flows, flowWaits, growthLinks,
   kbChunks, kbDocuments,
   messages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
   workspaceDomains, workspaces,
@@ -312,6 +312,7 @@ export interface FakeDatabase {
     kbChunks: Row[];
     savedReplies: Row[];
     flowWaits: Row[];
+    flows: Row[];
     workspaces: Row[];
   };
   seed(table: keyof FakeDatabase["rows"], row: Row): Row;
@@ -339,6 +340,7 @@ export function createFakeDatabase(): FakeDatabase {
     kbChunks: [] as Row[],
     savedReplies: [] as Row[],
     flowWaits: [] as Row[],
+    flows: [] as Row[],
     workspaces: [] as Row[],
   };
   const core = new FakeCore();
@@ -362,6 +364,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(kbChunks, store.kbChunks);
   core.register(savedReplies, store.savedReplies);
   core.register(flowWaits, store.flowWaits);
+  core.register(flows, store.flows);
   core.register(workspaces, store.workspaces);
 
   const impl = {
