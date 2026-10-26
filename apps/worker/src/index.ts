@@ -7,7 +7,7 @@ import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
   ensureBroadcastRecipients, advanceBroadcastRecipient,
   getFlowById, getContact, getWorkspaceById,
-  insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
+  insertCostLedger, insertAiUsageLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
   getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
   listChannelAccountsDueForRefresh, updateChannelAccountToken, purgeExpiredDisconnectedAccounts,
@@ -155,6 +155,8 @@ function buildWorkerWebchatStore(db: Database): WebchatStore {
         type: input.payload ? "rich" : "text",
         body: input.text,
         payload: input.payload,
+        // Producer badge (package #7), mirroring apps/api's store.
+        authorKind: input.authorKind,
         status: "sent",
         idempotencyKey: input.idempotencyKey,
       });
@@ -262,20 +264,54 @@ function buildProdPorts(db: Database): WorkerPorts {
       const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1));
       return countServiceUnitsInRange(db, channelAccountId, start, end);
     },
-    async aiReply({ workspaceId, prompt, query }) {
+    async aiReply({ workspaceId, prompt, query, conversationId }) {
       // Fase 3: KB-grounded AI reply for flow ai_reply nodes. Retrieval =
       // embed the query, cosine-rank the workspace's stored chunk
       // embeddings in code (no pgvector dependency), top-3 into the chat
       // context. Any gap (no provider, empty KB, no relevant chunk) -> null
       // and the flow sends its configured fallback text.
+      //
+      // AI takeover (package #7) is enforced one level up: the
+      // processors.ts flow wrapper consults isConversationAiPaused
+      // BEFORE delegating here, so on a paused thread this port - and
+      // the model - is never reached. Agent tools (ai-suggest /
+      // ai-analyze on the API) are NOT gated: pausing automation must
+      // not disarm the human's own instruments.
+      const conversation = conversationId
+        ? await getConversationById(db, conversationId)
+        : undefined;
+      const account = conversation
+        ? await getChannelAccountById(db, conversation.channelAccountId)
+        : undefined;
+      // Usage -> cost_ledger (package #7), best-effort like every other
+      // bookkeeping write: tokens when the provider reports them, NULL
+      // units otherwise; amount always 0 (no per-model rate card).
+      const recordAiUsage = async (model: string, usage?: { inputTokens: number; outputTokens: number }) => {
+        try {
+          await insertAiUsageLedger(db, {
+            workspaceId,
+            channelAccountId: conversation?.channelAccountId,
+            channel: account?.channel ?? "ai",
+            model,
+            totalTokens: usage ? usage.inputTokens + usage.outputTokens : null,
+            referenceId: conversationId ?? workspaceId,
+          });
+        } catch (err) {
+          console.warn(`[worker] ai usage ledger write failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      };
       const provider = createAIProviderFromEnv(process.env);
       if (!provider) return null;
       const stored = await listKbChunksByWorkspace(db, workspaceId);
       if (stored.length === 0) return null;
+      const embeddingModel = process.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
       const queryEmbedding = await provider.embedding({
-        model: process.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
+        model: embeddingModel,
         text: query,
       });
+      // The embedding seam returns no usage (bare vector): the call is
+      // recorded with NULL tokens, never an estimate.
+      await recordAiUsage(embeddingModel);
       const top = rankChunks(
         stored.map((c) => ({ text: c.text, embedding: c.embedding as number[] | null })),
         queryEmbedding,
@@ -293,7 +329,14 @@ function buildProdPorts(db: Database): WorkerPorts {
           { role: "user", content: query },
         ],
       });
+      await recordAiUsage(result.model, result.usage);
       return result.text;
+    },
+    async isConversationAiPaused(conversationId) {
+      // Takeover gate (package #7): read the stamp the API's reply
+      // route / pause endpoint maintain on the conversation row.
+      const conversation = await getConversationById(db, conversationId);
+      return Boolean(conversation?.aiPausedAt);
     },
     async updateMessageStatus(messageId, status, externalId) {
       await updateMessageStatus(db, messageId, status, externalId);

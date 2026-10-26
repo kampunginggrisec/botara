@@ -36,6 +36,8 @@ export interface WebchatStore {
      * natively (buttons/list) - degraded kinds persist text only.
      */
     payload?: RichBlock;
+    /** Producer badge (package #7): persisted as the row's author_kind. */
+    authorKind?: "human" | "ai";
   }): Promise<{ messageId: string }>;
 }
 
@@ -98,6 +100,7 @@ export class WebchatAdapter implements ChannelAdapter {
           text: richToPlainText(input.rich),
           idempotencyKey: input.idempotencyKey,
           payload: input.rich,
+          authorKind: input.authorKind,
         });
         return { externalMessageId: messageId, status: "sent" };
       }
@@ -105,6 +108,7 @@ export class WebchatAdapter implements ChannelAdapter {
         toExternalId: input.toExternalId,
         text: richToPlainText(input.rich),
         idempotencyKey: input.idempotencyKey,
+        authorKind: input.authorKind,
       });
       return { externalMessageId: messageId, status: "sent", warnings: ["RICH_DEGRADED_TO_TEXT"] };
     }
@@ -115,6 +119,7 @@ export class WebchatAdapter implements ChannelAdapter {
       toExternalId: input.toExternalId,
       text: input.text,
       idempotencyKey: input.idempotencyKey,
+      authorKind: input.authorKind,
     });
     return { externalMessageId: messageId, status: "sent" };
   }

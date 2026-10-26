@@ -18,7 +18,19 @@ import { initialState, step, type FlowAction, type FlowEvent, type FlowState } f
  * that state and later calls runFlow again with it to resume.
  */
 export interface FlowPorts {
-  sendMessage(input: { text: string; channel?: string; rich?: RichBlock }): Promise<void>;
+  sendMessage(input: {
+    text: string;
+    channel?: string;
+    rich?: RichBlock;
+    /**
+     * Producer badge (package #7): set to "ai" ONLY by the executor's
+     * ai_reply branch when it sends model-GENERATED text. Authored text
+     * (send_message nodes, ai_reply fallbacks) omits it and persists as
+     * "human" downstream - the badge follows the origin, never the
+     * content.
+     */
+    authorKind?: "human" | "ai";
+  }): Promise<void>;
   /** Persist/schedule a resume of `resumeState` after `seconds`. */
   scheduleDelay(input: { seconds: number; resumeState: FlowState }): Promise<void>;
   httpWebhook(input: { url: string; method: "GET" | "POST" }): Promise<void>;
@@ -231,8 +243,9 @@ export async function runFlow(
             ? await ports.aiReply({ prompt: action.prompt, query: action.query })
             : null;
           if (generated !== null && generated !== undefined) {
-            // Generated text is sent verbatim - never interpolated.
-            await ports.sendMessage({ text: generated, channel: action.channel });
+            // Generated text is sent verbatim - never interpolated - and
+            // badged as AI-produced at this seam (package #7).
+            await ports.sendMessage({ text: generated, channel: action.channel, authorKind: "ai" });
             executed.push({ type: "send_message", text: generated, channel: action.channel });
           } else {
             const rendered = renderSend(action.fallbackText, undefined, current.variables);

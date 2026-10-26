@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
   processBroadcast, processFlowRun, processSendMessage,
-  type BroadcastSnapshot, type SendMessageJobData, type WorkerPorts,
+  type BroadcastSnapshot, type FlowRunJobData, type SendMessageJobData, type WorkerPorts,
 } from "./processors";
 
 function fakePorts(overrides: Partial<WorkerPorts> = {}) {
@@ -46,8 +46,7 @@ function fakePorts(overrides: Partial<WorkerPorts> = {}) {
 }
 
 describe("worker processors (fake ports)", () => {
-  test("send-message: sends, writes rated cost_ledger row, marks sent", async () => {
-    const f = fakePorts();
+  test("send-message: sends, writes rated cost_ledger row, marks sent", async () => {    const f = fakePorts();
     const result = await processSendMessage(f.ports, {
       workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
       accountExternalId: "62812", toExternalId: "628999",
@@ -473,5 +472,116 @@ describe("broadcast recipient records (package #4)", () => {
       messageId: "m1", idempotencyKey: "k1",
     });
     expect(f.recipientUpdates).toEqual([]);
+  });
+});
+
+describe("AI copilot (package #7): badge + takeover gate", () => {
+  const aiFlow: FlowRunJobData["flow"] = {
+    id: "support-ai", version: 1, startNodeId: "t1",
+    nodes: [
+      { id: "t1", type: "trigger", trigger: "message.received", config: {}, next: "ai1" },
+      { id: "ai1", type: "ai_reply", prompt: "Jawab ramah.", fallbackText: "Maaf, agen kami akan segera membantu.", next: null },
+    ],
+  };
+  const aiContext = {
+    workspaceId: "ws1", channelAccountId: "acc1", channel: "webchat",
+    accountExternalId: "webchat:ws1", contactId: "c1", contactExternalId: "webchat-session:s1",
+    conversationId: "conv-9",
+  };
+
+  test("ai_reply generated send is badged authorKind=ai and the port receives the conversation id", async () => {
+    const seen: Array<{ conversationId?: string; flowId?: string }> = [];
+    const f = fakePorts({
+      async aiReply(input) {
+        seen.push(input);
+        return "Jawaban dari AI.";
+      },
+    });
+    const result = await processFlowRun(f.ports, {
+      flow: aiFlow, event: { type: "message.received", text: "jam buka?" }, context: aiContext,
+    });
+    expect(result.state.status).toBe("completed");
+    expect(seen).toEqual([expect.objectContaining({ conversationId: "conv-9", flowId: "support-ai" })]);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]).toMatchObject({ text: "Jawaban dari AI.", authorKind: "ai" });
+  });
+
+  test("an authored send_message job carries NO ai badge", async () => {
+    const f = fakePorts();
+    await processFlowRun(f.ports, {
+      flow: {
+        id: "welcome", version: 1, startNodeId: "t1",
+        nodes: [
+          { id: "t1", type: "trigger", trigger: "keyword", config: { keyword: "halo" }, next: "s1" },
+          { id: "s1", type: "send_message", text: "Halo juga!", next: null },
+        ],
+      },
+      event: { type: "message.received", text: "halo bot" },
+      context: aiContext,
+    });
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]!.authorKind).toBeUndefined();
+  });
+
+  test("PAUSED conversation: the model is never called and the authored fallback is sent unbadged", async () => {
+    let aiCalls = 0;
+    const f = fakePorts({
+      async aiReply() {
+        aiCalls++;
+        return "Jawaban dari AI.";
+      },
+      async isConversationAiPaused(conversationId) {
+        return conversationId === "conv-9";
+      },
+    });
+    const result = await processFlowRun(f.ports, {
+      flow: aiFlow, event: { type: "message.received", text: "jam buka?" }, context: aiContext,
+    });
+    expect(result.state.status).toBe("completed");
+    // The negative control: the gate fired BEFORE the model port.
+    expect(aiCalls).toBe(0);
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]).toMatchObject({ text: "Maaf, agen kami akan segera membantu." });
+    expect(f.sent[0]!.authorKind).toBeUndefined();
+  });
+
+  test("unpaused conversation passes the gate and reaches the model", async () => {
+    let aiCalls = 0;
+    const f = fakePorts({
+      async aiReply() {
+        aiCalls++;
+        return "Jawaban dari AI.";
+      },
+      async isConversationAiPaused() {
+        return false;
+      },
+    });
+    await processFlowRun(f.ports, {
+      flow: aiFlow, event: { type: "message.received", text: "jam buka?" }, context: aiContext,
+    });
+    expect(aiCalls).toBe(1);
+    expect(f.sent[0]).toMatchObject({ text: "Jawaban dari AI.", authorKind: "ai" });
+  });
+
+  test("processSendMessage forwards the badge to the send port", async () => {
+    const sendInputs: Array<{ authorKind?: string }> = [];
+    const f = fakePorts({
+      async send(_channel, input) {
+        sendInputs.push(input);
+        return { externalMessageId: "wm-x", status: "sent" as const };
+      },
+    });
+    await processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "webchat",
+      accountExternalId: "webchat:ws1", toExternalId: "webchat-session:s1",
+      text: "Jawaban dari AI.", authorKind: "ai", idempotencyKey: "flow:support-ai:c1:0",
+    });
+    await processSendMessage(f.ports, {
+      workspaceId: "ws1", channelAccountId: "acc1", channel: "webchat",
+      accountExternalId: "webchat:ws1", toExternalId: "webchat-session:s1",
+      text: "Halo juga!", idempotencyKey: "flow:welcome:c1:0",
+    });
+    expect(sendInputs[0]!.authorKind).toBe("ai");
+    expect(sendInputs[1]!.authorKind).toBeUndefined();
   });
 });

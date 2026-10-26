@@ -5,7 +5,7 @@ import type { Flow } from "./schemas";
 import type { FlowState } from "./interpreter";
 
 function fakePorts() {
-  const sent: Array<{ text: string; channel?: string }> = [];
+  const sent: Array<{ text: string; channel?: string; authorKind?: "human" | "ai" }> = [];
   const delays: Array<{ seconds: number; resumeState: FlowState }> = [];
   const webhooks: Array<{ url: string; method: string }> = [];
   const fields: Array<{ field: string; value: string }> = [];
@@ -158,7 +158,8 @@ describe("ai_reply node (Fase 3)", () => {
       type: "message.received", text: "jam buka?", variables: { name: "Romo" },
     });
     expect(seen).toEqual([{ prompt: "Jawab sebagai support untuk Romo.", query: "jam buka?" }]);
-    expect(f.sent).toEqual([{ text: "Jam buka kami 09.00-17.00 WIB.", channel: undefined }]);
+    // Package #7: model-generated text is badged "ai" at the send seam.
+    expect(f.sent).toEqual([{ text: "Jam buka kami 09.00-17.00 WIB.", channel: undefined, authorKind: "ai" }]);
     expect(result.state.status).toBe("completed");
   });
 
@@ -256,7 +257,7 @@ describe("variable interpolation in send paths (variables package #1)", () => {
     const gen = fakePorts();
     gen.ports.aiReply = async () => "Jawaban AI untuk {{contact.name}}";
     await runFlow(gen.ports, flow, undefined, { type: "message.received", text: "halo" }, { interpolation: interpCtx });
-    expect(gen.sent).toEqual([{ text: "Jawaban AI untuk {{contact.name}}", channel: undefined }]);
+    expect(gen.sent).toEqual([{ text: "Jawaban AI untuk {{contact.name}}", channel: undefined, authorKind: "ai" }]);
 
     const fb = fakePorts();
     fb.ports.aiReply = async () => null;

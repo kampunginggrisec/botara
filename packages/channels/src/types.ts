@@ -246,6 +246,14 @@ export interface SendInput {
   commentReplyExternalId?: string;
   /** REQUIRED: providers are called with this key so retries never double-send. */
   idempotencyKey: string;
+  /**
+   * Producer badge (package #7): "ai" when the text was model-generated
+   * (flow ai_reply nodes stamp it at the executor seam). Only the
+   * webchat adapter consumes it today - it forwards the badge to its
+   * store so the persisted row carries author_kind; other adapters
+   * persist no row for a send and ignore the field.
+   */
+  authorKind?: "human" | "ai";
 }
 
 export interface SendResult {

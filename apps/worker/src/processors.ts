@@ -40,6 +40,13 @@ export interface SendMessageJobData {
   category?: WhatsAppCategory;
   /** DB message row to update (inbox replies); absent for broadcast fan-out. */
   messageId?: string;
+  /**
+   * Producer badge (package #7): "ai" only for model-generated flow
+   * ai_reply sends, stamped by the executor at the send seam. Rides the
+   * job to the send seam so the persisted row (webchat store) carries
+   * author_kind; absent = human/authored.
+   */
+  authorKind?: "human" | "ai";
   /** Broadcast id this send belongs to (cost ledger reference + counters). */
   referenceId?: string;
   /**
@@ -256,9 +263,24 @@ export interface WorkerPorts {
   /**
    * AI reply for flow ai_reply nodes (Fase 3): KB retrieval + AI chat in
    * production. Return null when AI/KB have nothing - the flow executor
-   * then sends the node's configured fallback text.
+   * then sends the node's configured fallback text. Package #7: the
+   * wrapper below gates on the conversation's AI pause (ai_paused_at)
+   * BEFORE delegating here, and the production port records usage; the
+   * conversation/flow ids ride along for both (absent on legacy
+   * embedded-payload jobs - the port then behaves exactly as before).
    */
-  aiReply?(input: { workspaceId: string; prompt: string; query: string }): Promise<string | null>;
+  aiReply?(input: {
+    workspaceId: string; prompt: string; query: string;
+    conversationId?: string; flowId?: string;
+  }): Promise<string | null>;
+  /**
+   * AI takeover gate (package #7): true when the conversation's
+   * ai_paused_at is set. The flow-run wrapper consults it BEFORE
+   * delegating to aiReply, so on a paused thread the model is never
+   * called and the executor sends the node's authored fallback. Absent
+   * port = never paused (test doubles, legacy wiring).
+   */
+  isConversationAiPaused?(conversationId: string): Promise<boolean>;
   /**
    * Resolve an id-based flow-run reference into a full job (Fase 4).
    * Optional: embedded-payload jobs (tests, delay resumes) do not need it.
@@ -373,6 +395,7 @@ export async function processSendMessage(
       toExternalId: data.toExternalId,
       text: data.text,
       rich: data.rich,
+      authorKind: data.authorKind,
       template: data.template,
       conversationExternalId: data.conversationExternalId,
       commentReplyExternalId: data.commentReplyExternalId,
@@ -560,7 +583,7 @@ export async function processFlowRun(
   // the run would "complete" while its messages never leave.
   let sendSeq = data.state?.sendSeq ?? 0;
   const flowPorts: FlowPorts = {
-    async sendMessage({ text, channel, rich }) {
+    async sendMessage({ text, channel, rich, authorKind }) {
       await ports.enqueueSendMessage({
         workspaceId: ctx.workspaceId,
         channelAccountId: ctx.channelAccountId,
@@ -572,6 +595,7 @@ export async function processFlowRun(
         conversationExternalId: ctx.conversationExternalId,
         text,
         rich,
+        authorKind,
         country: ctx.country,
         idempotencyKey: `flow:${data.flow.id}:${ctx.contactId}:${sendSeq++}`,
       });
@@ -592,7 +616,16 @@ export async function processFlowRun(
     },
     async aiReply({ prompt, query }) {
       if (!ports.aiReply) return null;
-      return ports.aiReply({ workspaceId: ctx.workspaceId, prompt, query });
+      // Takeover gate (package #7): BEFORE any model work. A paused
+      // conversation gets the node's authored fallback, exactly as if
+      // AI were unconfigured.
+      if (ctx.conversationId && ports.isConversationAiPaused) {
+        if (await ports.isConversationAiPaused(ctx.conversationId)) return null;
+      }
+      return ports.aiReply({
+        workspaceId: ctx.workspaceId, prompt, query,
+        conversationId: ctx.conversationId, flowId: data.flow.id,
+      });
     },
     // Action steps (package #3): wired only when the matching worker
     // port exists - the executor degrades unwired steps to a recorded
