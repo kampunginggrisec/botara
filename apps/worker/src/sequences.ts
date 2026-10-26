@@ -1,3 +1,4 @@
+import { CHANNEL_CAPABILITIES, type ChannelKey } from "@botara/channels";
 import type { SendMessageJobData } from "./processors";
 
 /**
@@ -47,7 +48,19 @@ export async function processSequenceAdvance(
 ): Promise<{ advanced: number; completed: number }> {
   const due = await ports.listDueEnrollments(input.now);
   let completed = 0;
+  let advanced = 0;
   for (const enrollment of due) {
+    // Reactive-only channels (TikTok) can never run sequences: a
+    // sequence initiates contact on a schedule, which the provider
+    // forbids. The API create route rejects these up front; this gate
+    // is the backstop for rows that predate it - the enrollment fails
+    // terminally (typed in the status) instead of enqueueing sends
+    // that would fail one by one in the send processor.
+    const caps = CHANNEL_CAPABILITIES[enrollment.channel as ChannelKey];
+    if (caps && caps.canInitiate === false) {
+      await ports.updateEnrollment(enrollment.enrollmentId, { status: "failed", nextStepAt: null });
+      continue;
+    }
     const step = enrollment.steps[enrollment.currentStep];
     if (!step) {
       // Nothing left to send (steps were edited shorter): close it out.
@@ -55,6 +68,7 @@ export async function processSequenceAdvance(
       completed++;
       continue;
     }
+    advanced++;
     await ports.enqueueSendMessage({
       workspaceId: enrollment.workspaceId,
       channelAccountId: enrollment.channelAccountId,
@@ -83,5 +97,5 @@ export async function processSequenceAdvance(
       });
     }
   }
-  return { advanced: due.length, completed };
+  return { advanced, completed };
 }

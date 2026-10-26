@@ -16,7 +16,7 @@ import { processEmailInbound, type EmailInboundPorts } from "./email-inbound";
 
 function fakeTokenPorts(overrides: Partial<TokenRefreshPorts> = {}) {
   const enqueued: string[] = [];
-  const persisted: Array<{ id: string; patch: { tokenExpiresAt?: string; status?: string } }> = [];
+  const persisted: Array<{ id: string; patch: { tokenExpiresAt?: string; status?: string; secret?: string } }> = [];
   const alerts: Array<{ accountId: string; channel: string; error: string }> = [];
   const account: DueTokenAccount = {
     id: "acc-1", workspaceId: "ws-1", channel: "threads", externalId: "th-1",
@@ -62,6 +62,23 @@ describe("token-refresh processors (fake ports)", () => {
     const res = await processTokenRefreshAccount(f.ports, { accountId: "acc-1" });
     expect(res.refreshed).toBe(false);
     expect(f.persisted).toHaveLength(0);
+  });
+
+  test("a rotated secret from the adapter is threaded into persistRefresh (TikTok pairs)", async () => {
+    const f = fakeTokenPorts({
+      async refresh() {
+        return { refreshed: true, expiresAt: "2026-10-27T00:00:00.000Z", rotatedSecret: "{\"accessToken\":\"acc-2\"}" };
+      },
+    });
+    const res = await processTokenRefreshAccount(f.ports, { accountId: "acc-1" });
+    expect(res.refreshed).toBe(true);
+    expect(f.persisted).toEqual([{
+      id: "acc-1",
+      patch: {
+        tokenExpiresAt: "2026-10-27T00:00:00.000Z", status: "connected",
+        secret: "{\"accessToken\":\"acc-2\"}",
+      },
+    }]);
   });
 
   test("refresh failure marks refresh_failed, alerts, and rethrows", async () => {
@@ -211,6 +228,18 @@ describe("sequence processor (fake ports)", () => {
     expect(res.completed).toBe(1);
     expect(f.sent[0]).toEqual({ idempotencyKey: "seq:enr-1:1", text: "Sudah coba fitur X?" });
     expect(f.updates[0]!.patch).toMatchObject({ status: "completed", nextStepAt: null, currentStep: 2 });
+  });
+
+  test("a tiktok enrollment fails terminally (reactive-only channel) and sends nothing", async () => {
+    const f = fakeSequencePorts({
+      async listDueEnrollments() {
+        return [{ ...fakeSequencePorts().enrollment, channel: "tiktok", accountExternalId: "open-123" }];
+      },
+    });
+    const res = await processSequenceAdvance(f.ports, { now });
+    expect(res).toEqual({ advanced: 0, completed: 0 });
+    expect(f.sent).toHaveLength(0);
+    expect(f.updates).toEqual([{ id: "enr-1", patch: { status: "failed", nextStepAt: null } }]);
   });
 
   test("an enrollment past its steps is closed without sending", async () => {

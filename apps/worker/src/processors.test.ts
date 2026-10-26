@@ -173,3 +173,68 @@ describe("WhatsApp service allowance (Fase 3, fake counting port)", () => {
     expect(result.costUsd).toBe(0.0125);
   });
 });
+
+describe("tiktok send guards (capability-driven)", () => {
+  const ttJob = {
+    workspaceId: "ws1", channelAccountId: "acc-tt", channel: "tiktok",
+    accountExternalId: "open-123", toExternalId: "uniq-1",
+    text: "halo", idempotencyKey: "tt:1",
+  };
+
+  test("a send without a conversation id fails typed (CONVERSATION_ADDRESS_MISSING) and never reaches the adapter", async () => {
+    let sendCalled = false;
+    const f = fakePorts({
+      async send() { sendCalled = true; return { externalMessageId: "x", status: "sent" as const }; },
+    });
+    await expect(processSendMessage(f.ports, { ...ttJob }))
+      .rejects.toMatchObject({ code: "CONVERSATION_ADDRESS_MISSING", status: 422 });
+    expect(sendCalled).toBe(false);
+  });
+
+  test("at the consecutive cap the send fails typed (CONSECUTIVE_SEND_CAP) and never reaches the adapter", async () => {
+    let sendCalled = false;
+    const f = fakePorts({
+      async send() { sendCalled = true; return { externalMessageId: "x", status: "sent" as const }; },
+      async countConsecutiveOutbound() { return 10; },
+    });
+    await expect(processSendMessage(f.ports, { ...ttJob, conversationExternalId: "conv-1" }))
+      .rejects.toMatchObject({ code: "CONSECUTIVE_SEND_CAP", details: { cap: 10, consecutive: 10 } });
+    expect(sendCalled).toBe(false);
+  });
+
+  test("under the cap the send goes through with the conversation id on the SendInput", async () => {
+    const inputs: unknown[] = [];
+    const f = fakePorts({
+      async send(_channel, input) { inputs.push(input); return { externalMessageId: "tt-m1", status: "sent" as const }; },
+      async countConsecutiveOutbound() { return 9; },
+    });
+    const result = await processSendMessage(f.ports, { ...ttJob, conversationExternalId: "conv-1" });
+    expect(result.externalMessageId).toBe("tt-m1");
+    expect(inputs[0]).toMatchObject({ conversationExternalId: "conv-1", toExternalId: "uniq-1" });
+  });
+
+  test("a comment-reply reference satisfies the address guard (comment-to-DM opener)", async () => {
+    const f = fakePorts({
+      async countConsecutiveOutbound() { return 0; },
+    });
+    const result = await processSendMessage(f.ports, { ...ttJob, commentReplyExternalId: "comment-1" });
+    expect(result.externalMessageId).toBe("wamid.1");
+  });
+
+  test("broadcast to a tiktok account fails typed and marks the broadcast failed", async () => {
+    const statusUpdates: Array<{ id: string; status: string }> = [];
+    const f = fakePorts({
+      async loadBroadcast() {
+        return {
+          id: "b-tt", workspaceId: "ws1", channelAccountId: "acc-tt", channel: "tiktok",
+          accountExternalId: "open-123", tag: "vip", country: "ID",
+        };
+      },
+      async updateBroadcastStatus(id, status) { statusUpdates.push({ id, status }); },
+    });
+    await expect(processBroadcast(f.ports, { broadcastId: "b-tt" }))
+      .rejects.toMatchObject({ code: "CHANNEL_INITIATION_UNSUPPORTED" });
+    expect(statusUpdates).toEqual([{ id: "b-tt", status: "failed" }]);
+    expect(f.sent).toHaveLength(0);
+  });
+});

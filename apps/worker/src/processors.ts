@@ -1,6 +1,11 @@
 import { rateWhatsAppMessage, type WhatsAppCategory } from "@botara/billing";
 import { runFlow, type Flow, type FlowEvent, type FlowPorts, type FlowRunResult, type FlowState } from "@botara/flow-engine";
-import type { RichBlock, SendInput, SendResult } from "@botara/channels";
+import {
+  CHANNEL_CAPABILITIES, type ChannelKey, type RichBlock, type SendInput, type SendResult,
+} from "@botara/channels";
+import {
+  ChannelInitiationError, ConsecutiveSendCapError, ConversationAddressMissingError,
+} from "@botara/shared";
 
 /**
  * Fase 1 worker processors.
@@ -30,6 +35,17 @@ export interface SendMessageJobData {
   messageId?: string;
   /** Broadcast id this send belongs to (cost ledger reference + counters). */
   referenceId?: string;
+  /** Botara contact id (flow runs), used by conversation-scoped send guards. */
+  contactId?: string;
+  /**
+   * Provider conversation id for conversation-addressed channels
+   * (TikTok). Flow runs resolve it from the conversation row; a send on
+   * a reactive-only channel without it (or a comment-reply reference)
+   * fails typed instead of guessing an address.
+   */
+  conversationExternalId?: string;
+  /** TikTok comment-to-DM: high-intent comment id this send replies to. */
+  commentReplyExternalId?: string;
   /** Stable idempotency key - retries with the same key never double-send. */
   idempotencyKey: string;
 }
@@ -60,6 +76,8 @@ export interface FlowRunContext {
   tokenVaultRef?: string;
   contactId: string;
   contactExternalId: string;
+  /** Provider conversation id (TikTok), resolved from the conversation row. */
+  conversationExternalId?: string;
   country?: string;
 }
 
@@ -108,6 +126,21 @@ export interface WorkerPorts {
   }): Promise<void>;
   updateMessageStatus(messageId: string, status: string, externalId?: string): Promise<void>;
   incrementBroadcastCounts(broadcastId: string, delta: { sent?: number; failed?: number }): Promise<void>;
+  /** Mark a broadcast terminally failed (capability-gate backstop). Optional. */
+  updateBroadcastStatus?(broadcastId: string, status: string): Promise<void>;
+  /**
+   * Count a conversation's consecutive outbound messages since the
+   * customer's last inbound one (the shared counter's data source).
+   * Optional: without it, capability caps on sends are unenforced here
+   * (the API reply route still enforces them synchronously).
+   */
+  countConsecutiveOutbound?(input: {
+    workspaceId: string;
+    channel: string;
+    channelAccountId: string;
+    contactExternalId: string;
+    conversationExternalId?: string;
+  }): Promise<number>;
   loadBroadcast(broadcastId: string): Promise<BroadcastSnapshot | null>;
   listBroadcastTargets(broadcast: BroadcastSnapshot): Promise<BroadcastTarget[]>;
   /**
@@ -150,12 +183,36 @@ export async function processSendMessage(
 ): Promise<{ externalMessageId: string; costUsd: number }> {
   const category = billingCategory(data);
   try {
+    // Capability-driven send guards for reactive-only channels (TikTok),
+    // enforced at this choke point because EVERY send (flow, sequence,
+    // broadcast fan-out, comment DM) passes through it:
+    //  - no provider conversation id and no comment-reply reference means
+    //    the send cannot be addressed at all -> typed failure;
+    //  - the consecutive-outbound cap (TikTok: 10) is counted live.
+    const caps = CHANNEL_CAPABILITIES[data.channel as ChannelKey];
+    if (caps?.canInitiate === false && !data.conversationExternalId && !data.commentReplyExternalId) {
+      throw new ConversationAddressMissingError(data.channel);
+    }
+    if (caps?.maxConsecutiveOutbound && ports.countConsecutiveOutbound) {
+      const consecutive = await ports.countConsecutiveOutbound({
+        workspaceId: data.workspaceId,
+        channel: data.channel,
+        channelAccountId: data.channelAccountId,
+        contactExternalId: data.toExternalId,
+        conversationExternalId: data.conversationExternalId,
+      });
+      if (consecutive >= caps.maxConsecutiveOutbound) {
+        throw new ConsecutiveSendCapError(data.channel, caps.maxConsecutiveOutbound, consecutive);
+      }
+    }
     const result = await ports.send(data.channel, {
       account: { id: data.channelAccountId, externalId: data.accountExternalId, tokenVaultRef: data.tokenVaultRef },
       toExternalId: data.toExternalId,
       text: data.text,
       rich: data.rich,
       template: data.template,
+      conversationExternalId: data.conversationExternalId,
+      commentReplyExternalId: data.commentReplyExternalId,
       idempotencyKey: data.idempotencyKey,
     });
     if (result.warnings && result.warnings.length > 0) {
@@ -209,6 +266,14 @@ export async function processBroadcast(
 ): Promise<{ enqueued: number }> {
   const broadcast = await ports.loadBroadcast(data.broadcastId);
   if (!broadcast) throw new Error(`Broadcast ${data.broadcastId} not found`);
+  // Backstop for the API create gate: a broadcast row that exists for a
+  // channel that cannot broadcast (reactive-only, e.g. TikTok) fails
+  // terminally here instead of fanning out sends the provider forbids.
+  const caps = CHANNEL_CAPABILITIES[broadcast.channel as ChannelKey];
+  if (caps && !caps.canBroadcast) {
+    await ports.updateBroadcastStatus?.(broadcast.id, "failed").catch(() => undefined);
+    throw new ChannelInitiationError(broadcast.channel, "Broadcasts");
+  }
   const targets = await ports.listBroadcastTargets(broadcast);
   for (const target of targets) {
     await ports.enqueueSendMessage({
@@ -262,6 +327,8 @@ export async function processFlowRun(
         accountExternalId: ctx.accountExternalId,
         tokenVaultRef: ctx.tokenVaultRef,
         toExternalId: ctx.contactExternalId,
+        contactId: ctx.contactId,
+        conversationExternalId: ctx.conversationExternalId,
         text,
         rich,
         country: ctx.country,

@@ -738,6 +738,19 @@ export async function findConversationByExternalId(
   return row ?? null;
 }
 
+/** Fetch one conversation row by its Botara id (worker flow-run resolution). */
+export async function getConversationById(
+  db: Database,
+  conversationId: string,
+): Promise<ConversationRow | null> {
+  const [row] = await db
+    .select()
+    .from(conversations)
+    .where(eq(conversations.id, conversationId))
+    .limit(1);
+  return row ?? null;
+}
+
 export async function getContactByExternal(
   db: Database,
   workspaceId: string,

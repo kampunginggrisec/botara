@@ -158,3 +158,23 @@ describe("rich passthrough in send paths", () => {
     expect(f.enqueued[0]).toMatchObject({ rich: RICH, text: "Pick one", toExternalId: "62812" });
   });
 });
+
+describe("comment-action processor (tiktok)", () => {
+  test("public reply + hide are skipped by capability; the direct_reply private reply still runs", async () => {
+    const f = fakeCommentPorts();
+    const result = await processCommentAction(f.ports, {
+      ...baseJob,
+      channel: "tiktok",
+      channelAccountId: "acc-tt",
+      accountExternalId: "open-123",
+      privateText: "Halo! Ini info harganya.",
+    });
+    expect(result.skipped).toBe(false);
+    // No moderate calls at all: only private-reply -> persist -> mark -> flow-run.
+    expect(f.calls).toEqual(["private-reply", "persist", "mark", "flow-run"]);
+    expect(result.actions).toEqual([
+      "public-reply-skipped", "hide-skipped", "private-reply", "flow-run",
+    ]);
+    expect(f.persisted[0]).toMatchObject({ body: "Halo! Ini info harganya." });
+  });
+});

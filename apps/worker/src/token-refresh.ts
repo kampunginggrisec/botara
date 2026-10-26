@@ -31,8 +31,13 @@ export interface TokenRefreshPorts {
   enqueueRefresh(accountId: string): Promise<void>;
   loadAccount(accountId: string): Promise<DueTokenAccount | null>;
   /** Delegate to the channel adapter (registry) - it owns the window logic. */
-  refresh(channel: string, account: DueTokenAccount): Promise<{ refreshed: boolean; expiresAt?: string }>;
-  persistRefresh(accountId: string, patch: { tokenExpiresAt?: string; status?: string }): Promise<void>;
+  refresh(channel: string, account: DueTokenAccount): Promise<{ refreshed: boolean; expiresAt?: string; rotatedSecret?: string }>;
+  /**
+   * Persist a refresh outcome. `secret` carries a ROTATED credential
+   * (TikTok pairs): the wiring seals it into the vault and swaps the
+   * account's token_vault_ref, because the old refresh token is dead.
+   */
+  persistRefresh(accountId: string, patch: { tokenExpiresAt?: string; status?: string; secret?: string }): Promise<void>;
   /** Structured alert sink (prod: error log; later: paging/webhook). */
   alert(entry: { accountId: string; channel: string; error: string }): Promise<void>;
 }
@@ -65,6 +70,7 @@ export async function processTokenRefreshAccount(
       await ports.persistRefresh(account.id, {
         tokenExpiresAt: result.expiresAt,
         status: "connected",
+        secret: result.rotatedSecret,
       });
     }
     return { refreshed: result.refreshed };

@@ -1,4 +1,4 @@
-import type { ChannelAccountRef } from "@botara/channels";
+import { CHANNEL_CAPABILITIES, type ChannelAccountRef, type ChannelKey } from "@botara/channels";
 import type { FlowRunRef } from "./processors";
 
 /**
@@ -103,22 +103,37 @@ export async function processCommentAction(
 
   const actions: string[] = [];
 
+  // Public actions are capability-gated: TikTok's Business Messaging API
+  // has no public comment reply or hide (those live in a separate
+  // Accounts API Botara does not integrate), so for TikTok the steps are
+  // recorded as skipped - visibly, in the actions list - and the private
+  // reply below remains the effective comment-to-DM action.
+  const caps = CHANNEL_CAPABILITIES[job.channel as ChannelKey];
+
   // 1. Public reply (visible on the post, under the comment).
   if (job.publicReplyText) {
-    await ports.moderate({
-      channel: job.channel, account,
-      commentExternalId: job.commentExternalId, action: "reply", text: job.publicReplyText,
-    });
-    actions.push("public-reply");
+    if (caps?.canReplyToComments) {
+      await ports.moderate({
+        channel: job.channel, account,
+        commentExternalId: job.commentExternalId, action: "reply", text: job.publicReplyText,
+      });
+      actions.push("public-reply");
+    } else {
+      actions.push("public-reply-skipped");
+    }
   }
 
   // 2. Hide the comment (spam control).
   if (job.autoHide) {
-    await ports.moderate({
-      channel: job.channel, account,
-      commentExternalId: job.commentExternalId, action: "hide",
-    });
-    actions.push("hide");
+    if (caps?.canHideComments) {
+      await ports.moderate({
+        channel: job.channel, account,
+        commentExternalId: job.commentExternalId, action: "hide",
+      });
+      actions.push("hide");
+    } else {
+      actions.push("hide-skipped");
+    }
   }
 
   // 3. Private reply (comment-to-DM). Explicit config text wins; otherwise

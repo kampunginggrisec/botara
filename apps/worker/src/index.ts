@@ -13,15 +13,17 @@ import {
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
   getContactByExternal, createContact, listConversations, findOpenConversation,
+  findConversationByExternalId, getConversationById, listMessages, updateBroadcastStatus,
   isCommentProcessed, markCommentProcessed,
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
-  findMessageByIdempotencyKey, getWebchatSessionById,
+  findMessageByIdempotencyKey, getWebchatSessionById, createTokenVault,
   type Database,
 } from "@botara/db";
 import {
-  getAdapter, EmailAdapter, InstagramAdapter, WebchatAdapter,
+  getAdapter, configureTikTokTokenPersistence, EmailAdapter, InstagramAdapter, WebchatAdapter,
   type ChannelAccountRef, type ChannelKey, type WebchatStore,
 } from "@botara/channels";
+import { countConsecutiveOutbound } from "@botara/shared";
 import { putObject } from "@botara/media";
 import {
   processBroadcast, processFlowRun, processSendMessage,
@@ -172,6 +174,13 @@ function buildProdPorts(db: Database): WorkerPorts {
           };
         }
       }
+      // Conversation-addressed channels (TikTok) send to the provider
+      // conversation id on the conversation row this run belongs to:
+      // the ref's own conversation first, the open one as fallback.
+      const runConversation = (ref.conversationId ? await getConversationById(db, ref.conversationId) : null)
+        ?? await findOpenConversation(db, {
+          workspaceId: ref.workspaceId, channelAccountId: account.id, contactId: contact.id,
+        });
       return {
         flow: toRunnableFlow(flowRow.id, parsed.data),
         ...(state ? { state } : {}),
@@ -187,6 +196,7 @@ function buildProdPorts(db: Database): WorkerPorts {
           tokenVaultRef: account.tokenVaultRef ?? undefined,
           contactId: contact.id,
           contactExternalId: contact.externalId,
+          conversationExternalId: runConversation?.externalId ?? undefined,
         },
       };
     },
@@ -238,6 +248,25 @@ function buildProdPorts(db: Database): WorkerPorts {
     },
     async incrementBroadcastCounts(broadcastId, delta) {
       await incrementBroadcastCounts(db, broadcastId, delta);
+    },
+    async updateBroadcastStatus(broadcastId, status) {
+      await updateBroadcastStatus(db, broadcastId, status);
+    },
+    async countConsecutiveOutbound({ workspaceId, channel, channelAccountId, contactExternalId, conversationExternalId }) {
+      // Resolve the conversation the send belongs to: by provider id
+      // when the job carries one (TikTok), else the open conversation
+      // for (account, contact) - then count from the persisted rows.
+      let conversation = conversationExternalId
+        ? await findConversationByExternalId(db, channelAccountId, conversationExternalId)
+        : null;
+      if (!conversation) {
+        const contact = await getContactByExternal(db, workspaceId, channel, contactExternalId);
+        if (!contact) return 0;
+        conversation = await findOpenConversation(db, { workspaceId, channelAccountId, contactId: contact.id });
+      }
+      if (!conversation) return 0;
+      const rows = await listMessages(db, conversation.id);
+      return countConsecutiveOutbound(rows);
     },
     async loadBroadcast(broadcastId): Promise<BroadcastSnapshot | null> {
       const row = await getBroadcastById(db, broadcastId);
@@ -323,8 +352,22 @@ function buildTokenRefreshPorts(db: Database): TokenRefreshPorts {
       });
     },
     async persistRefresh(accountId, patch) {
+      // A rotated credential (TikTok pair) must replace the vault entry:
+      // the old refresh token is dead the moment the new pair is issued.
+      let tokenVaultRef: string | undefined;
+      if (patch.secret && process.env.TOKEN_VAULT_KEY) {
+        const row = await getChannelAccountById(db, accountId);
+        if (row) {
+          const vault = createTokenVault(db, process.env);
+          tokenVaultRef = await vault.put({
+            workspaceId: row.workspaceId, kind: row.channel,
+            label: row.displayName ?? row.channel, secret: patch.secret,
+          });
+        }
+      }
       await updateChannelAccountToken(db, accountId, {
         tokenExpiresAt: patch.tokenExpiresAt ? new Date(patch.tokenExpiresAt) : undefined,
+        tokenVaultRef,
         status: patch.status,
       });
     },
@@ -679,6 +722,29 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
       console.log(`[worker] ${queueName}: received job ${job.id} (${job.name}) - no handler`);
       return { stub: true };
   }
+}
+
+// TikTok token pairs rotate on refresh (including refresh-on-401 inside
+// a send): persist every rotation into the vault + account row. Wired
+// only when the vault is configured; without it the adapter's in-process
+// cache still keeps this process correct until restart.
+if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
+  configureTikTokTokenPersistence(async ({ account, pair, serialized }) => {
+    const db = getDbOrNull();
+    if (!db) return;
+    const row = await getChannelAccountById(db, account.id);
+    if (!row) return;
+    const vault = createTokenVault(db, process.env);
+    const ref = await vault.put({
+      workspaceId: row.workspaceId, kind: "tiktok",
+      label: row.displayName ?? "TikTok", secret: serialized,
+    });
+    await updateChannelAccountToken(db, row.id, {
+      tokenVaultRef: ref,
+      tokenExpiresAt: pair.expiresAt ? new Date(pair.expiresAt) : undefined,
+      status: "connected",
+    });
+  });
 }
 
 const queues: Queue[] = [];
