@@ -58,9 +58,10 @@ describe("requiredScopeForRoute", () => {
     expect(requiredScopeForRoute("DELETE", "/workspaces/ws1/members/u2")).toEqual({ kind: "scope", scope: "settings:write" });
   });
 
-  test("oauth start (GET) requires channels:write; stats overview is any-read", () => {
+  test("oauth start (GET) requires channels:write; stats overview and insights are any-read", () => {
     expect(requiredScopeForRoute("GET", "/channels/whatsapp/oauth/start")).toEqual({ kind: "scope", scope: "channels:write" });
     expect(requiredScopeForRoute("GET", "/stats/overview")).toEqual({ kind: "any-read" });
+    expect(requiredScopeForRoute("GET", "/stats/insights")).toEqual({ kind: "any-read" });
   });
 
   test("non-workspace surfaces are not resource routes", () => {
@@ -108,6 +109,9 @@ describe("assertApiTokenRouteAccess", () => {
     expect(() => assertApiTokenRouteAccess(grant({ scopes: ["kb:read"] }), "GET", "/stats/overview")).not.toThrow();
     expect(() => assertApiTokenRouteAccess(grant({ scopes: ["kb:write"] }), "GET", "/stats/overview")).not.toThrow();
     expect(() => assertApiTokenRouteAccess(grant({ scopes: [] }), "GET", "/stats/overview")).toThrow();
+    expect(() => assertApiTokenRouteAccess(grant({ scopes: ["kb:read"] }), "GET", "/stats/insights")).not.toThrow();
+    expect(() => assertApiTokenRouteAccess(grant({ scopes: ["kb:write"] }), "GET", "/stats/insights")).not.toThrow();
+    expect(() => assertApiTokenRouteAccess(grant({ scopes: [] }), "GET", "/stats/insights")).toThrow();
     expect(() => assertApiTokenRouteAccess(grant({ scopes: [] }), "GET", "/contacts")).toThrow();
   });
 });

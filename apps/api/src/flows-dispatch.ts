@@ -1,10 +1,10 @@
 import {
-  addContactTag, advanceBroadcastRecipientByProviderId, advanceConversationLastUserMessage,
+  addContactTag, advanceBroadcastRecipientByProviderId, advanceConversationLastUserMessage, advanceMessageStatusByProviderId,
   broadcastRecipientTransition, claimFlowWaitByConversation, createContact, createConversation, createMessage,
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
-  listGrowthLinksByAccount, markBroadcastRecipientReplied, touchConversationLastUserMessage, updateContact, updateConversationExternalId,
+  listGrowthLinksByAccount, markBroadcastRecipientReplied, messageStatusTransition, touchConversationLastUserMessage, updateContact, updateConversationExternalId,
   upsertContactByExternal, type Database,
 } from "@botara/db";
 import {
@@ -258,6 +258,15 @@ export interface DispatchStore {
     status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
   }): Promise<void>;
   /**
+   * Inbox message mirror (package #8): advance the outbound inbox
+   * message row carrying this provider message id (delivered/read
+   * receipts). Optional, same rationale as above.
+   */
+  advanceMessageStatusByProviderId?(input: {
+    workspaceId: string; providerMessageId: string;
+    status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
+  }): Promise<void>;
+  /**
    * Broadcast recipient mirror (package #4): attribute a contact's
    * inbound message as a reply to their latest still-open broadcast.
    * Optional, same rationale as above.
@@ -365,6 +374,13 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
         ...(input.error !== undefined ? { error: input.error } : {}),
       });
     },
+    async advanceMessageStatusByProviderId(input) {
+      await advanceMessageStatusByProviderId(getDatabase(), {
+        workspaceId: input.workspaceId,
+        providerMessageId: input.providerMessageId,
+        to: input.status,
+      });
+    },
     async markBroadcastRecipientReplied(input) {
       await markBroadcastRecipientReplied(getDatabase(), input);
     },
@@ -378,7 +394,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   /** Collect-input waits in creation order (claim = oldest first). */
   readonly flowWaits: Array<ClaimedFlowWait & { conversationId: string }> = [];
   readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; externalId?: string | null; lastUserMessageAt?: string }>();
-  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
+  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; status?: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
   readonly conversions = new Map<string, number>();
@@ -531,6 +547,21 @@ export class InMemoryDispatchStore implements DispatchStore {
     if (!latest) return;
     const patch = broadcastRecipientTransition(latest, "replied", input.at);
     if (patch) Object.assign(latest, patch);
+  }
+
+  /** Inbox message rows advanced by provider receipts (package #8). */
+  async advanceMessageStatusByProviderId(input: {
+    workspaceId: string; providerMessageId: string;
+    status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
+  }) {
+    for (const m of this.messages) {
+      if (m.externalId !== input.providerMessageId || m.direction !== "out") continue;
+      const conversation = this.conversations.get(m.conversationId);
+      if (!conversation || conversation.workspaceId !== input.workspaceId) continue;
+      const next = messageStatusTransition(m.status ?? "queued", input.status);
+      if (next) m.status = next;
+      return;
+    }
   }
 }
 
@@ -874,29 +905,47 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
   /**
    * Provider delivery-status webhooks (package #4): until now these
    * events were parsed by the adapters and dropped - nothing consumed
-   * them. Their one consumer is the broadcast recipient mirror: the
-   * recipient row carrying the provider message id (inside the resolved
-   * account's workspace) advances delivered/read, or records the
-   * provider's failure. The forward-only transition guard in the store
-   * makes out-of-order statuses harmless.
+   * them. Two mirrors consume them today, each in its own try/catch so
+   * one failing never blocks the other:
+   *  - the broadcast recipient mirror (package #4): the recipient row
+   *    carrying the provider message id advances delivered/read, or
+   *    records the provider's failure;
+   *  - the inbox message mirror (package #8): the outbound inbox
+   *    message row carrying the same provider id advances with it, so
+   *    the thread's delivered/read state is real.
+   * The forward-only transition guards in the store make out-of-order
+   * statuses harmless on both paths.
    */
   async function dispatchMessageStatus(event: Extract<InboundEvent, { type: "message.status" }>): Promise<void> {
-    if (!deps.store.advanceBroadcastRecipientByProviderId) return;
     const account = await resolveAccount(event);
     if (!account) return;
     const firstError = event.errors?.[0];
-    try {
-      await deps.store.advanceBroadcastRecipientByProviderId({
-        workspaceId: account.workspaceId,
-        providerMessageId: event.messageExternalId,
-        status: event.status,
-        at: new Date(event.receivedAt),
-        ...(firstError
-          ? { error: firstError.message ?? firstError.title ?? `provider error ${firstError.code}` }
-          : {}),
-      });
-    } catch (err) {
-      log({ event: "broadcast_recipient_status_failed", workspaceId: account.workspaceId, messageExternalId: event.messageExternalId, error: String(err) });
+    if (deps.store.advanceBroadcastRecipientByProviderId) {
+      try {
+        await deps.store.advanceBroadcastRecipientByProviderId({
+          workspaceId: account.workspaceId,
+          providerMessageId: event.messageExternalId,
+          status: event.status,
+          at: new Date(event.receivedAt),
+          ...(firstError
+            ? { error: firstError.message ?? firstError.title ?? `provider error ${firstError.code}` }
+            : {}),
+        });
+      } catch (err) {
+        log({ event: "broadcast_recipient_status_failed", workspaceId: account.workspaceId, messageExternalId: event.messageExternalId, error: String(err) });
+      }
+    }
+    if (deps.store.advanceMessageStatusByProviderId) {
+      try {
+        await deps.store.advanceMessageStatusByProviderId({
+          workspaceId: account.workspaceId,
+          providerMessageId: event.messageExternalId,
+          status: event.status,
+          at: new Date(event.receivedAt),
+        });
+      } catch (err) {
+        log({ event: "message_status_advance_failed", workspaceId: account.workspaceId, messageExternalId: event.messageExternalId, error: String(err) });
+      }
     }
   }
 

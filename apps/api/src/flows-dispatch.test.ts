@@ -811,3 +811,75 @@ describe("broadcast recipient mirror (package #4)", () => {
     expect(newer.repliedAt).toBe(firstRepliedAt); // first reply wins, never overwritten
   });
 });
+
+describe("inbox message status advancement (package #8)", () => {
+  const waStatus = (messageExternalId: string, status: "sent" | "delivered" | "read" | "failed", extra: object = {}): InboundEvent => ({
+    type: "message.status", channel: "whatsapp", accountExternalId: "10987",
+    messageExternalId, status, receivedAt: new Date().toISOString(), ...extra,
+  });
+
+  type OutboundSeed = {
+    id: string; conversationId: string; direction: string; externalId: string | null; status: string;
+  };
+  const seedOutbound = (store: InMemoryDispatchStore, over: Partial<OutboundSeed> = {}): OutboundSeed => {
+    const message: OutboundSeed = {
+      id: `m-${Math.random()}`,
+      conversationId: "conv-inbox",
+      direction: "out",
+      externalId: "wamid.INBOX",
+      status: "sent",
+      ...over,
+    };
+    store.conversations.set("conv-inbox", { id: "conv-inbox", workspaceId: "ws-1", channelAccountId: "acc-wa", contactId: "ct-9" });
+    store.messages.push(message as never);
+    return message;
+  };
+
+  test("delivered then read receipts advance the inbox message; out-of-order receipts never regress", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedOutbound(store);
+    await dispatcher.dispatch([waStatus("wamid.INBOX", "delivered")]);
+    expect(row.status).toBe("delivered");
+    await dispatcher.dispatch([waStatus("wamid.INBOX", "read")]);
+    expect(row.status).toBe("read");
+    // A late delivered (and a failed long after delivery) change nothing.
+    await dispatcher.dispatch([waStatus("wamid.INBOX", "delivered")]);
+    expect(row.status).toBe("read");
+    await dispatcher.dispatch([waStatus("wamid.INBOX", "failed")]);
+    expect(row.status).toBe("read");
+  });
+
+  test("a read receipt before any delivered receipt jumps straight to read", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedOutbound(store);
+    await dispatcher.dispatch([waStatus("wamid.INBOX", "read")]);
+    expect(row.status).toBe("read");
+  });
+
+  test("receipts for unknown provider ids are no-ops; inbound rows never match", async () => {
+    const { store, dispatcher } = setup();
+    const row = seedOutbound(store);
+    const inbound = seedOutbound(store, { id: "m-in", direction: "in", externalId: "wamid.INBOUND", status: "received" });
+    await dispatcher.dispatch([waStatus("wamid.DOES-NOT-EXIST", "delivered")]);
+    expect(row.status).toBe("sent");
+    await dispatcher.dispatch([waStatus("wamid.INBOUND", "read")]);
+    expect(inbound.status).toBe("received");
+  });
+
+  test("one receipt advances both the broadcast recipient and the inbox message", async () => {
+    const { store, dispatcher } = setup();
+    // Same provider id on a recipient row and an inbox message row:
+    // the two mirrors are independent - both must move.
+    const recipient = {
+      id: "rec-both", broadcastId: "b-1", workspaceId: "ws-1", contactId: "ct-9",
+      status: "sent", providerMessageId: "wamid.BOTH", error: null as string | null,
+      sentAt: new Date(), deliveredAt: null as Date | null, readAt: null as Date | null,
+      repliedAt: null as Date | null, createdAt: new Date(),
+    };
+    store.broadcastRecipients.push(recipient as never);
+    const message = seedOutbound(store, { externalId: "wamid.BOTH" });
+    await dispatcher.dispatch([waStatus("wamid.BOTH", "delivered")]);
+    expect(recipient.status).toBe("delivered");
+    expect(message.status).toBe("delivered");
+  });
+});

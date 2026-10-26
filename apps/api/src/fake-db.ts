@@ -14,10 +14,12 @@ import {
  * against the REAL repository code without a Postgres - the bug class it
  * guards (the webchat double-persist) lived precisely in that seam.
  *
- * Conditions are read by walking the Drizzle SQL query chunks: only `=`
+ * Conditions are read by walking the Drizzle SQL query chunks: `=`
  * comparisons between a column and a param (filters) or between two
- * columns (join keys) are supported; anything else throws, so a future
- * repository change fails this fake loudly instead of silently passing.
+ * columns (join keys), plus range comparisons (`>=`, `<=`, `>`, `<`)
+ * between a column and a param (the insights window queries, package
+ * #8); anything else throws, so a future repository change fails this
+ * fake loudly instead of silently passing.
  * Each createFakeDatabase() is fully independent (state lives in the
  * factory closure, never in module globals).
  */
@@ -70,8 +72,46 @@ function tokenize(node: unknown, out: Token[] = []): Token[] {
   return out;
 }
 
-interface EqFilter { table: unknown; key: string; value: unknown }
+interface EqFilter { table: unknown; key: string; value: unknown; op: "=" | ">=" | "<=" | ">" | "<" }
 interface JoinEq { aTable: unknown; aKey: string; bTable: unknown; bKey: string }
+
+/** Comparison operator carried by a text chunk between a column and a param, if any. */
+function operatorOf(text: string): EqFilter["op"] | null {
+  if (text.includes(">=")) return ">=";
+  if (text.includes("<=")) return "<=";
+  if (text.includes(">")) return ">";
+  if (text.includes("<")) return "<";
+  if (text.includes("=")) return "=";
+  return null;
+}
+
+/**
+ * Compare a stored row value against a filter param for range operators:
+ * Dates (or ISO strings on either side) compare by instant, numbers
+ * numerically, strings lexicographically. Null when incomparable.
+ */
+function compareValues(a: unknown, b: unknown): number | null {
+  if (a instanceof Date || b instanceof Date) {
+    const ta = a instanceof Date ? a.getTime() : typeof a === "string" ? Date.parse(a) : Number.NaN;
+    const tb = b instanceof Date ? b.getTime() : typeof b === "string" ? Date.parse(b) : Number.NaN;
+    if (Number.isNaN(ta) || Number.isNaN(tb)) return null;
+    return ta - tb;
+  }
+  if (typeof a === "number" && typeof b === "number") return a - b;
+  if (typeof a === "string" && typeof b === "string") return a < b ? -1 : a > b ? 1 : 0;
+  return null;
+}
+
+/** Whether one stored value satisfies one parsed filter. */
+function matchesFilter(rowValue: unknown, f: EqFilter): boolean {
+  if (f.op === "=") return rowValue === f.value;
+  const cmp = compareValues(rowValue, f.value);
+  if (cmp === null) return false;
+  if (f.op === ">=") return cmp >= 0;
+  if (f.op === "<=") return cmp <= 0;
+  if (f.op === ">") return cmp > 0;
+  return cmp < 0;
+}
 
 function parseCondition(cond: unknown): { filters: EqFilter[]; joins: JoinEq[] } {
   const tokens = tokenize(cond);
@@ -82,9 +122,11 @@ function parseCondition(cond: unknown): { filters: EqFilter[]; joins: JoinEq[] }
     const mid = tokens[i + 1];
     const b = tokens[i + 2];
     if (!a || !mid || !b) break;
-    if (a.kind === "column" && mid.kind === "text" && mid.text.includes("=")) {
-      if (b.kind === "param") filters.push({ table: a.table, key: a.key, value: b.value });
-      else if (b.kind === "column") joins.push({ aTable: a.table, aKey: a.key, bTable: b.table, bKey: b.key });
+    if (a.kind === "column" && mid.kind === "text") {
+      const op = operatorOf(mid.text);
+      if (op === null) continue;
+      if (b.kind === "param") filters.push({ table: a.table, key: a.key, value: b.value, op });
+      else if (b.kind === "column" && op === "=") joins.push({ aTable: a.table, aKey: a.key, bTable: b.table, bKey: b.key });
     }
   }
   return { filters, joins };
@@ -151,7 +193,7 @@ class FakeSelect {
     }
     if (this.whereCond !== null && this.whereCond !== undefined) {
       const { filters } = parseCondition(this.whereCond);
-      combined = combined.filter((jr) => filters.every((f) => jr.get(f.table)?.[f.key] === f.value));
+      combined = combined.filter((jr) => filters.every((f) => matchesFilter(jr.get(f.table)?.[f.key], f)));
     }
     for (const orderArg of this.orders) {
       const order = parseOrder(orderArg);
@@ -258,7 +300,7 @@ class FakeUpdate {
         const { filters } = parseCondition(this.whereCond);
         const affected: Row[] = [];
         for (const row of this.core.rowsOf(this.table)) {
-          if (filters.every((f) => row[f.key] === f.value)) {
+          if (filters.every((f) => matchesFilter(row[f.key], f))) {
             Object.assign(row, this.setObj);
             affected.push(row);
           }
@@ -282,7 +324,7 @@ class FakeDelete {
         const { filters } = parseCondition(this.whereCond);
         const rows = this.core.rowsOf(this.table);
         for (let i = rows.length - 1; i >= 0; i--) {
-          if (filters.every((f) => rows[i]![f.key] === f.value)) rows.splice(i, 1);
+          if (filters.every((f) => matchesFilter(rows[i]![f.key], f))) rows.splice(i, 1);
         }
       })
       .then(onFulfilled, onRejected);

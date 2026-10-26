@@ -7,7 +7,7 @@ import {
   getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceMembers,
   listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow,
   setUserPasswordHash, setUserPlatformAdmin, touchApiToken, touchUserLastLogin,
-  updateUserName, updateWorkspaceDefaultCurrency, updateWorkspaceName,
+  updateUserName, updateWorkspaceDefaultCurrency, updateWorkspaceName, updateWorkspaceReplyTarget,
   upsertWorkspaceMember,
   type Database,
 } from "@botara/db";
@@ -52,6 +52,8 @@ export interface AuthWorkspaceView {
   slug: string;
   /** Workspace default currency (package #6) - the deal form's preset. */
   defaultCurrency: string;
+  /** Workspace reply target in minutes (package #8) - the insights service goal. */
+  replyTargetMinutes: number;
   role: string;
 }
 
@@ -148,6 +150,8 @@ export interface AuthStore {
   renameWorkspace(workspaceId: string, name: string): Promise<void>;
   /** Workspace default currency (package #6). */
   updateWorkspaceCurrency(workspaceId: string, currency: string): Promise<void>;
+  /** Workspace reply target in minutes (package #8). */
+  updateWorkspaceReplyTarget(workspaceId: string, minutes: number): Promise<void>;
   /** API tokens (adopted features): create returns the raw token ONCE. */
   createApiToken(userId: string, name: string, options?: CreateApiTokenOptions): Promise<{ raw: string; token: ApiTokenView }>;
   listApiTokens(userId: string): Promise<ApiTokenView[]>;
@@ -288,7 +292,7 @@ export class DbAuthStore implements AuthStore {
     const rows = await listWorkspacesForUser(this.getDatabase(), userId);
     return rows.map((r) => ({
       id: r.workspaceId, name: r.workspaceName, slug: r.slug,
-      defaultCurrency: r.defaultCurrency, role: r.role,
+      defaultCurrency: r.defaultCurrency, replyTargetMinutes: r.replyTargetMinutes ?? 60, role: r.role,
     }));
   }
 
@@ -311,6 +315,10 @@ export class DbAuthStore implements AuthStore {
 
   async updateWorkspaceCurrency(workspaceId: string, currency: string) {
     await updateWorkspaceDefaultCurrency(this.getDatabase(), workspaceId, currency);
+  }
+
+  async updateWorkspaceReplyTarget(workspaceId: string, minutes: number) {
+    await updateWorkspaceReplyTarget(this.getDatabase(), workspaceId, minutes);
   }
 
   async createApiToken(userId: string, name: string, options: CreateApiTokenOptions = {}) {
@@ -364,7 +372,7 @@ export class DbAuthStore implements AuthStore {
 /** In-memory AuthStore for tests (and only tests). */
 export class InMemoryAuthStore implements AuthStore {
   readonly users = new Map<string, AuthUser>();
-  readonly workspaces = new Map<string, { id: string; name: string; slug: string; defaultCurrency: string }>();
+  readonly workspaces = new Map<string, { id: string; name: string; slug: string; defaultCurrency: string; replyTargetMinutes: number }>();
   readonly members = new Map<string, { workspaceId: string; userId: string; role: string }>();
   readonly auditLog: Array<{ workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }> = [];
   readonly apiTokens = new Map<string, ApiTokenView & { userId: string; tokenHash: string }>();
@@ -420,7 +428,7 @@ export class InMemoryAuthStore implements AuthStore {
   }
 
   async createWorkspace(input: { name: string; slug: string }) {
-    const ws = { id: crypto.randomUUID(), name: input.name, slug: input.slug, defaultCurrency: "IDR" };
+    const ws = { id: crypto.randomUUID(), name: input.name, slug: input.slug, defaultCurrency: "IDR", replyTargetMinutes: 60 };
     this.workspaces.set(ws.id, ws);
     return { id: ws.id, name: ws.name, slug: ws.slug };
   }
@@ -443,7 +451,7 @@ export class InMemoryAuthStore implements AuthStore {
       .filter((m) => m.userId === userId)
       .map((m) => {
         const ws = this.workspaces.get(m.workspaceId)!;
-        return { id: ws.id, name: ws.name, slug: ws.slug, defaultCurrency: ws.defaultCurrency, role: m.role };
+        return { id: ws.id, name: ws.name, slug: ws.slug, defaultCurrency: ws.defaultCurrency, replyTargetMinutes: ws.replyTargetMinutes ?? 60, role: m.role };
       });
   }
 
@@ -473,6 +481,11 @@ export class InMemoryAuthStore implements AuthStore {
   async updateWorkspaceCurrency(workspaceId: string, currency: string) {
     const ws = this.workspaces.get(workspaceId);
     if (ws) ws.defaultCurrency = currency;
+  }
+
+  async updateWorkspaceReplyTarget(workspaceId: string, minutes: number) {
+    const ws = this.workspaces.get(workspaceId);
+    if (ws) ws.replyTargetMinutes = minutes;
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {

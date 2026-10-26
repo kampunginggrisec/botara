@@ -35,7 +35,7 @@ import {
   listKbChunks, listKbChunksByWorkspace,
   insertAiUsageLedger, updateConversationAiAnalysis, setConversationAiPaused,
   createFlow, listFlows, getFlow, updateFlow, deleteFlow, deleteFlowWaitsForConversation,
-  deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
+  deleteSequence, countEnrollmentsBySequence, getWorkspaceStats, getWorkspaceInsights, listWorkspaceActivity,
   updateChannelAccountToken, updateChannelAccountAvatar,
   createGrowthLink, listGrowthLinks, getGrowthLink, deleteGrowthLink,
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
@@ -910,8 +910,10 @@ const renameWorkspaceBodySchema = z.object({
   name: z.string().min(1).max(120).optional(),
   /** Workspace default currency (package #6): ISO 4217, case-insensitive on input. */
   defaultCurrency: z.string().regex(/^[A-Za-z]{3}$/).optional(),
-}).refine((b) => b.name !== undefined || b.defaultCurrency !== undefined, {
-  message: "Provide at least one of: name, defaultCurrency.",
+  /** Workspace reply target in minutes (package #8): the insights service goal. */
+  replyTargetMinutes: z.number().int().min(1).max(10080).optional(),
+}).refine((b) => b.name !== undefined || b.defaultCurrency !== undefined || b.replyTargetMinutes !== undefined, {
+  message: "Provide at least one of: name, defaultCurrency, replyTargetMinutes.",
 }).openapi("RenameWorkspaceBody");
 const memberRoleBodySchema = z.object({ role: z.enum(ROLES) }).openapi("MemberRoleBody");
 const messengerSelectPageBodySchema = z.object({ pageId: z.string().min(1) }).openapi("MessengerSelectPageBody");
@@ -2281,6 +2283,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         action: "workspace.default_currency", details: { currency },
       });
     }
+    if (body.replyTargetMinutes !== undefined) {
+      await deps.authStore.updateWorkspaceReplyTarget(id, body.replyTargetMinutes);
+      await deps.authStore.audit({
+        workspaceId: id, userId: auth.user.id,
+        action: "workspace.reply_target", details: { minutes: body.replyTargetMinutes },
+      });
+    }
     const workspaces = await deps.authStore.listWorkspaces(auth.user.id);
     return c.json({ workspace: workspaces.find((w) => w.id === id) ?? null });
   });
@@ -2509,6 +2518,48 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         contactDisplayName: row.contactDisplayName,
         contactExternalId: row.contactExternalId,
         updatedAt: iso(row.lastUserMessageAt) ?? iso(row.createdAt) ?? "",
+      })),
+    });
+  });
+
+  /**
+   * Analytics depth, phase 1 (package #8): per-channel volume, the
+   * response-time block (waiting now / oldest waiting / over the
+   * workspace reply target / median first response split human vs AI,
+   * with previous-period medians), and the workspace activity feed.
+   * All query-time aggregation - see docs/analytics.md for the exact
+   * definitions. `days` is a closed set: 7 or 30.
+   */
+  const statsInsightsRoute = createRoute({
+    method: "get", path: "/stats/insights",
+    request: { query: z.object({ days: z.enum(["7", "30"]).optional() }) },
+    responses: { 200: { description: "Workspace insights (analytics phase 1)" } },
+  });
+  app.openapi(statsInsightsRoute, async (c) => {
+    const wsId = workspaceId(c);
+    const auth = authContext(c);
+    const days = Number(c.req.valid("query").days ?? "30");
+    const db = deps.getDatabase();
+    const workspaces = await deps.authStore.listWorkspaces(auth.user.id);
+    const replyTargetMinutes = workspaces.find((w) => w.id === wsId)?.replyTargetMinutes ?? 60;
+    const insights = await getWorkspaceInsights(db, wsId, { days, now: new Date(), replyTargetMinutes });
+    const activityRows = await listWorkspaceActivity(db, wsId, 50);
+    const members = await deps.authStore.listMembers(wsId);
+    const memberById = new Map(members.map((m) => [m.userId, m]));
+    return c.json({
+      ...insights,
+      activity: activityRows.map((row) => ({
+        id: row.id,
+        actor: row.userId
+          ? {
+              userId: row.userId,
+              name: memberById.get(row.userId)?.name ?? null,
+              email: memberById.get(row.userId)?.email ?? null,
+            }
+          : null,
+        action: row.action,
+        details: row.details,
+        createdAt: iso(row.createdAt) ?? "",
       })),
     });
   });
