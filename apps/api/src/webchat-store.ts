@@ -42,6 +42,9 @@ export function createDbWebchatStore(db: Database): WebchatStore {
         type: input.payload ? "rich" : "text",
         body: input.text,
         payload: input.payload,
+        // Producer badge (package #7): flow ai_reply sends arrive with
+        // authorKind "ai"; agent replies omit it and persist "human".
+        authorKind: input.authorKind,
         status: "sent",
         idempotencyKey: input.idempotencyKey,
       });

@@ -33,6 +33,7 @@ import {
   purgeExternalUserData,
   createKbDocument, listKbDocuments, getKbDocument, deleteKbDocument,
   listKbChunks, listKbChunksByWorkspace,
+  insertAiUsageLedger, updateConversationAiAnalysis, setConversationAiPaused,
   createFlow, listFlows, getFlow, updateFlow, deleteFlow, deleteFlowWaitsForConversation,
   deleteSequence, countEnrollmentsBySequence, getWorkspaceStats,
   updateChannelAccountToken, updateChannelAccountAvatar,
@@ -78,6 +79,8 @@ import { WORKSPACE_ROUTE_PREFIXES, assertApiTokenRouteAccess } from "./route-sco
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
   createAIProviderFromEnv, moderateText, rankChunks,
+  buildConversationAnalysisMessages, parseConversationAnalysis,
+  CONVERSATION_ANALYSIS_HISTORY_CAP,
   DEFAULT_AI_MODEL, DEFAULT_EMBEDDING_MODEL, type AIProvider,
 } from "@botara/ai";
 import {
@@ -2524,6 +2527,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     ...r,
     createdAt: iso(r.createdAt),
     lastUserMessageAt: iso(r.lastUserMessageAt),
+    // AI copilot (package #7): analysis + takeover stamps travel as ISO
+    // (null until the first analyze / pause). Rows from before migration
+    // 0013 simply lack the fields - normalize the absence to null.
+    aiSummary: r.aiSummary ?? null,
+    aiSummaryAt: iso(r.aiSummaryAt),
+    aiIntent: r.aiIntent ?? null,
+    aiIntentScore: r.aiIntentScore ?? null,
+    aiPausedAt: iso(r.aiPausedAt),
     windowOpen: evaluateReplyWindow({
       channel: r.channel, kind: "free_form", lastUserMessageAt: r.lastUserMessageAt, now: new Date(),
     }).windowOpen,
@@ -2551,6 +2562,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   ) => ({
     ...m,
     kind: m.kind ?? "message",
+    // Producer badge (package #7): rows written before migration 0013
+    // read as "human" - none of them came from a badged AI path.
+    authorKind: m.authorKind ?? "human",
     createdAt: iso(m.createdAt),
     author: m.authorUserId
       ? {
@@ -2820,6 +2834,18 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         idempotencyKey,
       });
       await updateMessageStatus(db, message.id, "sent", result.externalMessageId);
+      // AI takeover (package #7): a human replying takes the wheel - any
+      // AUTOMATIC AI sends on this conversation pause until a human
+      // resumes them (POST /conversations/:id/ai-resume). Only a
+      // SUCCESSFUL send pauses: a failed attempt changed nothing the
+      // customer saw, so automation keeps its state. Idempotent - an
+      // already-paused thread keeps its original stamp.
+      if (!conversation.aiPausedAt) {
+        await setConversationAiPaused(db, ws, id, true).catch(() => undefined);
+        await deps.realtimePublisher
+          .publishInboxUpdate({ workspaceId: ws, conversationId: id })
+          .catch(() => undefined);
+      }
       // Live inbox: dashboards on this workspace refetch the thread.
       await deps.realtimePublisher.publishInboxMessage({
         workspaceId: ws, conversationId: id, direction: "out", messageId: message.id,
@@ -4229,6 +4255,39 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
 
   // ------------------------------------------------------- AI (Fase 2)
+  /**
+   * AI usage -> cost_ledger (package #7): EVERY AI call writes one row
+   * (category "ai", amount 0 - there is no per-model rate card, so the
+   * token count is the truth and no price is invented). Units are the
+   * call's total tokens when the provider returned usage, else NULL.
+   * Bookkeeping is best-effort, like the broadcast recipient rows: a
+   * ledger failure is logged, never allowed to fail the AI call itself.
+   */
+  const recordAiUsage = async (input: {
+    db: Database;
+    workspaceId: string;
+    channelAccountId?: string;
+    channel: string;
+    model: string;
+    usage?: { inputTokens: number; outputTokens: number };
+    referenceId: string;
+  }): Promise<void> => {
+    try {
+      await insertAiUsageLedger(input.db, {
+        workspaceId: input.workspaceId,
+        channelAccountId: input.channelAccountId,
+        channel: input.channel,
+        model: input.model,
+        totalTokens: input.usage ? input.usage.inputTokens + input.usage.outputTokens : null,
+        referenceId: input.referenceId,
+      });
+    } catch (err) {
+      console.warn(
+        `[api] ai usage ledger write failed (reference ${input.referenceId}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  };
+
   const aiSuggestRoute = createRoute({
     method: "post", path: "/conversations/{id}/ai-suggest",
     request: { params: z.object({ id: z.string() }) },
@@ -4264,9 +4323,16 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       try {
         const stored = await listKbChunksByWorkspace(db, ws);
         if (stored.length > 0) {
+          const embeddingModel = deps.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL;
           const queryEmbedding = await provider.embedding({
-            model: deps.env.AI_EMBEDDING_MODEL ?? DEFAULT_EMBEDDING_MODEL,
+            model: embeddingModel,
             text: lastInbound,
+          });
+          // The embedding seam returns no usage (bare vector), so this
+          // row records the call with NULL tokens - never an estimate.
+          await recordAiUsage({
+            db, workspaceId: ws, channelAccountId: conversation.channelAccountId,
+            channel: conversation.channel, model: embeddingModel, referenceId: id,
           });
           const top = rankChunks(
             stored.map((row) => ({ text: row.text, embedding: row.embedding as number[] | null })),
@@ -4302,8 +4368,115 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
           : [{ role: "user" as const, content: "(no prior messages)" }]),
       ],
     });
+    await recordAiUsage({
+      db, workspaceId: ws, channelAccountId: conversation.channelAccountId,
+      channel: conversation.channel, model: result.model, usage: result.usage, referenceId: id,
+    });
     return c.json({ suggestion: result.text, model: result.model, kbChunksUsed });
   });
+
+  /**
+   * AI analysis (package #7): one chat call -> {summary, intent,
+   * intentScore} persisted on the conversation. Fail-closed exactly
+   * like ai-suggest (503 when no provider is configured - an analysis
+   * is never faked), and strict about the model's answer: malformed
+   * output is a typed 502 AI_RESPONSE_INVALID and NOTHING is persisted
+   * (the usage row for the call itself is still written - the tokens
+   * were spent either way; see recordAiUsage).
+   */
+  const aiAnalyzeRoute = createRoute({
+    method: "post", path: "/conversations/{id}/ai-analyze",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "AI conversation analysis persisted" } },
+  });
+  app.openapi(aiAnalyzeRoute, async (c) => {
+    requireRole(c.get("auth"), ROLES);
+    const provider = deps.getAiProvider();
+    if (!provider) {
+      throw new AppError(
+        "CONFIGURATION",
+        "No AI provider is configured (AI_API_KEY); analysis is unavailable and is never faked.",
+        { status: 503 },
+      );
+    }
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    // Internal notes never enter the prompt (same rule as ai-suggest).
+    const history = (await listMessages(db, id))
+      .filter((m) => m.kind !== "note")
+      .slice(-CONVERSATION_ANALYSIS_HISTORY_CAP);
+    const result = await provider.chatCompletion({
+      model: deps.env.AI_MODEL ?? DEFAULT_AI_MODEL,
+      temperature: 0,
+      messages: buildConversationAnalysisMessages(
+        history.map((m) => ({ direction: m.direction as "in" | "out", body: m.body })),
+      ),
+    });
+    await recordAiUsage({
+      db, workspaceId: ws, channelAccountId: conversation.channelAccountId,
+      channel: conversation.channel, model: result.model, usage: result.usage, referenceId: id,
+    });
+    // Throws AI_RESPONSE_INVALID (502) on malformed output - before ANY
+    // analysis field is written.
+    const analysis = parseConversationAnalysis(result.text);
+    const updated = await updateConversationAiAnalysis(db, ws, id, analysis);
+    if (!updated) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    return c.json({
+      aiSummary: updated.aiSummary,
+      aiSummaryAt: iso(updated.aiSummaryAt),
+      aiIntent: updated.aiIntent,
+      aiIntentScore: updated.aiIntentScore,
+      model: result.model,
+    });
+  });
+
+  /**
+   * AI takeover (package #7): pause/resume AUTOMATIC AI sends on one
+   * conversation. While ai_paused_at is set, the worker's ai_reply port
+   * returns null before calling the model (the flow sends its authored
+   * fallback instead). Agent-invoked tools (ai-suggest, ai-analyze) are
+   * deliberately NOT blocked - pausing automation must not disarm the
+   * human's own instruments.
+   */
+  const aiPauseRoute = createRoute({
+    method: "post", path: "/conversations/{id}/ai-pause",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Automatic AI paused for this conversation" } },
+  });
+  const aiResumeRoute = createRoute({
+    method: "post", path: "/conversations/{id}/ai-resume",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Automatic AI resumed for this conversation" } },
+  });
+  const applyAiPauseToggle = async (c: Ctx, id: string, paused: boolean) => {
+    requireRole(c.get("auth"), ROLES);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    // Idempotent: re-pausing keeps the original stamp, re-resuming an
+    // unpaused thread is a no-op - the write only happens on a change.
+    const already = Boolean(conversation.aiPausedAt);
+    let aiPausedAt = conversation.aiPausedAt;
+    if (paused !== already) {
+      const updated = await setConversationAiPaused(db, ws, id, paused);
+      if (!updated) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+      aiPausedAt = updated.aiPausedAt;
+      // Other open inboxes refresh their thread header state.
+      await deps.realtimePublisher
+        .publishInboxUpdate({ workspaceId: ws, conversationId: id })
+        .catch(() => undefined);
+    }
+    const memberById = await memberMapOf(ws);
+    return c.json({
+      conversation: serializeConversation({ ...conversation, aiPausedAt }, memberById),
+    });
+  };
+  app.openapi(aiPauseRoute, async (c) => applyAiPauseToggle(c, c.req.valid("param").id, true));
+  app.openapi(aiResumeRoute, async (c) => applyAiPauseToggle(c, c.req.valid("param").id, false));
 
   const moderationRoute = createRoute({
     method: "post", path: "/moderation/check",
