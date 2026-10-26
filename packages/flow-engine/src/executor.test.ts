@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { buildVariableContext } from "@botara/shared";
 import { runFlow, type FlowPorts } from "./executor";
 import type { Flow } from "./schemas";
 import type { FlowState } from "./interpreter";
@@ -172,5 +173,94 @@ describe("ai_reply node (Fase 3)", () => {
     const f = fakePorts();
     await runFlow(f.ports, aiFlow, undefined, { type: "message.received", text: "halo" });
     expect(f.sent).toEqual([{ text: "Maaf, tim kami akan segera membantu.", channel: undefined }]);
+  });
+});
+
+describe("variable interpolation in send paths (variables package #1)", () => {
+  const interpCtx = buildVariableContext({
+    contact: {
+      displayName: "Dewi",
+      externalId: "628777",
+      channel: "telegram",
+      customFields: { city: "Medan" },
+    },
+    workspaceName: "Toko Dewi",
+  });
+
+  const varFlow: Flow = {
+    id: "vars",
+    version: 1,
+    startNodeId: "t1",
+    nodes: [
+      { id: "t1", type: "trigger", trigger: "message.received", config: {}, next: "s1" },
+      {
+        id: "s1", type: "send_message",
+        text: "Halo {{contact.name}} dari {{contact.city}}, pesanan {{vars.orderId}} di {{workspace.name}}. [{{contact.unknown}}]",
+        next: null,
+      },
+    ],
+  };
+
+  test("send_message renders contact/workspace/vars; unknown renders empty + warning", async () => {
+    const f = fakePorts();
+    const result = await runFlow(f.ports, varFlow, undefined, {
+      type: "message.received", text: "halo", variables: { orderId: "ORD-7" },
+    }, { interpolation: interpCtx });
+    expect(f.sent).toEqual([{ text: "Halo Dewi dari Medan, pesanan ORD-7 di Toko Dewi. []", channel: undefined }]);
+    expect(result.warnings).toEqual([{ code: "UNKNOWN_VARIABLE", path: "contact.unknown" }]);
+  });
+
+  test("rich block text fields render too", async () => {
+    const flow: Flow = {
+      id: "vars-rich",
+      version: 1,
+      startNodeId: "t1",
+      nodes: [
+        { id: "t1", type: "trigger", trigger: "manual", config: {}, next: "s1" },
+        {
+          id: "s1", type: "send_message", text: "teks",
+          rich: { kind: "buttons", text: "Untuk {{contact.name}}", buttons: [{ type: "reply", title: "OK {{contact.name}}", payload: "ok" }] },
+          next: null,
+        },
+      ],
+    };
+    const f = fakePorts();
+    await runFlow(f.ports, flow, undefined, { type: "manual" }, { interpolation: interpCtx });
+    const sentRich = (f.sent[0] as { rich?: unknown }).rich;
+    expect(sentRich).toEqual({
+      kind: "buttons",
+      text: "Untuk Dewi",
+      buttons: [{ type: "reply", title: "OK Dewi", payload: "ok" }],
+    });
+  });
+
+  test("without an interpolation context, dot-path tokens pass through untouched", async () => {
+    const f = fakePorts();
+    const result = await runFlow(f.ports, varFlow, undefined, {
+      type: "message.received", text: "halo", variables: { orderId: "ORD-7" },
+    });
+    expect(f.sent[0]!.text).toContain("{{contact.name}}");
+    expect(result.warnings).toEqual([]);
+  });
+
+  test("ai_reply: generated text is NEVER interpolated; the fallback IS", async () => {
+    const flow: Flow = {
+      id: "ai-vars",
+      version: 1,
+      startNodeId: "t1",
+      nodes: [
+        { id: "t1", type: "trigger", trigger: "message.received", config: {}, next: "ai1" },
+        { id: "ai1", type: "ai_reply", prompt: "p", fallbackText: "Halo {{contact.name}}, tunggu ya.", next: null },
+      ],
+    };
+    const gen = fakePorts();
+    gen.ports.aiReply = async () => "Jawaban AI untuk {{contact.name}}";
+    await runFlow(gen.ports, flow, undefined, { type: "message.received", text: "halo" }, { interpolation: interpCtx });
+    expect(gen.sent).toEqual([{ text: "Jawaban AI untuk {{contact.name}}", channel: undefined }]);
+
+    const fb = fakePorts();
+    fb.ports.aiReply = async () => null;
+    await runFlow(fb.ports, flow, undefined, { type: "message.received", text: "halo" }, { interpolation: interpCtx });
+    expect(fb.sent).toEqual([{ text: "Halo Dewi, tunggu ya.", channel: undefined }]);
   });
 });

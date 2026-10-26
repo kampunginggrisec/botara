@@ -1,4 +1,5 @@
-import type { RichBlock } from "@botara/channels";
+import { interpolateRichBlock, type RichBlock } from "@botara/channels";
+import { interpolate, type InterpolationWarning, type VariableContext } from "@botara/shared";
 import type { Flow } from "./schemas";
 import { initialState, step, type FlowAction, type FlowEvent, type FlowState } from "./interpreter";
 
@@ -37,6 +38,12 @@ export interface FlowRunResult {
   executed: FlowAction[];
   /** True when the run paused at a delay node and must be resumed later. */
   paused: boolean;
+  /**
+   * Variable-interpolation warnings collected while rendering
+   * send_message texts (unknown variables rendered empty). Empty when
+   * every template resolved - or when no interpolation context ran.
+   */
+  warnings: InterpolationWarning[];
 }
 
 /**
@@ -59,22 +66,53 @@ export function triggerMatches(flow: Flow, state: FlowState, event: FlowEvent): 
  * nodes as the `messageText` variable, and event variables (e.g. contact
  * fields loaded by the caller) are merged into the run state, so conditions
  * can branch on message keywords AND contact fields.
+ *
+ * Variable interpolation (variables package #1): when the caller passes
+ * `options.interpolation` (contact / workspace / channel context), every
+ * send_message text and rich block is rendered through the shared
+ * @botara/shared engine at the moment of the send, with the run's own
+ * variables merged in as the `vars` root (run values win over any the
+ * caller pre-seeded). AI-generated reply text is NEVER interpolated (it
+ * is generated content, sent verbatim); the ai_reply node's configured
+ * fallbackText IS rendered like any authored text. Without a context,
+ * texts pass through untouched - the interpreter's legacy flat
+ * `{{key}}` substitution against run variables still applies either way.
  */
 export async function runFlow(
   ports: FlowPorts,
   flow: Flow,
   state: FlowState | undefined,
   event: FlowEvent,
-  options: { maxSteps?: number } = {},
+  options: { maxSteps?: number; interpolation?: VariableContext } = {},
 ): Promise<FlowRunResult> {
   const maxSteps = options.maxSteps ?? 50;
   const isFreshRun = state === undefined;
   let current: FlowState = state ?? initialState(flow);
   const executed: FlowAction[] = [];
+  const warnings: InterpolationWarning[] = [];
+
+  /** Render one authored send text (+ optional rich block) for this step. */
+  const renderSend = (
+    text: string,
+    rich: RichBlock | undefined,
+    runVars: Record<string, string>,
+  ): { text: string; rich?: RichBlock } => {
+    if (!options.interpolation) return { text, rich };
+    const ctx: VariableContext = {
+      ...options.interpolation,
+      vars: { ...(options.interpolation.vars ?? {}), ...runVars },
+    };
+    const renderedText = interpolate(text, ctx);
+    warnings.push(...renderedText.warnings);
+    if (!rich) return { text: renderedText.text };
+    const renderedRich = interpolateRichBlock(rich, ctx);
+    warnings.push(...renderedRich.warnings);
+    return { text: renderedText.text, rich: renderedRich.block };
+  };
 
   if (isFreshRun && !triggerMatches(flow, current, event)) {
     // Keyword trigger did not match: the run ends before any action.
-    return { state: { ...current, status: "completed", currentNodeId: null }, executed, paused: false };
+    return { state: { ...current, status: "completed", currentNodeId: null }, executed, paused: false, warnings };
   }
   if (state && state.status === "waiting") {
     // Resuming after a delay: the interpreter already advanced past the
@@ -89,23 +127,36 @@ export async function runFlow(
 
   for (let i = 0; i < maxSteps; i++) {
     if (current.status === "completed" || !current.currentNodeId) {
-      return { state: current, executed, paused: false };
+      return { state: current, executed, paused: false, warnings };
     }
     const { state: next, actions } = step(flow, current, enrichedEvent);
     current = next;
     for (const action of actions) {
       switch (action.type) {
-        case "send_message":
-          await ports.sendMessage({ text: action.text, channel: action.channel, rich: action.rich });
-          executed.push(action);
+        case "send_message": {
+          const rendered = renderSend(action.text, action.rich, current.variables);
+          await ports.sendMessage({ text: rendered.text, channel: action.channel, rich: rendered.rich });
+          executed.push({
+            type: "send_message",
+            text: rendered.text,
+            channel: action.channel,
+            ...(rendered.rich ? { rich: rendered.rich } : {}),
+          });
           break;
+        }
         case "ai_reply": {
           const generated = ports.aiReply
             ? await ports.aiReply({ prompt: action.prompt, query: action.query })
             : null;
-          const text = generated ?? action.fallbackText;
-          await ports.sendMessage({ text, channel: action.channel });
-          executed.push({ type: "send_message", text, channel: action.channel });
+          if (generated !== null && generated !== undefined) {
+            // Generated text is sent verbatim - never interpolated.
+            await ports.sendMessage({ text: generated, channel: action.channel });
+            executed.push({ type: "send_message", text: generated, channel: action.channel });
+          } else {
+            const rendered = renderSend(action.fallbackText, undefined, current.variables);
+            await ports.sendMessage({ text: rendered.text, channel: action.channel });
+            executed.push({ type: "send_message", text: rendered.text, channel: action.channel });
+          }
           break;
         }
         case "call_webhook":
@@ -119,7 +170,7 @@ export async function runFlow(
         case "schedule_delay":
           await ports.scheduleDelay({ seconds: action.seconds, resumeState: current });
           executed.push(action);
-          return { state: current, executed, paused: true };
+          return { state: current, executed, paused: true, warnings };
         case "complete":
           break;
       }
@@ -127,5 +178,5 @@ export async function runFlow(
   }
   // Step guard hit: return the state as-is so the caller can resume later
   // instead of looping forever on a malformed (cyclic) flow.
-  return { state: current, executed, paused: current.status === "waiting" };
+  return { state: current, executed, paused: current.status === "waiting", warnings };
 }
