@@ -524,6 +524,14 @@ export const flowWaits = pgTable("flow_waits", {
  * display fragment (e.g. "bta_AbCd1234") shown in Settings so users can
  * tell tokens apart. Tokens authenticate as their user (Bearer bta_...)
  * and power the MCP server + third-party API access.
+ *
+ * Adoption #5 adds the scoped-token columns, all NULLABLE: a row with
+ * workspace_id/scopes/expires_at all NULL is a LEGACY token and keeps
+ * the original all-or-nothing behavior bit-for-bit. A non-NULL
+ * workspace_id binds the token to that workspace; a non-NULL scopes
+ * (jsonb string array, taxonomy in @botara/shared api-tokens) restricts
+ * which workspace resource routes it may call; expires_at is enforced
+ * at resolution time (401 TOKEN_EXPIRED).
  */
 export const apiTokens = pgTable("api_tokens", {
   id: uuid("id").primaryKey().defaultRandom(),
@@ -531,6 +539,12 @@ export const apiTokens = pgTable("api_tokens", {
   name: varchar("name", { length: 120 }).notNull(),
   tokenHash: varchar("token_hash", { length: 64 }).notNull(),
   prefix: varchar("prefix", { length: 20 }).notNull(),
+  /** Scoped tokens (#5): bound workspace; NULL = any workspace of the user. */
+  workspaceId: uuid("workspace_id").references(() => workspaces.id),
+  /** Scoped tokens (#5): granted scopes; NULL = unrestricted (legacy). */
+  scopes: jsonb("scopes").$type<string[]>(),
+  /** Scoped tokens (#5): hard expiry; NULL = never expires. */
+  expiresAt: timestamp("expires_at", { withTimezone: true }),
   lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
   revokedAt: timestamp("revoked_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),

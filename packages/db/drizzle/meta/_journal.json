@@ -78,6 +78,13 @@
       "when": 1793032185296,
       "tag": "0010_cultured_cargill",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1793035747389,
+      "tag": "0011_api_token_scopes",
+      "breakpoints": true
     }
   ]
 }

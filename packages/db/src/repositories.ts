@@ -2570,11 +2570,25 @@ export type ApiTokenRow = typeof apiTokens.$inferSelect;
 
 export async function createApiToken(
   db: Database,
-  input: { userId: string; name: string; tokenHash: string; prefix: string },
+  input: {
+    userId: string;
+    name: string;
+    tokenHash: string;
+    prefix: string;
+    /** Scoped tokens (#5): omitted/undefined leaves the legacy NULLs. */
+    workspaceId?: string | null;
+    scopes?: string[] | null;
+    expiresAt?: Date | null;
+  },
 ): Promise<ApiTokenRow> {
   const [row] = await db
     .insert(apiTokens)
-    .values({ userId: input.userId, name: input.name, tokenHash: input.tokenHash, prefix: input.prefix })
+    .values({
+      userId: input.userId, name: input.name, tokenHash: input.tokenHash, prefix: input.prefix,
+      workspaceId: input.workspaceId ?? null,
+      scopes: input.scopes ?? null,
+      expiresAt: input.expiresAt ?? null,
+    })
     .returning();
   return row!;
 }
