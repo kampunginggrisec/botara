@@ -12,6 +12,18 @@ export interface FlowState {
   currentNodeId: string | null;
   variables: Record<string, string>;
   status: "running" | "waiting" | "completed";
+  /**
+   * Runtime bookkeeping: how many outbound sends this run has already
+   * performed across ALL its segments. Effectful runtimes (the worker)
+   * build send idempotency keys from this count and stamp it into every
+   * pause snapshot (delay / collect-input), so a resumed segment
+   * continues the sequence instead of restarting at 0 - a restarted
+   * count would reuse an earlier segment's keys and the send pipeline
+   * would dedupe the resumed run's sends away. The interpreter never
+   * reads or writes it; every transition spreads state, so the value
+   * simply rides along. Absent = no sends yet.
+   */
+  sendSeq?: number;
 }
 
 export interface FlowEvent {

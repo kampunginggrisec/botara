@@ -471,7 +471,14 @@ export async function processFlowRun(
   }
   data = job;
   const ctx = data.context;
-  let sendSeq = 0;
+  // Send idempotency sequence: continuous across the run's pause/resume
+  // segments. The incoming state's stamp (written into every pause
+  // snapshot by the scheduleDelay / awaitInput ports below) seeds the
+  // counter; a fresh run starts at 0. Restarting at 0 on a resume would
+  // rebuild an earlier segment's `flow:...:{seq}` keys, and the
+  // send-message pipeline would dedupe the resumed run's sends away -
+  // the run would "complete" while its messages never leave.
+  let sendSeq = data.state?.sendSeq ?? 0;
   const flowPorts: FlowPorts = {
     async sendMessage({ text, channel, rich }) {
       await ports.enqueueSendMessage({
@@ -491,7 +498,9 @@ export async function processFlowRun(
     },
     async scheduleDelay({ seconds, resumeState }) {
       await ports.scheduleFlowResume(
-        { flow: data.flow, state: resumeState, event: { type: "resume" }, context: ctx },
+        // Stamp the send counter into the snapshot: the delayed job IS
+        // this object, and the resumed segment seeds its counter from it.
+        { flow: data.flow, state: { ...resumeState, sendSeq }, event: { type: "resume" }, context: ctx },
         seconds,
       );
     },
@@ -543,7 +552,11 @@ export async function processFlowRun(
       }) => {
         if (!ctx.conversationId) throw new Error("flow run carries no conversation");
         await ports.scheduleFlowInputWait!(
-          { flow: data.flow, state: input.resumeState, event: { type: "awaiting-input" }, context: ctx },
+          // Same send-counter stamp as scheduleDelay: the wait row's
+          // resumeState is what the claiming resumer restarts from.
+          // (The executor sends the prompt BEFORE this port runs, so
+          // the prompt's own send is already counted in `sendSeq`.)
+          { flow: data.flow, state: { ...input.resumeState, sendSeq }, event: { type: "awaiting-input" }, context: ctx },
           {
             nodeId: input.nodeId, variable: input.variable,
             saveToContactField: input.saveToContactField, timeoutHours: input.timeoutHours,
