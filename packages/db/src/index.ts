@@ -8,6 +8,8 @@ export {
   catalogProducts, platformSettings,
 } from "./schema";
 export { getDb, closeDb, type Database } from "./client";
+/** Re-exported so API/worker code can build raw SQL fragments without depending on drizzle-orm directly. */
+export { sql } from "drizzle-orm";
 export * from "./repositories";
 export {
   TokenVault, InMemoryVaultStore, createDbVaultStore, createTokenVault,

@@ -1,8 +1,13 @@
 import { expect } from "bun:test";
 import { AppError } from "@botara/shared";
+import { InMemoryPlatformSettingsStorage, PlatformSettingsService } from "@botara/db";
 import { createApp, type ApiDeps } from "./app";
+import { InMemoryAdminStore } from "./admin";
 import { InMemoryAuthStore } from "./auth";
 import { InMemoryVault } from "./whatsapp-onboarding";
+
+/** Fixed 32-byte vault key for the in-memory platform-settings service. */
+export const TEST_VAULT_KEY = Buffer.alloc(32, 7);
 
 /**
  * Shared fake deps for API tests: every port is an in-memory fake, the DB
@@ -10,6 +15,10 @@ import { InMemoryVault } from "./whatsapp-onboarding";
  * would, and auth runs against InMemoryAuthStore with a test secret.
  */
 export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
+  const env: Record<string, string | undefined> = {
+    WHATSAPP_VERIFY_TOKEN: "verify-me",
+    SESSION_SECRET: "test-session-secret",
+  };
   return {
     getDatabase: () => {
       throw new AppError("CONFIGURATION", "DATABASE_URL is not configured (test).", { status: 503 });
@@ -44,7 +53,13 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
       async checkDatabase() { return { ok: false, detail: "not configured (test)" }; },
       async checkRedis() { return { ok: false, detail: "not configured (test)" }; },
     },
-    env: { WHATSAPP_VERIFY_TOKEN: "verify-me", SESSION_SECRET: "test-session-secret" },
+    adminStore: new InMemoryAdminStore(),
+    platformSettings: new PlatformSettingsService(new InMemoryPlatformSettingsStorage(), {
+      baseEnv: env,
+      liveEnv: env,
+      vaultKey: TEST_VAULT_KEY,
+    }),
+    env,
     ...overrides,
   };
 }

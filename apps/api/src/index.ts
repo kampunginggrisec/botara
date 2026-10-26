@@ -1,4 +1,7 @@
-import { createTokenVault, getChannelAccountById, getDb, updateChannelAccountToken } from "@botara/db";
+import {
+  createTokenVault, getChannelAccountById, getDb, startEffectiveEnvRefresh, updateChannelAccountToken,
+  type EnvLike,
+} from "@botara/db";
 import {
   VaultCredentialProvider, configureAdapterCredentials, configureTikTokTokenPersistence,
   envEmailCredentials, envInstagramCredentials, envMessengerCredentials,
@@ -89,7 +92,34 @@ if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
   }
 }
 
-const app = createApp(defaultDeps());
+/**
+ * Platform settings overlay (admin panel): DB settings win over env
+ * (resolution DB -> env -> unset). The pristine env is snapshotted FIRST
+ * and handed to both the refresher (as its fallback base) and
+ * defaultDeps (as the settings service's baseEnv); the refresher then
+ * mutates process.env and keeps it current on a 60s cycle, so panel
+ * edits made in ANY process propagate here without a restart. Panel
+ * writes served by THIS process apply immediately on top of that.
+ */
+const pristineEnv: EnvLike = { ...process.env };
+if (process.env.DATABASE_URL) {
+  try {
+    const refresher = startEffectiveEnvRefresh({
+      db: getDb(process.env.DATABASE_URL),
+      target: process.env,
+      baseEnv: pristineEnv,
+      onError: (err) => console.error(
+        `[api] platform settings refresh failed: ${err instanceof Error ? err.message : String(err)}`,
+      ),
+    });
+    await refresher.refreshNow();
+    console.log("[api] platform settings overlay active (DB -> env fallback, 60s refresh)");
+  } catch (err) {
+    console.error(`[api] platform settings overlay failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
+const app = createApp(defaultDeps(pristineEnv));
 
 const port = Number(process.env.PORT_API ?? process.env.PORT ?? 3000);
 console.log(`[api] listening on http://localhost:${port} (health: /health, openapi: /doc)`);

@@ -34,9 +34,11 @@ import {
   getGrowthLinkBySlug, incrementGrowthLinkClicks, upsertContactByExternal,
   updateConversationAssignment, updateConversationStatus, CONVERSATION_STATUSES,
   upsertCatalogProduct, listCatalogProducts, listCatalogProductKeys, deleteCatalogProduct,
+  PlatformSettingsService, DbPlatformSettingsStorage, tryParseVaultKey,
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
-  type GrowthLinkRow, type ConversationListItem,
+  type GrowthLinkRow, type ConversationListItem, type EnvLike,
 } from "@botara/db";
+import { DbAdminStore, registerAdminRoutes, type AdminStore } from "./admin";
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
   WebchatAdapter, CHANNEL_CAPABILITIES,
@@ -202,6 +204,10 @@ export interface ApiDeps {
   realtimePublisher: RealtimePublisher;
   /** Fase 4: fetch used for provider OAuth/token calls (fakeable in tests). */
   providerFetch: FetchLike;
+  /** Platform admin (operator panel): deployment-scoped read views. */
+  adminStore: AdminStore;
+  /** Platform admin: DB-managed settings with env fallback (see @botara/db). */
+  platformSettings: PlatformSettingsService;
   env: Record<string, string | undefined>;
 }
 
@@ -477,7 +483,13 @@ export function createDbTemplateCategoryUpdater(getDatabase: () => Database): Te
   };
 }
 
-export function defaultDeps(): ApiDeps {
+/**
+ * Production deps. `baseEnv` is the PRISTINE env snapshot (pre-overlay)
+ * the platform-settings service falls back to; index.ts captures it
+ * before applying the DB overlay and passes it in. Defaults to a fresh
+ * snapshot of the current process env.
+ */
+export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
   const redisUrl = process.env.REDIS_URL ?? "redis://localhost:6379";
   const vault = createDefaultVault();
   const realtimePublisher = createRedisRealtimePublisher(redisUrl);
@@ -546,6 +558,19 @@ export function defaultDeps(): ApiDeps {
       );
     },
     getAiProvider: () => createAIProviderFromEnv(process.env),
+    adminStore: new DbAdminStore(defaultGetDatabase),
+    platformSettings: new PlatformSettingsService(
+      new DbPlatformSettingsStorage(defaultGetDatabase),
+      {
+        // baseEnv is the pristine env snapshot (the fallback source);
+        // liveEnv IS process.env (=== deps.env), so a panel write applies
+        // to this process immediately - see apps/api/src/index.ts for the
+        // startup overlay + cross-process refresh.
+        baseEnv,
+        liveEnv: process.env,
+        vaultKey: tryParseVaultKey(baseEnv.TOKEN_VAULT_KEY),
+      },
+    ),
     env: process.env,
   };
 }
@@ -579,7 +604,7 @@ export function parseMetaSignedRequest(
 
 // ------------------------------------------------------------------- types
 
-type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
+export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string } };
 type Ctx = Context<AppEnv>;
 
 
@@ -619,7 +644,9 @@ function guardMutator(c: Ctx): void {
   requireRole(c.get("auth"), MUTATOR_ROLES);
 }
 
-const publicUser = (user: AuthUser) => ({ id: user.id, email: user.email, name: user.name });
+const publicUser = (user: AuthUser) => ({
+  id: user.id, email: user.email, name: user.name, isPlatformAdmin: user.isPlatformAdmin,
+});
 
 async function readJsonBody(c: Ctx): Promise<Record<string, unknown>> {
   try {
@@ -1098,14 +1125,22 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       await deps.authStore.setPasswordHash(user.id, passwordHash);
       user = { ...user, passwordHash, name: user.name ?? body.name ?? null };
     } else {
-      user = await deps.authStore.createUser({ email, name: body.name, passwordHash });
+      // Platform-admin bootstrap (product rule): the FIRST registered
+      // user of a fresh deployment becomes its operator. The store
+      // re-checks the empty-table condition atomically at insert time,
+      // so two concurrent first registrations cannot both win the flag.
+      const isFirstUser = (await deps.authStore.countUsers()) === 0;
+      user = await deps.authStore.createUser({
+        email, name: body.name, passwordHash, isPlatformAdmin: isFirstUser,
+      });
     }
     // Every new user starts with a personal workspace they own.
     const displayName = body.name ?? user.name ?? email.split("@")[0]!;
     const workspace = await createWorkspaceWithUniqueSlug(`${displayName}'s Workspace`);
     await deps.authStore.addMember({ workspaceId: workspace.id, userId: user.id, role: "owner" });
     await deps.authStore.audit({
-      workspaceId: workspace.id, userId: user.id, action: "auth.register", details: { email },
+      workspaceId: workspace.id, userId: user.id, action: "auth.register",
+      details: { email, platformAdmin: user.isPlatformAdmin },
     });
     const token = signSessionToken({ userId: user.id, email: user.email }, secret);
     setSessionCookie(c, token);
@@ -1129,6 +1164,8 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (!user?.passwordHash || !(await verifyPassword(body.password, user.passwordHash))) {
       throw new AppError("UNAUTHORIZED", "Invalid email or password.", { status: 401 });
     }
+    // Stamp the login - the admin panel's "active users" counts read this.
+    await deps.authStore.touchLastLogin(user.id);
     await deps.authStore.audit({ userId: user.id, action: "auth.login", details: { email: user.email } });
     const token = signSessionToken({ userId: user.id, email: user.email }, secret);
     setSessionCookie(c, token);
@@ -1251,6 +1288,19 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     tiktokAppId: deps.env.TIKTOK_APP_ID ?? null,
     publicWebhookBaseUrl: deps.env.PUBLIC_WEBHOOK_BASE_URL ?? deps.env.APP_PUBLIC_URL ?? null,
   }));
+
+  // ------------------------------------------------ platform admin (operator panel)
+  // Deployment-scoped operator surface (NOT workspace-scoped): overview,
+  // users, workspaces, billing visibility, platform settings (DB-managed
+  // with env fallback), audit trail, platform-admin grants. Guard +
+  // handlers live in ./admin.ts; they authenticate via the same session
+  // machinery and require users.is_platform_admin.
+  registerAdminRoutes(app, {
+    authenticate: authenticateRequest,
+    authStore: deps.authStore,
+    adminStore: deps.adminStore,
+    platformSettings: deps.platformSettings,
+  });
 
 
   // ------------------------------------------------------------ webhooks

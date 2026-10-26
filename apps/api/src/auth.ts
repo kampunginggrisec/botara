@@ -1,11 +1,13 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { AppError } from "@botara/shared";
 import {
+  countPlatformAdmins, countUsers, sql,
   createApiToken as createApiTokenRow, createUser, createWorkspace,
   findApiTokenByHash, getUserByEmail, getUserById, getWorkspaceBySlug,
   getWorkspaceMember, insertAuditLog, listApiTokensByUser, listWorkspaceMembers,
   listWorkspacesForUser, removeWorkspaceMember, revokeApiToken as revokeApiTokenRow,
-  setUserPasswordHash, touchApiToken, updateUserName, updateWorkspaceName,
+  setUserPasswordHash, setUserPlatformAdmin, touchApiToken, touchUserLastLogin,
+  updateUserName, updateWorkspaceName,
   upsertWorkspaceMember,
   type Database,
 } from "@botara/db";
@@ -40,6 +42,8 @@ export interface AuthUser {
   email: string;
   name: string | null;
   passwordHash: string | null;
+  /** Platform operator flag (admin panel) - NOT a workspace role. */
+  isPlatformAdmin: boolean;
 }
 
 export interface AuthWorkspaceView {
@@ -88,8 +92,15 @@ export function apiTokenDisplayPrefix(raw: string): string {
 export interface AuthStore {
   findUserByEmail(email: string): Promise<AuthUser | null>;
   findUserById(id: string): Promise<AuthUser | null>;
-  createUser(input: { email: string; name?: string; passwordHash?: string }): Promise<AuthUser>;
+  createUser(input: { email: string; name?: string; passwordHash?: string; isPlatformAdmin?: boolean }): Promise<AuthUser>;
   setPasswordHash(userId: string, passwordHash: string): Promise<void>;
+  /** Platform admin (operator panel): bootstrap counting + flag management. */
+  countUsers(): Promise<number>;
+  countPlatformAdmins(): Promise<number>;
+  /** Grant/revoke the platform-admin flag; false when the user does not exist. */
+  setPlatformAdmin(userId: string, grant: boolean): Promise<boolean>;
+  /** Stamp a successful login (drives "active users" in the admin panel). */
+  touchLastLogin(userId: string): Promise<void>;
   createWorkspace(input: { name: string; slug: string }): Promise<{ id: string; name: string; slug: string }>;
   workspaceSlugExists(slug: string): Promise<boolean>;
   addMember(input: { workspaceId: string; userId: string; role: string }): Promise<void>;
@@ -114,23 +125,63 @@ export interface AuthStore {
   }): Promise<void>;
 }
 
+const toAuthUser = (row: {
+  id: string; email: string; name: string | null; passwordHash: string | null; isPlatformAdmin: boolean;
+}): AuthUser => ({
+  id: row.id, email: row.email, name: row.name, passwordHash: row.passwordHash,
+  isPlatformAdmin: row.isPlatformAdmin,
+});
+
 /** Production AuthStore over the Drizzle repositories. */
 export class DbAuthStore implements AuthStore {
   constructor(private readonly getDatabase: () => Database) {}
 
   async findUserByEmail(email: string) {
     const row = await getUserByEmail(this.getDatabase(), email);
-    return row ? { id: row.id, email: row.email, name: row.name, passwordHash: row.passwordHash } : null;
+    return row ? toAuthUser(row) : null;
   }
 
   async findUserById(id: string) {
     const row = await getUserById(this.getDatabase(), id);
-    return row ? { id: row.id, email: row.email, name: row.name, passwordHash: row.passwordHash } : null;
+    return row ? toAuthUser(row) : null;
   }
 
-  async createUser(input: { email: string; name?: string; passwordHash?: string }) {
-    const row = await createUser(this.getDatabase(), input);
-    return { id: row.id, email: row.email, name: row.name, passwordHash: row.passwordHash };
+  async createUser(input: { email: string; name?: string; passwordHash?: string; isPlatformAdmin?: boolean }) {
+    const db = this.getDatabase();
+    if (!input.isPlatformAdmin) {
+      return toAuthUser(await createUser(db, input));
+    }
+    /**
+     * Platform-admin bootstrap must be ATOMIC: two concurrent first
+     * registrations must not both observe an empty users table. The
+     * insert runs in a transaction behind a fixed advisory lock, and the
+     * empty-table check is repeated inside the lock - the flag is only
+     * granted when the table is still empty at insert time.
+     */
+    return db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(727271)`);
+      const txDb = tx as unknown as Database;
+      const total = await countUsers(txDb);
+      const row = await createUser(txDb, { ...input, isPlatformAdmin: total === 0 });
+      return toAuthUser(row);
+    });
+  }
+
+  async countUsers() {
+    return countUsers(this.getDatabase());
+  }
+
+  async countPlatformAdmins() {
+    return countPlatformAdmins(this.getDatabase());
+  }
+
+  async setPlatformAdmin(userId: string, grant: boolean) {
+    const row = await setUserPlatformAdmin(this.getDatabase(), userId, grant);
+    return row !== null;
+  }
+
+  async touchLastLogin(userId: string) {
+    await touchUserLastLogin(this.getDatabase(), userId, new Date());
   }
 
   async setPasswordHash(userId: string, passwordHash: string) {
@@ -215,7 +266,7 @@ export class DbAuthStore implements AuthStore {
     // Best-effort usage stamp - a failed stamp must never fail auth.
     await touchApiToken(db, row.id, new Date()).catch(() => undefined);
     const user = await getUserById(db, row.userId);
-    return user ? { id: user.id, email: user.email, name: user.name, passwordHash: user.passwordHash } : null;
+    return user ? toAuthUser(user) : null;
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
@@ -230,6 +281,7 @@ export class InMemoryAuthStore implements AuthStore {
   readonly members = new Map<string, { workspaceId: string; userId: string; role: string }>();
   readonly auditLog: Array<{ workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }> = [];
   readonly apiTokens = new Map<string, ApiTokenView & { userId: string; tokenHash: string }>();
+  readonly lastLogins = new Map<string, Date>();
 
   private memberKey(workspaceId: string, userId: string) {
     return `${workspaceId}:${userId}`;
@@ -243,15 +295,36 @@ export class InMemoryAuthStore implements AuthStore {
     return this.users.get(id) ?? null;
   }
 
-  async createUser(input: { email: string; name?: string; passwordHash?: string }) {
+  async createUser(input: { email: string; name?: string; passwordHash?: string; isPlatformAdmin?: boolean }) {
     const user: AuthUser = {
       id: crypto.randomUUID(),
       email: input.email.toLowerCase(),
       name: input.name ?? null,
       passwordHash: input.passwordHash ?? null,
+      // Mirror the DB store: the bootstrap flag only lands on an empty table.
+      isPlatformAdmin: (input.isPlatformAdmin ?? false) && this.users.size === 0,
     };
     this.users.set(user.id, user);
     return user;
+  }
+
+  async countUsers() {
+    return this.users.size;
+  }
+
+  async countPlatformAdmins() {
+    return [...this.users.values()].filter((u) => u.isPlatformAdmin).length;
+  }
+
+  async setPlatformAdmin(userId: string, grant: boolean) {
+    const user = this.users.get(userId);
+    if (!user) return false;
+    user.isPlatformAdmin = grant;
+    return true;
+  }
+
+  async touchLastLogin(userId: string) {
+    this.lastLogins.set(userId, new Date());
   }
 
   async setPasswordHash(userId: string, passwordHash: string) {
@@ -424,6 +497,21 @@ export interface AuthContext {
   role?: string;
   /** True when context came from the BOTARA_ALLOW_HEADER_WORKSPACE dev fallback. */
   viaHeaderFallback?: boolean;
+}
+
+/**
+ * Platform-operator guard for /admin handlers: throws FORBIDDEN unless
+ * the authenticated user carries the platform-admin flag. Unauthenticated
+ * callers never reach this - authenticateRequest throws 401 first.
+ */
+export function requirePlatformAdmin(user: AuthUser | undefined): void {
+  if (!user?.isPlatformAdmin) {
+    throw new AppError(
+      "FORBIDDEN",
+      "This area is restricted to platform administrators.",
+      { status: 403 },
+    );
+  }
 }
 
 /** Role guard for handlers: throws FORBIDDEN unless the role is allowed. */
