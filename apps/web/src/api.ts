@@ -252,6 +252,15 @@ export interface CatalogSummary {
 export interface Message {
   id: string;
   direction: "in" | "out";
+  /**
+   * Timeline kind (package #2): "message" is customer traffic; "note" is
+   * an internal team note - rendered as an internal card, never sent.
+   * Absent on rows written before the kind column existed (= message).
+   */
+  kind?: "message" | "note";
+  /** Authoring member for human-written rows (notes); null otherwise. */
+  authorUserId?: string | null;
+  author?: { userId: string; name: string | null; email: string | null } | null;
   type: string;
   body: string | null;
   /**
@@ -271,6 +280,18 @@ export interface Message {
   mediaKeys?: string[];
   status: string;
   createdAt: string;
+}
+
+/** A saved reply from the workspace's shared quick-reply library (package #2). */
+export interface SavedReply {
+  id: string;
+  title: string;
+  body: string;
+  /** Canonical "/"-prefixed picker handle; null when unset. */
+  shortcut: string | null;
+  createdBy: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Contact {
@@ -743,6 +764,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     });
+  },
+  /** Add an internal note to the thread (package #2): team-only, never sent to the customer. */
+  addNote(conversationId: string, body: string): Promise<{ message: Message }> {
+    return request(`/conversations/${conversationId}/notes`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    });
+  },
+  listSavedReplies(): Promise<{ savedReplies: SavedReply[] }> {
+    return request("/saved-replies");
+  },
+  createSavedReply(body: {
+    title: string; body: string; shortcut?: string | null;
+  }): Promise<{ savedReply: SavedReply }> {
+    return request("/saved-replies", { method: "POST", body: JSON.stringify(body) });
+  },
+  updateSavedReply(
+    id: string,
+    body: { title?: string; body?: string; shortcut?: string | null },
+  ): Promise<{ savedReply: SavedReply }> {
+    return request(`/saved-replies/${id}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deleteSavedReply(id: string): Promise<{ deleted: boolean }> {
+    return request(`/saved-replies/${id}`, { method: "DELETE" });
   },
   /** AI reply suggestion for the composer (F4): fills the draft, never sends. 503 when no AI provider is configured. */
   aiSuggest(conversationId: string): Promise<{ suggestion: string; model: string; kbChunksUsed: number }> {

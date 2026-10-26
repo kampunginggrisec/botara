@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { insertVariable, variableOptions, variableToken, VARIABLE_OPTIONS } from "./variables";
+import { insertPlainText, insertVariable, variableOptions, variableToken, VARIABLE_OPTIONS } from "./variables";
 
 /**
  * Variable picker model (variables package #1): the catalogue stays in

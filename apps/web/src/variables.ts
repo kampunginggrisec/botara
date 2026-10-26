@@ -71,16 +71,45 @@ export function insertVariable(
   };
 }
 
+/**
+ * Insert raw text (a saved-reply body, package #2) into `text` replacing
+ * the selection [selStart, selEnd) - same caret math as insertVariable,
+ * without the {{ }} wrapping. Returns the new text and the caret just
+ * after the inserted text.
+ */
+export function insertPlainText(
+  text: string,
+  inserted: string,
+  selStart: number | null,
+  selEnd: number | null,
+): { text: string; caret: number } {
+  const start = selStart ?? text.length;
+  const end = selEnd ?? start;
+  return {
+    text: text.slice(0, start) + inserted + text.slice(end),
+    caret: start + inserted.length,
+  };
+}
+
 type TextField = HTMLInputElement | HTMLTextAreaElement;
 
 /**
- * Insert a token into a (possibly React-controlled) field at its current
- * selection: set the value through the native setter so React's change
- * tracking sees it, dispatch `input` so onChange fires, then restore
- * focus with the caret after the token.
+ * Insert a {{token}} into a (possibly React-controlled) field at its
+ * current selection: set the value through the native setter so React's
+ * change tracking sees it, dispatch `input` so onChange fires, then
+ * restore focus with the caret after the inserted text.
  */
 export function insertIntoElement(el: TextField, token: string): void {
-  const { text, caret } = insertVariable(el.value, token, el.selectionStart, el.selectionEnd);
+  insertTextIntoElement(el, variableToken(token));
+}
+
+/**
+ * Insert arbitrary text into a field at its current selection - the
+ * shared machinery behind insertIntoElement (variable tokens) and the
+ * saved-replies picker (raw bodies, package #2).
+ */
+export function insertTextIntoElement(el: TextField, inserted: string): void {
+  const { text, caret } = insertPlainText(el.value, inserted, el.selectionStart, el.selectionEnd);
   const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), "value")?.set;
   if (setter) setter.call(el, text);
   else el.value = text;

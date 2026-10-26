@@ -21,6 +21,7 @@ import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
+import { SavedRepliesPicker } from "./saved-replies-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
   type PlatformCardGroup,
@@ -235,6 +236,12 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const [selected, setSelected] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [replyText, setReplyText] = useState("");
+  // Composer mode (package #2): "reply" writes to the customer, "note"
+  // adds an internal timeline note. Each mode keeps its own draft, so
+  // toggling never loses text.
+  const [composerMode, setComposerMode] = useState<"reply" | "note">("reply");
+  const [noteText, setNoteText] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
   const replyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
@@ -491,6 +498,23 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
     }
   };
 
+  // Internal note (package #2): posts to the notes endpoint only - the
+  // text is stored verbatim (no variable rendering, no window check)
+  // and the thread refetches so the note card appears in place.
+  const addNote = async () => {
+    if (!selected || !noteText.trim()) return;
+    setNoteSaving(true);
+    try {
+      await api.addNote(selected.id, noteText.trim());
+      setNoteText("");
+      await openConversation(selected);
+    } catch (err) {
+      pushToast("err", errText(err, t("inbox.noteFailed")));
+    } finally {
+      setNoteSaving(false);
+    }
+  };
+
   return (
     <div>
       <PageTitle title={t("inbox.title")} subtitle={t("inbox.subtitle")} />
@@ -628,7 +652,19 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
               </div>
               <div className="flex-1 p-4 space-y-2 overflow-y-auto">
                 {messages.length === 0 && <div className="text-sm text-slate-400 dark:text-slate-500">{t("inbox.noMessages")}</div>}
-                {messages.map((m) => (
+                {messages.map((m) => m.kind === "note" ? (
+                  // Internal note (package #2): a centered amber card,
+                  // visually impossible to confuse with customer traffic.
+                  <div key={m.id} className="flex justify-center">
+                    <div className="w-full max-w-md rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide">
+                        {t("inbox.noteLabel")}
+                        {m.author ? ` · ${m.author.name ?? m.author.email ?? ""}` : ""}
+                      </div>
+                      <div className="mt-0.5 whitespace-pre-wrap">{m.body}</div>
+                    </div>
+                  </div>
+                ) : (
                   <div key={m.id} className={`flex ${m.direction === "out" ? "justify-end" : "justify-start"}`}>
                     <div className="flex max-w-md flex-col gap-1">
                       <div className={`rounded-lg px-3 py-2 text-sm ${m.direction === "out"
@@ -653,20 +689,55 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                   {richWarning}
                 </div>
               )}
-              <div className="border-t border-slate-100 dark:border-slate-800 p-3">
+              <div className={`border-t p-3 ${composerMode === "note"
+                ? "border-amber-300 bg-amber-50 dark:border-amber-900 dark:bg-amber-950/40"
+                : "border-slate-100 dark:border-slate-800"}`}>
+                <div className="mb-2 inline-flex overflow-hidden rounded-md border border-slate-300 dark:border-slate-700" role="tablist" aria-label={t("inbox.modeReply")}>
+                  <button
+                    type="button"
+                    onClick={() => setComposerMode("reply")}
+                    className={`px-3 py-1 text-xs font-medium ${composerMode === "reply"
+                      ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+                      : "bg-white text-slate-600 dark:bg-slate-900 dark:text-slate-300"}`}
+                  >
+                    {t("inbox.modeReply")}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setComposerMode("note")}
+                    className={`px-3 py-1 text-xs font-medium ${composerMode === "note"
+                      ? "bg-amber-500 text-white dark:bg-amber-600"
+                      : "bg-white text-slate-600 dark:bg-slate-900 dark:text-slate-300"}`}
+                  >
+                    {t("inbox.modeNote")}
+                  </button>
+                </div>
                 <div className="flex gap-2">
                   <textarea
                     ref={replyTextareaRef}
-                    value={replyText}
-                    onChange={(e) => setReplyText(e.target.value)}
+                    value={composerMode === "note" ? noteText : replyText}
+                    onChange={(e) => (composerMode === "note" ? setNoteText(e.target.value) : setReplyText(e.target.value))}
                     rows={2}
-                    placeholder={t("inbox.replyPlaceholder")}
-                    className="flex-1 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-slate-400 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                    placeholder={composerMode === "note" ? t("inbox.notePlaceholder") : t("inbox.replyPlaceholder")}
+                    className={`flex-1 rounded-md border bg-white px-3 py-2 text-sm focus:outline-none focus:ring-2 dark:bg-slate-900 dark:text-slate-100 ${composerMode === "note"
+                      ? "border-amber-400 focus:ring-amber-400 dark:border-amber-800"
+                      : "border-slate-300 focus:ring-slate-400 dark:border-slate-700"}`}
                   />
-                  <button onClick={() => void sendReply()} disabled={sending || !replyText.trim()} className={`self-end ${primaryBtn}`}>
-                    {sending ? t("common.sending") : t("common.send")}
-                  </button>
+                  {composerMode === "note" ? (
+                    <button
+                      onClick={() => void addNote()}
+                      disabled={noteSaving || !noteText.trim()}
+                      className="self-end rounded-md bg-amber-500 px-4 py-2 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 dark:bg-amber-600 dark:hover:bg-amber-500"
+                    >
+                      {noteSaving ? t("inbox.addingNote") : t("inbox.addNote")}
+                    </button>
+                  ) : (
+                    <button onClick={() => void sendReply()} disabled={sending || !replyText.trim()} className={`self-end ${primaryBtn}`}>
+                      {sending ? t("common.sending") : t("common.send")}
+                    </button>
+                  )}
                 </div>
+                {composerMode === "reply" && (
                 <div className="mt-2 flex flex-wrap items-center gap-2">
                   <button
                     onClick={() => void runAiSuggest()}
@@ -683,7 +754,11 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                     {checkBusy ? t("inbox.checking") : t("inbox.checkDraft")}
                   </button>
                   <VariablePicker target={() => replyTextareaRef.current} />
+                  <SavedRepliesPicker target={() => replyTextareaRef.current} />
                 </div>
+                )}
+                {composerMode === "reply" && (
+                <>
                 <div className="mt-2 flex items-center gap-2">
                   <label className="text-xs text-slate-500 dark:text-slate-400" htmlFor="inbox-rich-kind">
                     {t("inbox.richKind")}
@@ -798,6 +873,8 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                       />
                     </div>
                   </div>
+                )}
+                </>
                 )}
               </div>
             </>
