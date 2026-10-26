@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   pgTable, uuid, varchar, text, timestamp, boolean, jsonb, integer, numeric, uniqueIndex, index,
 } from "drizzle-orm/pg-core";
@@ -103,7 +104,20 @@ export const conversations = pgTable("conversations", {
   /** Drives messaging-window enforcement (Meta 24h window, human-agent 7d). */
   lastUserMessageAt: timestamp("last_user_message_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-}, (t) => [index("conversations_ws_idx").on(t.workspaceId)]);
+}, (t) => [
+  index("conversations_ws_idx").on(t.workspaceId),
+  /**
+   * At most ONE non-resolved conversation per (channel account, contact):
+   * concurrent inbound webhooks must never fragment one contact into
+   * parallel open threads (the race this index backstops is handled in
+   * createConversation, which falls back to the existing thread on a
+   * unique violation). Resolved threads do not block a fresh thread, so
+   * the index is partial on status <> 'resolved' (covers open + pending).
+   */
+  uniqueIndex("conversations_open_unique_idx")
+    .on(t.channelAccountId, t.contactId)
+    .where(sql`${t.status} <> 'resolved'`),
+]);
 
 export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),
