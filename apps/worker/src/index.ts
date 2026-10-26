@@ -294,6 +294,10 @@ function buildProdPorts(db: Database): WorkerPorts {
       const rows = await listMessages(db, conversation.id);
       return countConsecutiveOutbound(rows);
     },
+    async resolveAccountStatus(channelAccountId) {
+      const row = await getChannelAccountById(db, channelAccountId);
+      return row?.status ?? null;
+    },
     async loadBroadcast(broadcastId): Promise<BroadcastSnapshot | null> {
       const row = await getBroadcastById(db, broadcastId);
       if (!row) return null;
@@ -306,6 +310,7 @@ function buildProdPorts(db: Database): WorkerPorts {
         channelAccountId: row.channelAccountId,
         channel: account.channel,
         accountExternalId: account.externalId,
+        accountStatus: account.status,
         tokenVaultRef: account.tokenVaultRef ?? undefined,
         template: template
           ? { name: template.name, language: template.language, latestCategory: template.latestCategory ?? template.category ?? "utility" }

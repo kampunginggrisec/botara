@@ -62,6 +62,8 @@ export interface BroadcastSnapshot {
   channelAccountId: string;
   channel: string;
   accountExternalId: string;
+  /** Live account status at load time; fan-out skips non-"connected" accounts. */
+  accountStatus?: string;
   tokenVaultRef?: string;
   template?: { name: string; language: string; latestCategory: string };
   tag?: string;
@@ -144,6 +146,13 @@ export interface WorkerPorts {
   loadBroadcast(broadcastId: string): Promise<BroadcastSnapshot | null>;
   listBroadcastTargets(broadcast: BroadcastSnapshot): Promise<BroadcastTarget[]>;
   /**
+   * Live status of a channel account (the send choke point's disconnect
+   * guard). Optional: without it, sends rely on the enqueue-time
+   * snapshot alone (the API reply route still guards synchronously).
+   * A null result (account purged) also blocks the send.
+   */
+  resolveAccountStatus?(channelAccountId: string): Promise<string | null>;
+  /**
    * Month-to-date count of DELIVERED service messages for a channel
    * account (Fase 3 allowance tracking over cost_ledger). Optional on
    * purpose: without it, service messages are rated at the utility rate
@@ -180,9 +189,22 @@ function billingCategory(data: SendMessageJobData): WhatsAppCategory {
 export async function processSendMessage(
   ports: WorkerPorts,
   data: SendMessageJobData,
-): Promise<{ externalMessageId: string; costUsd: number }> {
+): Promise<{ externalMessageId: string; costUsd: number; skipped?: boolean }> {
   const category = billingCategory(data);
   try {
+    // Disconnected-account guard: a soft-disconnected (or purged)
+    // account must not send, whatever surface queued the job (flow,
+    // sequence, broadcast, inbox reply). The job COMPLETES as a skip -
+    // with the usual failure bookkeeping so inbox rows and broadcast
+    // counters never get stuck - instead of crashing into retries.
+    if (ports.resolveAccountStatus) {
+      const accountStatus = await ports.resolveAccountStatus(data.channelAccountId);
+      if (accountStatus !== "connected") {
+        if (data.messageId) await ports.updateMessageStatus(data.messageId, "failed").catch(() => undefined);
+        if (data.referenceId) await ports.incrementBroadcastCounts(data.referenceId, { failed: 1 }).catch(() => undefined);
+        return { externalMessageId: "", costUsd: 0, skipped: true };
+      }
+    }
     // Capability-driven send guards for reactive-only channels (TikTok),
     // enforced at this choke point because EVERY send (flow, sequence,
     // broadcast fan-out, comment DM) passes through it:
@@ -273,6 +295,14 @@ export async function processBroadcast(
   if (caps && !caps.canBroadcast) {
     await ports.updateBroadcastStatus?.(broadcast.id, "failed").catch(() => undefined);
     throw new ChannelInitiationError(broadcast.channel, "Broadcasts");
+  }
+  // A broadcast whose account was disconnected after creation fans out
+  // nothing: terminally failed (like the capability backstop) and the
+  // job completes - the per-send guard in processSendMessage remains
+  // the backstop for jobs queued before the disconnect.
+  if (broadcast.accountStatus !== undefined && broadcast.accountStatus !== "connected") {
+    await ports.updateBroadcastStatus?.(broadcast.id, "failed").catch(() => undefined);
+    return { enqueued: 0 };
   }
   const targets = await ports.listBroadcastTargets(broadcast);
   for (const target of targets) {

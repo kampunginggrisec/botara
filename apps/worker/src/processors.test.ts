@@ -238,3 +238,64 @@ describe("tiktok send guards (capability-driven)", () => {
     expect(f.sent).toHaveLength(0);
   });
 });
+
+describe("disconnected-account send guards", () => {
+  const job = {
+    workspaceId: "ws1", channelAccountId: "acc1", channel: "telegram",
+    accountExternalId: "bot", toExternalId: "42", text: "hi",
+    messageId: "m-disc", referenceId: "b1", idempotencyKey: "k-disc",
+  };
+
+  test("send-message: disconnected account is SKIPPED (no send, no throw, failure bookkeeping runs)", async () => {
+    let sendCalls = 0;
+    const f = fakePorts({
+      async resolveAccountStatus() { return "disconnected"; },
+      async send() { sendCalls++; return { externalMessageId: "x", status: "sent" as const }; },
+    });
+    const result = await processSendMessage(f.ports, { ...job });
+    expect(result).toEqual({ externalMessageId: "", costUsd: 0, skipped: true });
+    expect(sendCalls).toBe(0);
+    expect(f.costs).toHaveLength(0);
+    expect(f.statuses).toEqual([{ id: "m-disc", status: "failed", externalId: undefined }]);
+    expect(f.increments).toEqual([{ id: "b1", failed: 1 }]);
+  });
+
+  test("send-message: purged account (status resolves null) is skipped too", async () => {
+    let sendCalls = 0;
+    const f = fakePorts({
+      async resolveAccountStatus() { return null; },
+      async send() { sendCalls++; return { externalMessageId: "x", status: "sent" as const }; },
+    });
+    const result = await processSendMessage(f.ports, { ...job });
+    expect(result.skipped).toBe(true);
+    expect(sendCalls).toBe(0);
+  });
+
+  test("send-message: connected account proceeds normally when the status port is wired", async () => {
+    const f = fakePorts({
+      async resolveAccountStatus() { return "connected"; },
+    });
+    const result = await processSendMessage(f.ports, { ...job, channel: "whatsapp", text: undefined });
+    expect(result.skipped).toBeUndefined();
+    expect(result.externalMessageId).toBe("wamid.1");
+  });
+
+  test("broadcast: snapshot with a disconnected account fans out nothing and is marked failed", async () => {
+    const statusUpdates: Array<{ id: string; status: string }> = [];
+    const f = fakePorts({
+      async loadBroadcast() {
+        return {
+          id: "b-disc", workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+          accountExternalId: "62812", accountStatus: "disconnected",
+          template: { name: "promo", language: "id", latestCategory: "marketing" },
+          tag: "vip", country: "ID",
+        };
+      },
+      async updateBroadcastStatus(id, status) { statusUpdates.push({ id, status }); },
+    });
+    const result = await processBroadcast(f.ports, { broadcastId: "b-disc" });
+    expect(result).toEqual({ enqueued: 0 });
+    expect(f.sent).toHaveLength(0);
+    expect(statusUpdates).toEqual([{ id: "b-disc", status: "failed" }]);
+  });
+});
