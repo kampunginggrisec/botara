@@ -2005,13 +2005,13 @@ function ChannelsPage() {
   return (
     <div className="max-w-[1400px]">
       <div className="flex flex-wrap items-start justify-between gap-4">
-        <div>
+        <div className="min-w-0 flex-1">
           <PageTitle title={t("channels.title")} subtitle={t("channels.subtitle")} />
         </div>
         <button
           type="button"
           onClick={() => document.getElementById("connect-channels")?.scrollIntoView({ behavior: "smooth", block: "start" })}
-          className="rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900"
+          className="shrink-0 rounded-full bg-slate-900 px-4 py-2 text-sm font-medium text-white shadow-sm hover:bg-slate-700 dark:bg-slate-100 dark:text-slate-900"
         >
           {`+ ${t("channels.connectAccount")}`}
         </button>
