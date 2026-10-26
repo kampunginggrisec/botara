@@ -24,6 +24,10 @@ import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-exam
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
+import {
+  TOKEN_RESOURCES, countPickedResources, emptyScopePicks, expiryIsoFromDays,
+  picksToScopes, scopeParts, tokenIsExpired, type ScopePicks, type TokenResource,
+} from "./api-tokens";
 import { SavedRepliesPicker } from "./saved-replies-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
@@ -4758,6 +4762,20 @@ function AdminAuditView() {
   );
 }
 
+/** i18n keys for the API-token scope resources (adoption #5). */
+const TOKEN_RESOURCE_LABEL_KEYS = {
+  contacts: "settings.tokenResource.contacts",
+  conversations: "settings.tokenResource.conversations",
+  broadcasts: "settings.tokenResource.broadcasts",
+  flows: "settings.tokenResource.flows",
+  sequences: "settings.tokenResource.sequences",
+  templates: "settings.tokenResource.templates",
+  channels: "settings.tokenResource.channels",
+  kb: "settings.tokenResource.kb",
+  posts: "settings.tokenResource.posts",
+  settings: "settings.tokenResource.settings",
+} as const satisfies Record<TokenResource, string>;
+
 function SettingsPage({ user, workspace, refreshSession }: {
   user: AuthUser;
   workspace: WorkspaceSummary | undefined;
@@ -4775,9 +4793,15 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   // API tokens (adopted features): raw token shown ONCE after creation.
+  // Scoped tokens (#5): optional workspace binding, scope picks, expiry.
   const [apiTokens, setApiTokens] = useState<ApiTokenInfo[]>([]);
   const [tokenName, setTokenName] = useState("");
   const [newRawToken, setNewRawToken] = useState<string | null>(null);
+  const [tokenWorkspaces, setTokenWorkspaces] = useState<WorkspaceSummary[]>([]);
+  const [tokenWorkspaceId, setTokenWorkspaceId] = useState("");
+  const [tokenFullAccess, setTokenFullAccess] = useState(true);
+  const [tokenPicks, setTokenPicks] = useState<ScopePicks>(() => emptyScopePicks());
+  const [tokenExpiryDays, setTokenExpiryDays] = useState("");
 
   useEffect(() => { setWsName(workspace?.name ?? ""); }, [workspace?.name]);
 
@@ -4791,11 +4815,30 @@ function SettingsPage({ user, workspace, refreshSession }: {
   }, [t]);
   useEffect(() => { void loadTokens(); }, [loadTokens]);
 
+  const loadTokenWorkspaces = useCallback(async () => {
+    try {
+      const res = await api.listWorkspaces();
+      setTokenWorkspaces(res.workspaces);
+    } catch {
+      // The binding select simply stays unbound-only; token CRUD still works.
+      setTokenWorkspaces([]);
+    }
+  }, []);
+  useEffect(() => { void loadTokenWorkspaces(); }, [loadTokenWorkspaces]);
+
   const createToken = async () => {
     if (!tokenName.trim()) return;
+    if (!tokenFullAccess && countPickedResources(tokenPicks) === 0) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      const res = await api.createApiToken(tokenName.trim());
+      const body: { name: string; workspaceId?: string; scopes?: string[]; expiresAt?: string } = {
+        name: tokenName.trim(),
+      };
+      if (tokenWorkspaceId) body.workspaceId = tokenWorkspaceId;
+      if (!tokenFullAccess) body.scopes = picksToScopes(tokenPicks);
+      else if (tokenWorkspaceId || tokenExpiryDays) body.scopes = ["*"];
+      if (tokenExpiryDays) body.expiresAt = expiryIsoFromDays(Number(tokenExpiryDays));
+      const res = await api.createApiToken(body);
       setNewRawToken(res.token);
       setTokenName("");
       await loadTokens();
@@ -4969,16 +5012,94 @@ function SettingsPage({ user, workspace, refreshSession }: {
             </div>
           </div>
         )}
-        <div className="mt-3 flex flex-wrap gap-2">
+        <div className="mt-3 flex flex-wrap items-end gap-2">
           <input
             value={tokenName}
             onChange={(e) => setTokenName(e.target.value)}
             placeholder={t("settings.tokenNamePlaceholder")}
             className="w-64 rounded-md border border-slate-300 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
           />
-          <button onClick={() => void createToken()} disabled={busy || !tokenName.trim()} className={primaryBtn}>
+          <label className="flex flex-col gap-1 text-xs text-slate-500 dark:text-slate-400">
+            {t("settings.tokenWorkspace")}
+            <select
+              value={tokenWorkspaceId}
+              onChange={(e) => setTokenWorkspaceId(e.target.value)}
+              className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              <option value="">{t("settings.tokenWorkspaceAny")}</option>
+              {tokenWorkspaces.map((w) => (
+                <option key={w.id} value={w.id}>{w.name}</option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-xs text-slate-500 dark:text-slate-400">
+            {t("settings.tokenExpires")}
+            <select
+              value={tokenExpiryDays}
+              onChange={(e) => setTokenExpiryDays(e.target.value)}
+              className="rounded-md border border-slate-300 bg-white px-2 py-2 text-sm dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+            >
+              <option value="">{t("settings.tokenExpiryNever")}</option>
+              {[30, 90, 365].map((days) => (
+                <option key={days} value={String(days)}>{t("settings.tokenExpiryDays", { days })}</option>
+              ))}
+            </select>
+          </label>
+          <button
+            onClick={() => void createToken()}
+            disabled={busy || !tokenName.trim() || (!tokenFullAccess && countPickedResources(tokenPicks) === 0)}
+            className={primaryBtn}
+          >
             {t("settings.tokenCreate")}
           </button>
+        </div>
+        <div className="mt-3">
+          <div className="text-xs font-medium text-slate-500 dark:text-slate-400">{t("settings.tokenScopes")}</div>
+          <label className="mt-1 flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={tokenFullAccess}
+              onChange={(e) => setTokenFullAccess(e.target.checked)}
+            />
+            {t("settings.tokenFullAccess")}
+          </label>
+          {!tokenFullAccess && (
+            <div className="mt-2 grid max-w-2xl grid-cols-1 gap-1 sm:grid-cols-2">
+              {TOKEN_RESOURCES.map((resource) => (
+                <div key={resource} className="flex items-center justify-between gap-2 rounded-md border border-slate-200 px-2 py-1.5 dark:border-slate-800">
+                  <span className="text-sm">{t(TOKEN_RESOURCE_LABEL_KEYS[resource])}</span>
+                  <span className="flex items-center gap-3 text-xs">
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={tokenPicks[resource].read || tokenPicks[resource].write}
+                        disabled={tokenPicks[resource].write}
+                        onChange={(e) => setTokenPicks((prev) => ({
+                          ...prev,
+                          [resource]: { ...prev[resource], read: e.target.checked },
+                        }))}
+                      />
+                      {t("settings.tokenScopeRead")}
+                    </label>
+                    <label className="flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={tokenPicks[resource].write}
+                        onChange={(e) => setTokenPicks((prev) => ({
+                          ...prev,
+                          [resource]: { read: prev[resource].read || e.target.checked, write: e.target.checked },
+                        }))}
+                      />
+                      {t("settings.tokenScopeWrite")}
+                    </label>
+                  </span>
+                </div>
+              ))}
+              {countPickedResources(tokenPicks) === 0 && (
+                <p className={`text-xs ${mutedCls}`}>{t("settings.tokenScopePickHint")}</p>
+              )}
+            </div>
+          )}
         </div>
         {apiTokens.length === 0 ? (
           <p className={`mt-3 ${mutedCls}`}>{t("settings.tokensEmpty")}</p>
@@ -4988,25 +5109,67 @@ function SettingsPage({ user, workspace, refreshSession }: {
               <tr>
                 <th className="px-3 py-2 font-medium">{t("common.name")}</th>
                 <th className="px-3 py-2 font-medium">{t("settings.tokenPrefix")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenWorkspace")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenScopes")}</th>
                 <th className="px-3 py-2 font-medium">{t("settings.tokenCreated")}</th>
+                <th className="px-3 py-2 font-medium">{t("settings.tokenExpires")}</th>
                 <th className="px-3 py-2 font-medium">{t("settings.tokenLastUsed")}</th>
                 <th className="px-3 py-2 font-medium">{t("common.actions")}</th>
               </tr>
             </thead>
             <tbody>
-              {apiTokens.map((token) => (
-                <tr key={token.id} className="border-t border-slate-100 dark:border-slate-800">
-                  <td className="px-3 py-2">{token.name}</td>
-                  <td className="px-3 py-2"><code className="text-xs">{token.prefix}...</code></td>
-                  <td className="px-3 py-2">{new Date(token.createdAt).toLocaleString()}</td>
-                  <td className="px-3 py-2">{token.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</td>
-                  <td className="px-3 py-2">
-                    <button onClick={() => void revokeToken(token)} className="text-xs text-red-600 dark:text-red-400 underline">
-                      {t("settings.tokenRevoke")}
-                    </button>
-                  </td>
-                </tr>
-              ))}
+              {apiTokens.map((token) => {
+                const expired = tokenIsExpired(token.expiresAt);
+                const boundWorkspace = token.workspaceId
+                  ? tokenWorkspaces.find((w) => w.id === token.workspaceId)
+                  : undefined;
+                return (
+                  <tr key={token.id} className="border-t border-slate-100 dark:border-slate-800">
+                    <td className="px-3 py-2">
+                      {token.name}
+                      {token.revokedAt && (
+                        <span className="ml-2 rounded bg-slate-200 px-1.5 py-0.5 text-[11px] text-slate-600 dark:bg-slate-700 dark:text-slate-300">
+                          {t("settings.tokenRevoked")}
+                        </span>
+                      )}
+                      {!token.revokedAt && expired && (
+                        <span className="ml-2 rounded bg-red-100 px-1.5 py-0.5 text-[11px] text-red-700 dark:bg-red-950 dark:text-red-300">
+                          {t("settings.tokenExpired")}
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2"><code className="text-xs">{token.prefix}...</code></td>
+                    <td className="px-3 py-2">
+                      {token.workspaceId ? (boundWorkspace?.name ?? `${token.workspaceId.slice(0, 8)}...`) : t("settings.tokenAllWorkspaces")}
+                    </td>
+                    <td className="px-3 py-2 text-xs">
+                      {token.scopes === null || (token.scopes.length === 1 && token.scopes[0] === "*")
+                        ? t("settings.tokenFullAccess")
+                        : token.scopes.length === 0
+                          ? t("settings.tokenScopesNone")
+                          : token.scopes.map((s) => {
+                              const parts = scopeParts(s);
+                              if (parts.level === "all") return t("settings.tokenFullAccess");
+                              const label = TOKEN_RESOURCE_LABEL_KEYS[parts.resource as TokenResource];
+                              const resourceLabel = label ? t(label) : parts.resource;
+                              return `${resourceLabel}: ${parts.level === "write" ? t("settings.tokenScopeWrite") : t("settings.tokenScopeRead")}`;
+                            }).join(", ")}
+                    </td>
+                    <td className="px-3 py-2">{new Date(token.createdAt).toLocaleString()}</td>
+                    <td className="px-3 py-2">
+                      {token.expiresAt ? new Date(token.expiresAt).toLocaleString() : t("settings.tokenExpiryNever")}
+                    </td>
+                    <td className="px-3 py-2">{token.lastUsedAt ? new Date(token.lastUsedAt).toLocaleString() : "-"}</td>
+                    <td className="px-3 py-2">
+                      {!token.revokedAt && (
+                        <button onClick={() => void revokeToken(token)} className="text-xs text-red-600 dark:text-red-400 underline">
+                          {t("settings.tokenRevoke")}
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         )}

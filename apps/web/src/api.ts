@@ -519,9 +519,23 @@ export interface ApiTokenInfo {
   id: string;
   name: string;
   prefix: string;
+  /** Scoped tokens (#5): bound workspace id; null = any of the user's workspaces. */
+  workspaceId: string | null;
+  /** Scoped tokens (#5): granted scopes; null = unrestricted (legacy). */
+  scopes: string[] | null;
+  /** Scoped tokens (#5): ISO expiry; null = never expires. */
+  expiresAt: string | null;
   lastUsedAt: string | null;
   revokedAt: string | null;
   createdAt: string;
+}
+
+/** Creation payload for an API token; omitting the #5 fields mints a legacy token. */
+export interface CreateApiTokenBody {
+  name: string;
+  workspaceId?: string;
+  scopes?: string[];
+  expiresAt?: string;
 }
 
 export interface ContactImportResult {
@@ -735,8 +749,8 @@ export const api = {
   listApiTokens(): Promise<{ tokens: ApiTokenInfo[] }> {
     return request("/auth/tokens");
   },
-  createApiToken(name: string): Promise<{ token: string; tokenInfo: ApiTokenInfo }> {
-    return request("/auth/tokens", { method: "POST", body: JSON.stringify({ name }) });
+  createApiToken(body: CreateApiTokenBody): Promise<{ token: string; tokenInfo: ApiTokenInfo }> {
+    return request("/auth/tokens", { method: "POST", body: JSON.stringify(body) });
   },
   revokeApiToken(id: string): Promise<{ revoked: boolean }> {
     return request(`/auth/tokens/${id}`, { method: "DELETE" });
