@@ -123,6 +123,20 @@ export const messages = pgTable("messages", {
   id: uuid("id").primaryKey().defaultRandom(),
   conversationId: uuid("conversation_id").notNull().references(() => conversations.id),
   direction: varchar("direction", { length: 10 }).notNull(), // in|out
+  /**
+   * Timeline kind: "message" rows are customer-visible traffic (the only
+   * kind any send path may ever deliver); "note" rows are INTERNAL team
+   * notes (package #2) - they render in the inbox thread only, are never
+   * enqueued or sent, never counted as outbound sends, and are filtered
+   * out of every customer-facing listing (webchat widget, AI suggest).
+   */
+  kind: varchar("kind", { length: 20 }).notNull().default("message"), // message|note
+  /**
+   * The workspace user who authored this row, when a human wrote it
+   * (internal notes today). Null for customer messages and automated
+   * sends; the inbox resolves the display name from the member list.
+   */
+  authorUserId: uuid("author_user_id").references(() => users.id),
   type: varchar("type", { length: 40 }).notNull().default("text"),
   body: text("body"),
   /**
@@ -149,6 +163,31 @@ export const messages = pgTable("messages", {
   idempotencyKey: varchar("idempotency_key", { length: 256 }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("messages_conversation_idx").on(t.conversationId)]);
+
+/**
+ * Saved replies (package #2): the workspace's shared quick-reply library
+ * for the inbox composer. Every member reads the same library; mutating
+ * it is a mutator-role action (owner/admin/member). Bodies may contain
+ * {{variables}} - they insert into the composer as drafts and render per
+ * contact through the normal reply path, never at rest. `shortcut` (e.g.
+ * "/halo") is an optional picker search handle, unique per workspace
+ * when present (partial index - any number of rows may omit it).
+ */
+export const savedReplies = pgTable("saved_replies", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  title: varchar("title", { length: 200 }).notNull(),
+  body: text("body").notNull(),
+  shortcut: varchar("shortcut", { length: 60 }),
+  createdBy: uuid("created_by").notNull().references(() => users.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("saved_replies_ws_idx").on(t.workspaceId),
+  uniqueIndex("saved_replies_ws_shortcut_idx")
+    .on(t.workspaceId, t.shortcut)
+    .where(sql`${t.shortcut} is not null`),
+]);
 
 export const templates = pgTable("templates", {
   id: uuid("id").primaryKey().defaultRandom(),
