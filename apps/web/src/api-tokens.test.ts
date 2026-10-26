@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
-  TOKEN_RESOURCES, countPickedResources, emptyScopePicks, expiryIsoFromDays,
+  TOKEN_RESOURCES, countPickedResources, defaultTokenFormState, emptyScopePicks, expiryIsoFromDays,
   picksToScopes, scopeParts, tokenIsExpired,
 } from "./api-tokens";
 
@@ -40,5 +40,20 @@ describe("web API token scope helpers", () => {
     const now = new Date("2026-10-27T00:00:00.000Z");
     expect(expiryIsoFromDays(30, now)).toBe("2026-11-26T00:00:00.000Z");
     expect(expiryIsoFromDays(365, now)).toBe("2027-10-27T00:00:00.000Z");
+  });
+
+  test("defaultTokenFormState (rider #7): exact factory defaults, fresh picks per call", () => {
+    const state = defaultTokenFormState();
+    expect(state.name).toBe("");
+    expect(state.workspaceId).toBe(""); // "" = All workspaces (no binding)
+    expect(state.fullAccess).toBe(true);
+    expect(state.expiryDays).toBe(""); // "" = Never
+    expect(countPickedResources(state.picks)).toBe(0);
+    expect(picksToScopes(state.picks)).toEqual([]);
+    // Mutating one reset's picks must not leak into the next reset.
+    state.picks.contacts.write = true;
+    const next = defaultTokenFormState();
+    expect(next.picks.contacts.write).toBe(false);
+    expect(countPickedResources(next.picks)).toBe(0);
   });
 });

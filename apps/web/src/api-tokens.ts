@@ -32,6 +32,31 @@ export function emptyScopePicks(): ScopePicks {
   ) as ScopePicks;
 }
 
+/**
+ * The token creation form's factory defaults (package #7 rider): after
+ * a successful create the form returns to EXACTLY this state - name
+ * empty, no workspace binding ("All workspaces"), Full access on, no
+ * per-resource picks, expiry Never (""). Before this, only the name
+ * was cleared and the previous token's workspace/scope/expiry picks
+ * silently carried into the next creation. Fresh objects on every
+ * call: the picks map must never be shared between resets.
+ */
+export function defaultTokenFormState(): {
+  name: string;
+  workspaceId: string;
+  fullAccess: boolean;
+  picks: ScopePicks;
+  expiryDays: string;
+} {
+  return {
+    name: "",
+    workspaceId: "",
+    fullAccess: true,
+    picks: emptyScopePicks(),
+    expiryDays: "",
+  };
+}
+
 /** How many resources have any pick - the form refuses an all-empty scope list. */
 export function countPickedResources(picks: ScopePicks): number {
   return TOKEN_RESOURCES.filter((r) => picks[r].read || picks[r].write).length;

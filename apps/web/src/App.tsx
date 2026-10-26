@@ -27,7 +27,7 @@ import { VariablePicker } from "./variable-picker";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { formatDealMoney, groupDealsByStage, movedStageOrder, visibleDeals } from "./deals";
 import {
-  TOKEN_RESOURCES, countPickedResources, emptyScopePicks, expiryIsoFromDays,
+  TOKEN_RESOURCES, countPickedResources, defaultTokenFormState, emptyScopePicks, expiryIsoFromDays,
   picksToScopes, scopeParts, tokenIsExpired, type ScopePicks, type TokenResource,
 } from "./api-tokens";
 import { SavedRepliesPicker } from "./saved-replies-picker";
@@ -5536,7 +5536,16 @@ function SettingsPage({ user, workspace, refreshSession }: {
       if (tokenExpiryDays) body.expiresAt = expiryIsoFromDays(Number(tokenExpiryDays));
       const res = await api.createApiToken(body);
       setNewRawToken(res.token);
-      setTokenName("");
+      // Rider (package #7): reset the WHOLE form to factory defaults -
+      // previously only the name cleared, so the next token silently
+      // inherited this one's workspace binding, scope picks and expiry.
+      // The one-time raw-token banner above is intentionally untouched.
+      const fresh = defaultTokenFormState();
+      setTokenName(fresh.name);
+      setTokenWorkspaceId(fresh.workspaceId);
+      setTokenFullAccess(fresh.fullAccess);
+      setTokenPicks(fresh.picks);
+      setTokenExpiryDays(fresh.expiryDays);
       await loadTokens();
     } catch (err) {
       setError(errText(err, t("settings.tokensFailed")));
