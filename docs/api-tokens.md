@@ -45,6 +45,7 @@ and a `write` level, plus `*` for full access.
 | `broadcasts:read` / `broadcasts:write` | `/broadcasts/*` |
 | `flows:read` / `flows:write` | `/flows/*`, `/growth-links/*` |
 | `sequences:read` / `sequences:write` | `/sequences/*` |
+| `deals:read` / `deals:write` | `/deals/*`, `/pipelines/*` (package #6) |
 | `templates:read` / `templates:write` | `/templates/*` |
 | `channels:read` / `channels:write` | `/channels/*`, `/catalog-products` |
 | `kb:read` / `kb:write` | `/kb/*` |
