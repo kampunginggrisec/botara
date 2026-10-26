@@ -121,6 +121,8 @@ export interface ConversationListItem extends ConversationRow {
   channelAccountExternalId: string;
   contactExternalId: string;
   contactDisplayName: string | null;
+  /** The contact's tags (the conversation row itself carries contactId). */
+  contactTags: string[];
 }
 
 export async function listConversations(
@@ -135,6 +137,7 @@ export async function listConversations(
       channelAccountExternalId: channelAccounts.externalId,
       contactExternalId: contacts.externalId,
       contactDisplayName: contacts.displayName,
+      contactTags: contacts.tags,
     })
     .from(conversations)
     .innerJoin(channelAccounts, eq(conversations.channelAccountId, channelAccounts.id))
@@ -153,6 +156,7 @@ export async function listConversations(
     channelAccountExternalId: r.channelAccountExternalId,
     contactExternalId: r.contactExternalId,
     contactDisplayName: r.contactDisplayName,
+    contactTags: (r.contactTags as string[] | null) ?? [],
   }));
   // Assignee filter in JS (same precedent as the contacts tag filter):
   // `assignedTo: null` means unassigned-only, a string means that member,
@@ -412,6 +416,15 @@ export async function createBroadcast(
     })
     .returning();
   return row!;
+}
+
+/** All broadcasts of a workspace, newest first (Broadcast history view). */
+export async function listBroadcasts(db: Database, workspaceId: string): Promise<BroadcastRow[]> {
+  return db
+    .select()
+    .from(broadcasts)
+    .where(eq(broadcasts.workspaceId, workspaceId))
+    .orderBy(desc(broadcasts.createdAt));
 }
 
 export async function getBroadcast(db: Database, workspaceId: string, id: string): Promise<BroadcastRow | null> {
