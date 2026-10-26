@@ -4325,6 +4325,10 @@ export async function createWebhookEndpoint(
       url: input.url,
       secretSealed: input.secretSealed,
       events: input.events,
+      // Defaults set explicitly (not left to the column defaults) so the
+      // row reads identically on every store implementation.
+      enabled: true,
+      consecutiveFailures: 0,
     })
     .returning();
   return row!;
@@ -4424,15 +4428,22 @@ export async function listEnabledWebhookEndpoints(
 
 export async function createWebhookDelivery(
   db: Database,
-  input: { endpointId: string; workspaceId: string; event: string; payload: Record<string, unknown> },
+  input: {
+    /** Explicit id when the caller needs it before the insert (the envelope embeds it). */
+    id?: string;
+    endpointId: string; workspaceId: string; event: string; payload: Record<string, unknown>;
+  },
 ): Promise<WebhookDeliveryRow> {
   const [row] = await db
     .insert(webhookDeliveries)
     .values({
+      ...(input.id ? { id: input.id } : {}),
       endpointId: input.endpointId,
       workspaceId: input.workspaceId,
       event: input.event,
       payload: input.payload,
+      status: "pending",
+      attempts: 0,
     })
     .returning();
   return row!;

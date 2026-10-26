@@ -29,7 +29,7 @@ export const WORKSPACE_ROUTE_PREFIXES = [
   "/conversations", "/contacts", "/segments", "/templates", "/broadcasts",
   "/channels", "/posts", "/sequences", "/workspaces", "/kb", "/flows",
   "/stats", "/growth-links", "/catalog-products", "/moderation", "/saved-replies",
-  "/pipelines", "/deals",
+  "/pipelines", "/deals", "/settings",
 ] as const;
 
 /** Prefix families -> scope resource. `/workspaces/*` and `/stats` are special-cased below. */
@@ -50,6 +50,7 @@ const FAMILY_RESOURCES: ReadonlyArray<readonly [prefix: string, resource: ApiTok
   ["/kb", "kb"],
   ["/posts", "posts"],
   ["/moderation", "settings"], // operator utility, no resource of its own
+  ["/settings", "settings"], // outbound webhooks (#10) + settings surface
 ];
 
 export type RouteScopeRequirement =

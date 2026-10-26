@@ -23,6 +23,9 @@ import {
   isCommentProcessed, markCommentProcessed,
   createConversation as createConversationRow, createMessage, touchConversationLastUserMessage,
   findMessageByIdempotencyKey, getWebchatSessionById, createTokenVault,
+  getWebhookDelivery, getWebhookEndpointById, recordWebhookDeliveryAttempt,
+  markWebhookDeliveryDelivered, markWebhookDeliveryFailed, resetWebhookEndpointFailures,
+  registerWebhookEndpointFailure, tryParseVaultKey, unsealSettingValue,
   startEffectiveEnvRefresh,
   type Database,
 } from "@botara/db";
@@ -30,7 +33,7 @@ import {
   getAdapter, configureTikTokTokenPersistence, EmailAdapter, InstagramAdapter, WebchatAdapter,
   type ChannelAccountRef, type ChannelKey, type WebchatStore,
 } from "@botara/channels";
-import { countConsecutiveOutbound } from "@botara/shared";
+import { WEBHOOK_AUTO_DISABLE_FAILURES, countConsecutiveOutbound } from "@botara/shared";
 import { putObject } from "@botara/media";
 import {
   isFlowWaitTimeout, processBroadcast, processFlowRun, processFlowWaitTimeout, processSendMessage,
@@ -53,6 +56,9 @@ import { processSequenceAdvance, type SequencePorts } from "./sequences";
 import { processRetentionScan } from "./retention";
 import { processEmailInbound, type EmailInboundJobData, type EmailInboundPorts } from "./email-inbound";
 import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-ingest";
+import {
+  processOutboundWebhookDelivery, type OutboundWebhookPorts,
+} from "./outbound-webhooks";
 
 /**
  * Botara worker - Fase 2 entrypoint.
@@ -69,7 +75,7 @@ import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-
 
 export const QUEUE_NAMES = [
   "broadcast", "sequence", "publish", "token-refresh", "email", "send-message", "flow-run", "kb",
-  "comment-action",
+  "comment-action", "outbound-webhooks",
 ] as const;
 export type QueueName = (typeof QUEUE_NAMES)[number];
 
@@ -890,6 +896,59 @@ function buildKbPorts(db: Database): KbIngestPorts {
   };
 }
 
+// ------------------------------------------------- outbound-webhook ports
+
+function buildOutboundWebhookPorts(db: Database): OutboundWebhookPorts {
+  return {
+    async getDelivery(deliveryId) {
+      const row = await getWebhookDelivery(db, deliveryId);
+      return row
+        ? {
+            id: row.id, endpointId: row.endpointId, workspaceId: row.workspaceId,
+            event: row.event, payload: row.payload as Record<string, unknown>,
+            status: row.status as "pending" | "delivered" | "failed", attempts: row.attempts,
+          }
+        : null;
+    },
+    async getEndpoint(endpointId) {
+      const row = await getWebhookEndpointById(db, endpointId);
+      return row ? { id: row.id, workspaceId: row.workspaceId, url: row.url, enabled: row.enabled } : null;
+    },
+    async getEndpointSecret(endpointId) {
+      const vaultKey = tryParseVaultKey(process.env.TOKEN_VAULT_KEY);
+      if (!vaultKey) return null;
+      const row = await getWebhookEndpointById(db, endpointId);
+      if (!row) return null;
+      try {
+        return unsealSettingValue(vaultKey, row.secretSealed);
+      } catch {
+        return null;
+      }
+    },
+    async recordAttempt(input) {
+      await recordWebhookDeliveryAttempt(db, input.deliveryId, {
+        responseStatus: input.responseStatus, error: input.lastError,
+      });
+    },
+    async markDelivered(deliveryId) {
+      await markWebhookDeliveryDelivered(db, deliveryId, new Date());
+    },
+    async markFailed(deliveryId, error) {
+      await markWebhookDeliveryFailed(db, deliveryId, error);
+    },
+    async resetEndpointFailures(endpointId) {
+      await resetWebhookEndpointFailures(db, endpointId);
+    },
+    async registerEndpointFailure(endpointId) {
+      const row = await getWebhookEndpointById(db, endpointId);
+      if (!row) return;
+      await registerWebhookEndpointFailure(db, row, {
+        threshold: WEBHOOK_AUTO_DISABLE_FAILURES, at: new Date(),
+      });
+    },
+  };
+}
+
 // -------------------------------------------------------- comment-action ports
 
 function buildCommentActionPorts(db: Database): CommentActionPorts {
@@ -1001,6 +1060,11 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
       return processKbIngest(buildKbPorts(db), job.data as KbIngestJobData);
     case "comment-action":
       return processCommentAction(buildCommentActionPorts(db), job.data as CommentActionJobData);
+    case "outbound-webhooks":
+      return processOutboundWebhookDelivery(buildOutboundWebhookPorts(db), {
+        deliveryId: (job.data as { deliveryId: string }).deliveryId,
+        attemptsMade: job.attemptsMade,
+      });
     default:
       console.log(`[worker] ${queueName}: received job ${job.id} (${job.name}) - no handler`);
       return { stub: true };

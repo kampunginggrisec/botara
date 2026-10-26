@@ -45,6 +45,7 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
     },
     kbEnqueuer: { async enqueueKbIngest() {} },
     flowEnqueuer: { async enqueueFlowRun() {} },
+    webhookEnqueuer: { async enqueueWebhookDelivery() {} },
     flowDispatcher: { async dispatch() {}, async dispatchPersistedWebchat() {} },
     realtimePublisher: { async publishInboxMessage() {}, async publishInboxUpdate() {} },
     vault: new InMemoryVault(),

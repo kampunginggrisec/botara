@@ -6,8 +6,8 @@ import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import {
   AppError, ChannelAccountDisconnectedError, ChannelInitiationError, ConsecutiveSendCapError,
-  buildVariableContext, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
-  MessagingWindowClosedError, parseApiTokenScopes,
+  buildVariableContext, checkOutboundWebhookUrl, countConsecutiveOutbound, disconnectPurgeAt, evaluateReplyWindow, interpolate,
+  MessagingWindowClosedError, WEBHOOK_DELIVERY_MAX_ATTEMPTS, WEBHOOK_TEST_EVENT, parseApiTokenScopes, parseWebhookEvents,
 } from "@botara/shared";
 import {
   getDb, getWorkspaceById, listContacts, getContact, createContact, updateContact, segmentCounts,
@@ -47,7 +47,10 @@ import {
   type PipelineRow, type PipelineStageRow, type DealRow, type DealWithContact, type DealStatus,
   updateConversationAssignment, updateConversationStatus, CONVERSATION_STATUSES,
   upsertCatalogProduct, listCatalogProducts, listCatalogProductKeys, deleteCatalogProduct,
-  PlatformSettingsService, DbPlatformSettingsStorage, tryParseVaultKey,
+  PlatformSettingsService, DbPlatformSettingsStorage, tryParseVaultKey, sealSettingValue,
+  createWebhookEndpoint, listWebhookEndpoints, getWebhookEndpoint, updateWebhookEndpoint,
+  deleteWebhookEndpoint, createWebhookDelivery, listWebhookDeliveries,
+  type WebhookEndpointRow, type WebhookDeliveryRow,
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
   type GrowthLinkRow, type ConversationListItem, type EnvLike,
 } from "@botara/db";
@@ -79,6 +82,10 @@ import {
   INVITABLE_ROLES, generateInviteToken, hashInviteToken, inviteDisplayPrefix, invitePath, inviteState,
 } from "./invites";
 import { createRedisPresenceReader, offlinePresenceReader, type PresenceReader } from "./presence";
+import {
+  createOutboundWebhookEmitter, generateWebhookSecret, webhookEnvelope, webhookTestData,
+  type WebhookDeliveryEnqueuer,
+} from "./outbound-webhooks";
 import { WORKSPACE_ROUTE_PREFIXES, assertApiTokenRouteAccess } from "./route-scopes";
 import { estimateBroadcastCost, type WhatsAppCategory } from "@botara/billing";
 import {
@@ -237,6 +244,8 @@ export interface ApiDeps {
   /** Fase 4: flow-run enqueueing + inbound webhook dispatch (persist + match). */
   flowEnqueuer: FlowRunEnqueuer;
   flowDispatcher: InboundFlowDispatcher;
+  /** Outbound event webhooks (#10): delivery-job enqueueing for the worker's outbound-webhooks queue. */
+  webhookEnqueuer: WebhookDeliveryEnqueuer;
   /** Fase 4: token vault for channel connect flows (telegram/OAuth). Store-only. */
   vault: TokenVaultPort;
   /** Inbox live updates: fire-and-forget publisher onto the realtime bus. */
@@ -360,6 +369,50 @@ export function createBullMqKbEnqueuer(redisUrl: string): KbEnqueuer {
   const inner = createBullMqEnqueuer(redisUrl, "kb", "ingest");
   return {
     enqueueKbIngest: (input) => inner.enqueue(input, `kb-ingest:${input.documentId}`),
+  };
+}
+
+/**
+ * Production outbound-webhook enqueuer: BullMQ "outbound-webhooks"
+ * queue, job "deliver". Unlike the generic helper, the job carries the
+ * delivery retry policy (5 attempts, exponential backoff from 5s) - the
+ * worker's own per-delivery attempt counter agrees with it, and the
+ * final attempt marks the delivery failed instead of throwing.
+ */
+export function createBullMqWebhookEnqueuer(redisUrl: string): WebhookDeliveryEnqueuer {
+  return {
+    async enqueueWebhookDelivery(deliveryId: string): Promise<void> {
+      const connection = new IORedis(redisUrl, {
+        maxRetriesPerRequest: 1,
+        connectTimeout: 2000,
+        enableOfflineQueue: false,
+        retryStrategy: () => null,
+      });
+      connection.on("error", () => { /* surfaced via the raced add() below */ });
+      const queue = new Queue("outbound-webhooks", { connection });
+      try {
+        const add = queue.add("deliver", { deliveryId }, {
+          jobId: jobIdFor(`webhook-delivery:${deliveryId}`),
+          attempts: WEBHOOK_DELIVERY_MAX_ATTEMPTS,
+          backoff: { type: "exponential", delay: 5000 },
+          removeOnComplete: 100,
+          removeOnFail: 100,
+        });
+        const timeout = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("redis enqueue timed out")), 3000),
+        );
+        await Promise.race([add, timeout]);
+      } catch (err) {
+        throw new AppError(
+          "CONFIGURATION",
+          `outbound-webhooks queue (Redis) is unavailable: ${err instanceof Error ? err.message : String(err)}`,
+          { status: 503 },
+        );
+      } finally {
+        await queue.close().catch(() => undefined);
+        connection.disconnect();
+      }
+    },
   };
 }
 
@@ -571,11 +624,18 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
     dataDeletionStore: createDbDataDeletionStore(defaultGetDatabase),
     kbEnqueuer: createBullMqKbEnqueuer(redisUrl),
     flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
+    webhookEnqueuer: createBullMqWebhookEnqueuer(redisUrl),
     flowDispatcher: createDbFlowDispatcher({
       getDatabase: defaultGetDatabase,
       flowEnqueuer: createBullMqFlowEnqueuer(redisUrl),
       commentEnqueuer: createBullMqCommentActionEnqueuer(redisUrl),
       publisher: realtimePublisher,
+      // Outbound event webhooks (#10): lifecycle events fan out to the
+      // workspace's subscribed endpoints; fire-and-forget by contract.
+      webhookEmitter: createOutboundWebhookEmitter({
+        getDatabase: defaultGetDatabase,
+        enqueuer: createBullMqWebhookEnqueuer(redisUrl),
+      }),
       // Inbound media pipeline: copies channel media bytes into R2 at
       // ingest. Degrades silently to caption-only when R2 is not
       // configured - the port never throws (see inbound-media.ts).
@@ -5915,6 +5975,271 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const removed = await deleteSequence(deps.getDatabase(), ws, c.req.valid("param").id);
     if (!removed) throw new AppError("NOT_FOUND", "Sequence not found.", { status: 404 });
     return c.json({ deleted: true });
+  });
+
+  // ------------------------------------------- outbound webhooks (#10)
+  // Workspace-scoped signed event subscriptions (Settings -> Webhooks).
+  // Management is an owner/admin surface (settings resource): members
+  // and agents get 403. The signing secret is generated server-side,
+  // sealed with the platform vault key, and returned in plaintext
+  // EXACTLY ONCE (create / rotate-secret responses) - list reads carry
+  // no secret material at all. URL validation mirrors the delivery-time
+  // SSRF guard, so an endpoint that cannot be safely delivered to is
+  // refused at write time with the reason attached.
+  const webhookEndpointView = (row: WebhookEndpointRow) => ({
+    id: row.id,
+    name: row.name,
+    url: row.url,
+    events: Array.isArray(row.events) ? (row.events as string[]) : [],
+    enabled: row.enabled,
+    consecutiveFailures: row.consecutiveFailures,
+    disabledAt: iso(row.disabledAt),
+    autoDisabled: row.disabledBySystem === true,
+    createdAt: iso(row.createdAt),
+    updatedAt: iso(row.updatedAt),
+  });
+  const webhookDeliveryView = (row: WebhookDeliveryRow) => ({
+    id: row.id,
+    endpointId: row.endpointId,
+    event: row.event,
+    status: row.status,
+    responseStatus: row.responseStatus,
+    attempts: row.attempts,
+    lastError: row.lastError,
+    createdAt: iso(row.createdAt),
+    deliveredAt: iso(row.deliveredAt),
+  });
+  const guardWebhookAdmin = (c: Ctx): void => {
+    requireRole(authContext(c), ADMIN_ROLES);
+  };
+  const webhookVaultKey = (): Buffer => {
+    const key = tryParseVaultKey(deps.env.TOKEN_VAULT_KEY);
+    if (!key) {
+      throw new AppError(
+        "CONFIGURATION",
+        "Outbound webhook secrets require TOKEN_VAULT_KEY to be configured on the server.",
+        { status: 503 },
+      );
+    }
+    return key;
+  };
+  const validateWebhookUrl = async (raw: string): Promise<string> => {
+    const check = await checkOutboundWebhookUrl(raw);
+    if (!check.ok) {
+      throw new AppError(
+        "VALIDATION",
+        `Webhook URL rejected: ${check.reason}`,
+        { status: 400, details: { reason: check.reason } },
+      );
+    }
+    return check.url.toString();
+  };
+  const webhookName = (raw: string): string => {
+    const name = raw.trim();
+    if (!name) throw new AppError("VALIDATION", "Webhook name must not be empty.", { status: 400 });
+    return name;
+  };
+  const loadWebhookEndpoint = async (ws: string, id: string): Promise<WebhookEndpointRow> => {
+    const row = await getWebhookEndpoint(deps.getDatabase(), ws, id);
+    if (!row) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", { status: 404 });
+    return row;
+  };
+
+  const webhookEventsBody = z.object({
+    name: z.string().min(1).max(200),
+    url: z.string().min(1).max(2000),
+    events: z.array(z.string()).min(1),
+  });
+
+  const createWebhookRoute = createRoute({
+    method: "post", path: "/settings/webhooks",
+    request: { body: { content: { "application/json": { schema: webhookEventsBody } } } },
+    responses: { 201: { description: "Webhook endpoint created; `secret` is shown ONCE - store it now" } },
+  });
+  app.openapi(createWebhookRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const body = c.req.valid("json");
+    const events = parseWebhookEvents(body.events);
+    if (!events) {
+      throw new AppError("VALIDATION", "Events must be a non-empty list of supported event types.", { status: 400 });
+    }
+    const url = await validateWebhookUrl(body.url);
+    const secret = generateWebhookSecret();
+    const row = await createWebhookEndpoint(deps.getDatabase(), {
+      workspaceId: ws,
+      name: webhookName(body.name),
+      url,
+      secretSealed: sealSettingValue(webhookVaultKey(), secret),
+      events,
+    });
+    await deps.authStore.audit({
+      workspaceId: ws, userId: auth.user.id, action: "webhook_endpoint.created",
+      details: { endpointId: row.id, url: row.url, events },
+    });
+    // The raw secret leaves the server only here (and at rotation).
+    return c.json({ ...webhookEndpointView(row), secret }, 201);
+  });
+
+  const listWebhooksRoute = createRoute({
+    method: "get", path: "/settings/webhooks",
+    responses: { 200: { description: "Webhook endpoints (no secret material)" } },
+  });
+  app.openapi(listWebhooksRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const ws = workspaceId(c);
+    const rows = await listWebhookEndpoints(deps.getDatabase(), ws);
+    return c.json({ webhooks: rows.map(webhookEndpointView) });
+  });
+
+  const patchWebhookRoute = createRoute({
+    method: "patch", path: "/settings/webhooks/{id}",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              name: z.string().min(1).max(200).optional(),
+              url: z.string().min(1).max(2000).optional(),
+              events: z.array(z.string()).min(1).optional(),
+              enabled: z.boolean().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Webhook endpoint updated" } },
+  });
+  app.openapi(patchWebhookRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const existing = await loadWebhookEndpoint(ws, c.req.valid("param").id);
+    const body = c.req.valid("json");
+    const patch: Parameters<typeof updateWebhookEndpoint>[3] = {};
+    if (body.name !== undefined) patch.name = webhookName(body.name);
+    if (body.url !== undefined) patch.url = await validateWebhookUrl(body.url);
+    if (body.events !== undefined) {
+      const events = parseWebhookEvents(body.events);
+      if (!events) {
+        throw new AppError("VALIDATION", "Events must be a non-empty list of supported event types.", { status: 400 });
+      }
+      patch.events = events;
+    }
+    if (body.enabled !== undefined) {
+      patch.enabled = body.enabled;
+      if (body.enabled) {
+        // Manual re-enable is the recovery path from auto-disable:
+        // the failure streak and the system stamps reset.
+        patch.consecutiveFailures = 0;
+        patch.disabledAt = null;
+        patch.disabledBySystem = null;
+      }
+    }
+    const row = await updateWebhookEndpoint(db, ws, existing.id, patch);
+    if (!row) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", { status: 404 });
+    await deps.authStore.audit({
+      workspaceId: ws, userId: auth.user.id, action: "webhook_endpoint.updated",
+      details: { endpointId: row.id, fields: Object.keys(patch) },
+    });
+    return c.json(webhookEndpointView(row));
+  });
+
+  const rotateWebhookRoute = createRoute({
+    method: "post", path: "/settings/webhooks/{id}/rotate-secret",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Secret rotated; the new `secret` is shown ONCE and the old one stops working immediately" } },
+  });
+  app.openapi(rotateWebhookRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const existing = await loadWebhookEndpoint(ws, c.req.valid("param").id);
+    const secret = generateWebhookSecret();
+    const row = await updateWebhookEndpoint(deps.getDatabase(), ws, existing.id, {
+      secretSealed: sealSettingValue(webhookVaultKey(), secret),
+    });
+    if (!row) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", { status: 404 });
+    await deps.authStore.audit({
+      workspaceId: ws, userId: auth.user.id, action: "webhook_endpoint.secret_rotated",
+      details: { endpointId: row.id },
+    });
+    return c.json({ ...webhookEndpointView(row), secret });
+  });
+
+  const deleteWebhookRoute = createRoute({
+    method: "delete", path: "/settings/webhooks/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Webhook endpoint and its delivery history deleted" } },
+  });
+  app.openapi(deleteWebhookRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const removed = await deleteWebhookEndpoint(deps.getDatabase(), ws, c.req.valid("param").id);
+    if (!removed) throw new AppError("NOT_FOUND", "Webhook endpoint not found.", { status: 404 });
+    await deps.authStore.audit({
+      workspaceId: ws, userId: auth.user.id, action: "webhook_endpoint.deleted",
+      details: { endpointId: c.req.valid("param").id },
+    });
+    return c.json({ deleted: true });
+  });
+
+  const listWebhookDeliveriesRoute = createRoute({
+    method: "get", path: "/settings/webhooks/{id}/deliveries",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Latest 50 deliveries for the endpoint" } },
+  });
+  app.openapi(listWebhookDeliveriesRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const ws = workspaceId(c);
+    const endpoint = await loadWebhookEndpoint(ws, c.req.valid("param").id);
+    const rows = await listWebhookDeliveries(deps.getDatabase(), ws, endpoint.id, 50);
+    return c.json({ deliveries: rows.map(webhookDeliveryView) });
+  });
+
+  const testWebhookRoute = createRoute({
+    method: "post", path: "/settings/webhooks/{id}/test",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 201: { description: "Test ping enqueued through the normal delivery pipeline" } },
+  });
+  app.openapi(testWebhookRoute, async (c) => {
+    guardWebhookAdmin(c);
+    const auth = authContext(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const endpoint = await loadWebhookEndpoint(ws, c.req.valid("param").id);
+    // Same pipeline as real events: a delivery row + the worker queue.
+    // Works on disabled endpoints too - that is exactly the state an
+    // operator wants to probe before re-enabling.
+    const deliveryId = crypto.randomUUID();
+    const payload = webhookEnvelope({
+      deliveryId,
+      type: WEBHOOK_TEST_EVENT,
+      workspaceId: ws,
+      data: webhookTestData(endpoint.id),
+      at: new Date(),
+    });
+    const row = await createWebhookDelivery(db, {
+      id: deliveryId, endpointId: endpoint.id, workspaceId: ws, event: WEBHOOK_TEST_EVENT, payload,
+    });
+    try {
+      await deps.webhookEnqueuer.enqueueWebhookDelivery(row.id);
+    } catch (err) {
+      throw new AppError(
+        "CONFIGURATION",
+        `Webhook test could not be queued: ${err instanceof Error ? err.message : String(err)}`,
+        { status: 503 },
+      );
+    }
+    await deps.authStore.audit({
+      workspaceId: ws, userId: auth.user.id, action: "webhook_endpoint.test_sent",
+      details: { endpointId: endpoint.id, deliveryId: row.id },
+    });
+    return c.json(webhookDeliveryView(row), 201);
   });
 
   app.doc("/doc", {

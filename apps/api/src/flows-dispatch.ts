@@ -1,6 +1,6 @@
 import {
   addContactTag, advanceBroadcastRecipientByProviderId, advanceConversationLastUserMessage, advanceMessageStatusByProviderId,
-  broadcastRecipientTransition, claimFlowWaitByConversation, createContact, createConversation, createMessage,
+  broadcastRecipientTransition, claimFlowWaitByConversation, createContact, createConversation, insertConversation, createMessage,
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
@@ -11,6 +11,7 @@ import {
   commentTriggerConfig, flowTriggerMatches, type FlowState, type FlowTrigger,
 } from "@botara/flow-engine";
 import type { InboundEvent, MessageMedia } from "@botara/channels";
+import { webhookMessagePreview, type OutboundWebhookEvent } from "@botara/shared";
 import type { RealtimePublisher } from "./realtime-publish";
 
 /**
@@ -130,6 +131,22 @@ export interface CommentActionEnqueuer {
 }
 
 /**
+ * Outbound event webhooks (package #10): after the dispatcher persists
+ * something noteworthy, the emitter fans it out to the workspace's
+ * subscribed endpoints (one delivery row + one queue job each).
+ * CONTRACT: implementations guard internally and the dispatcher guards
+ * again - a webhook failure (DB, Redis, anything) must never break
+ * message processing or delay a provider acknowledgment.
+ */
+export interface OutboundWebhookEmitter {
+  emit(input: {
+    workspaceId: string;
+    type: OutboundWebhookEvent;
+    data: Record<string, unknown>;
+  }): Promise<void>;
+}
+
+/**
  * A webchat visitor message that the public widget route has ALREADY
  * persisted (typed message or button click). The dispatcher must NOT
  * persist it again - it only evaluates flow triggers and enqueues runs.
@@ -217,7 +234,12 @@ export interface DispatchStore {
   /** Insert-or-update one contact from a coexistence state sync (name refresh). */
   upsertSyncedContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }): Promise<void>;
   findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string; externalId?: string | null } | null>;
-  createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }): Promise<{ id: string; externalId?: string | null }>;
+  /**
+   * Create a conversation. `createdNew` is false when the repository's
+   * race backstop (#0) reused a concurrent winner's thread instead of
+   * inserting - outbound webhooks (#10) announce only genuine creations.
+   */
+  createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }): Promise<{ id: string; externalId?: string | null; createdNew: boolean }>;
   /**
    * Backfill a conversation's provider id (TikTok conversation_id) when
    * an inbound event carries one the stored conversation does not have
@@ -251,21 +273,23 @@ export interface DispatchStore {
   /**
    * Broadcast recipient mirror (package #4): advance the recipient row
    * carrying this provider message id from a provider status webhook.
-   * Optional: stores without recipient tracking simply skip it.
+   * Optional: stores without recipient tracking simply skip it. Returns
+   * the advanced row's identity, or null when nothing moved (package
+   * #10 emits message.status only for real advancements).
    */
   advanceBroadcastRecipientByProviderId?(input: {
     workspaceId: string; providerMessageId: string;
     status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
-  }): Promise<void>;
+  }): Promise<{ recipientId: string; broadcastId: string; contactId: string } | null>;
   /**
    * Inbox message mirror (package #8): advance the outbound inbox
    * message row carrying this provider message id (delivered/read
-   * receipts). Optional, same rationale as above.
+   * receipts). Optional, same rationale as above; same return contract.
    */
   advanceMessageStatusByProviderId?(input: {
     workspaceId: string; providerMessageId: string;
     status: "sent" | "delivered" | "read" | "failed"; at: Date; error?: string;
-  }): Promise<void>;
+  }): Promise<{ messageId: string; conversationId: string } | null>;
   /**
    * Broadcast recipient mirror (package #4): attribute a contact's
    * inbound message as a reply to their latest still-open broadcast.
@@ -305,8 +329,8 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
       return row ? { id: row.id, externalId: row.externalId } : null;
     },
     async createConversation(input) {
-      const row = await createConversation(getDatabase(), input);
-      return { id: row.id, externalId: row.externalId };
+      const { row, created } = await insertConversation(getDatabase(), input);
+      return { id: row.id, externalId: row.externalId, createdNew: created };
     },
     async setConversationExternalId(conversationId, externalId) {
       await updateConversationExternalId(getDatabase(), conversationId, externalId);
@@ -366,7 +390,7 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
       await updateContact(getDatabase(), workspaceId, contactId, { customFields: { [field]: value } });
     },
     async advanceBroadcastRecipientByProviderId(input) {
-      await advanceBroadcastRecipientByProviderId(getDatabase(), {
+      return advanceBroadcastRecipientByProviderId(getDatabase(), {
         workspaceId: input.workspaceId,
         providerMessageId: input.providerMessageId,
         to: input.status,
@@ -375,7 +399,7 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
       });
     },
     async advanceMessageStatusByProviderId(input) {
-      await advanceMessageStatusByProviderId(getDatabase(), {
+      return advanceMessageStatusByProviderId(getDatabase(), {
         workspaceId: input.workspaceId,
         providerMessageId: input.providerMessageId,
         to: input.status,
@@ -443,7 +467,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   async createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }) {
     const conversation = { id: crypto.randomUUID(), ...input };
     this.conversations.set(conversation.id, conversation);
-    return conversation;
+    return { ...conversation, createdNew: true };
   }
 
   async setConversationExternalId(conversationId: string, externalId: string) {
@@ -534,8 +558,9 @@ export class InMemoryDispatchStore implements DispatchStore {
       Object.assign(row, patch);
       if (input.status === "failed") row.error = input.error ?? null;
       if (input.status === "sent") row.error = null;
-      return;
+      return { recipientId: row.id, broadcastId: row.broadcastId, contactId: row.contactId };
     }
+    return null;
   }
 
   async markBroadcastRecipientReplied(input: { workspaceId: string; contactId: string; at: Date }) {
@@ -559,9 +584,13 @@ export class InMemoryDispatchStore implements DispatchStore {
       const conversation = this.conversations.get(m.conversationId);
       if (!conversation || conversation.workspaceId !== input.workspaceId) continue;
       const next = messageStatusTransition(m.status ?? "queued", input.status);
-      if (next) m.status = next;
-      return;
+      if (next) {
+        m.status = next;
+        return { messageId: m.id ?? input.providerMessageId, conversationId: m.conversationId };
+      }
+      return null;
     }
+    return null;
   }
 }
 
@@ -585,6 +614,8 @@ export interface FlowDispatcherDeps {
   commentEnqueuer?: CommentActionEnqueuer;
   /** Inbox live updates: notified once per newly persisted inbound message. */
   publisher?: RealtimePublisher;
+  /** Outbound event webhooks (#10): lifecycle events for subscribed endpoints. */
+  webhookEmitter?: OutboundWebhookEmitter;
   /**
    * Inbound media pipeline (optional): when wired, media-carrying
    * inbound messages, echoes and history items get their bytes copied
@@ -630,7 +661,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     accountId: string,
     contactId: string,
     conversationExternalId?: string,
-  ): Promise<{ id: string }> {
+  ): Promise<{ id: string; createdNew: boolean }> {
     const existing = await deps.store.findOpenConversation({ workspaceId, channelAccountId: accountId, contactId });
     if (existing) {
       // Backfill the provider conversation id when this event carries one
@@ -639,7 +670,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       if (conversationExternalId && !existing.externalId && deps.store.setConversationExternalId) {
         await deps.store.setConversationExternalId(existing.id, conversationExternalId).catch(() => undefined);
       }
-      return existing;
+      return { ...existing, createdNew: false };
     }
     const created = await deps.store.createConversation({
       workspaceId, channelAccountId: accountId, contactId,
@@ -649,11 +680,31 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     // partial unique index: when a concurrent event won the create race,
     // createConversation returns THAT thread instead of a fresh row - in
     // which case it may still lack the provider id this event carries,
-    // so run the same backfill as the existing-thread branch above.
+    // so run the same backfill as the existing-thread branch above. The
+    // store's `createdNew` flag carries the distinction (#10 announces
+    // only genuine creations).
     if (conversationExternalId && !created.externalId && deps.store.setConversationExternalId) {
       await deps.store.setConversationExternalId(created.id, conversationExternalId).catch(() => undefined);
     }
     return created;
+  }
+
+  /**
+   * Outbound webhook emission (package #10): pure bookkeeping next to
+   * the broadcast-reply attribution - wrapped so an emitter failure is
+   * a log line, never a dispatch failure.
+   */
+  async function emitWebhook(input: {
+    workspaceId: string;
+    type: OutboundWebhookEvent;
+    data: Record<string, unknown>;
+  }): Promise<void> {
+    if (!deps.webhookEmitter) return;
+    try {
+      await deps.webhookEmitter.emit(input);
+    } catch (err) {
+      log({ event: "outbound_webhook_emit_failed", workspaceId: input.workspaceId, type: input.type, error: err instanceof Error ? err.message : String(err) });
+    }
   }
 
   /**
@@ -796,6 +847,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     );
 
     let messagePersisted = false;
+    let persistedMessageId: string | null = null;
     if (event.type === "message.received") {
       const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
       if (!existing) {
@@ -814,6 +866,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
         });
         await deps.store.touchConversationLastUserMessage(conversation.id, new Date(event.receivedAt));
         messagePersisted = true;
+        persistedMessageId = created.id;
         // Live inbox: exactly one event per NEWLY persisted message -
         // webhook redeliveries (the `existing` branch) publish nothing.
         if (deps.publisher) {
@@ -825,6 +878,44 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           }).catch(() => undefined);
         }
       }
+    }
+
+    // --- outbound webhooks (package #10): lifecycle announcements for
+    // subscribed operator endpoints. conversation.created fires only
+    // for a GENUINELY new thread (the store's createdNew flag - the #0
+    // race-fallback reuse announces nothing); message.received fires
+    // only for a newly persisted message (webhook redeliveries stay
+    // silent). Dispatcher-persisted messages are never internal notes -
+    // notes exist only through the inbox API and never pass this seam.
+    if (conversation.createdNew) {
+      await emitWebhook({
+        workspaceId,
+        type: "conversation.created",
+        data: {
+          conversationId: conversation.id,
+          channelAccountId: account.id,
+          channel: event.channel,
+          contactId: contact.id,
+        },
+      });
+    }
+    if (event.type === "message.received" && messagePersisted) {
+      const preview = webhookMessagePreview(event.text);
+      await emitWebhook({
+        workspaceId,
+        type: "message.received",
+        data: {
+          messageId: persistedMessageId,
+          conversationId: conversation.id,
+          channelAccountId: account.id,
+          channel: event.channel,
+          contactId: contact.id,
+          direction: "in",
+          externalId: event.messageExternalId,
+          ...(preview !== undefined ? { preview } : {}),
+          receivedAt: new Date(event.receivedAt).toISOString(),
+        },
+      });
     }
 
     // --- broadcast reply attribution (package #4): a NEWLY persisted
@@ -920,9 +1011,11 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     const account = await resolveAccount(event);
     if (!account) return;
     const firstError = event.errors?.[0];
+    let recipientAdvanced: { recipientId: string; broadcastId: string; contactId: string } | null = null;
+    let messageAdvanced: { messageId: string; conversationId: string } | null = null;
     if (deps.store.advanceBroadcastRecipientByProviderId) {
       try {
-        await deps.store.advanceBroadcastRecipientByProviderId({
+        recipientAdvanced = await deps.store.advanceBroadcastRecipientByProviderId({
           workspaceId: account.workspaceId,
           providerMessageId: event.messageExternalId,
           status: event.status,
@@ -937,7 +1030,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     }
     if (deps.store.advanceMessageStatusByProviderId) {
       try {
-        await deps.store.advanceMessageStatusByProviderId({
+        messageAdvanced = await deps.store.advanceMessageStatusByProviderId({
           workspaceId: account.workspaceId,
           providerMessageId: event.messageExternalId,
           status: event.status,
@@ -946,6 +1039,34 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       } catch (err) {
         log({ event: "message_status_advance_failed", workspaceId: account.workspaceId, messageExternalId: event.messageExternalId, error: String(err) });
       }
+    }
+    // Outbound webhooks (package #10): announce only REAL advancements -
+    // a duplicate or out-of-order receipt that moved nothing stays
+    // silent, like the mirrors themselves.
+    if (recipientAdvanced || messageAdvanced) {
+      await emitWebhook({
+        workspaceId: account.workspaceId,
+        type: "message.status",
+        data: {
+          channel: event.channel,
+          channelAccountId: account.id,
+          providerMessageId: event.messageExternalId,
+          status: event.status,
+          ...(messageAdvanced
+            ? { messageId: messageAdvanced.messageId, conversationId: messageAdvanced.conversationId }
+            : {}),
+          ...(recipientAdvanced
+            ? {
+                broadcastId: recipientAdvanced.broadcastId,
+                recipientId: recipientAdvanced.recipientId,
+                contactId: recipientAdvanced.contactId,
+              }
+            : {}),
+          ...(firstError
+            ? { error: firstError.message ?? firstError.title ?? `provider error ${firstError.code}` }
+            : {}),
+        },
+      });
     }
   }
 
@@ -1187,6 +1308,7 @@ export interface DbFlowDispatcherDeps {
   commentEnqueuer?: CommentActionEnqueuer;
   publisher?: RealtimePublisher;
   mediaPort?: InboundMediaPort;
+  webhookEmitter?: OutboundWebhookEmitter;
 }
 
 export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowDispatcher {
@@ -1196,6 +1318,7 @@ export function createDbFlowDispatcher(deps: DbFlowDispatcherDeps): InboundFlowD
     commentEnqueuer: deps.commentEnqueuer,
     publisher: deps.publisher,
     mediaPort: deps.mediaPort,
+    webhookEmitter: deps.webhookEmitter,
   });
 }
 
