@@ -38,3 +38,39 @@ export function evaluateLongLivedRefresh(input: LongLivedRefreshInput): RefreshD
   if (ageMs < minAgeHours * 3600 * 1000) return { action: "skip", reason: "too-early" };
   return { action: "refresh" };
 }
+
+/**
+ * Short-lived OAuth pair decisions (TikTok tt_user tokens).
+ *
+ * The semantics differ from Meta's long-lived rule in the one way that
+ * matters: the ACCESS token lives ~24h, but the REFRESH token is the
+ * long-lived credential, so an already-expired access token CAN still be
+ * refreshed - "expired" is a refresh trigger here, never a dead end. The
+ * refresh token's own lifetime is the platform's reauthorization deadline
+ * (public sources conflict - ~30 days vs ~365 days - so nothing in this
+ * decision depends on it: refresh early and often, and a failed refresh
+ * surfaces as needs-reauthorization at the call site either way).
+ */
+
+export type ShortLivedRefreshDecision =
+  | { action: "refresh"; reason: "expired" | "expiring" }
+  | { action: "skip"; reason: "unknown-expiry" | "fresh" };
+
+export interface ShortLivedRefreshInput {
+  /** ISO timestamp when the current ACCESS token expires. */
+  expiresAt?: string | null;
+  now: Date;
+  /** Refresh once the remaining lifetime drops to this many minutes (default 30). */
+  refreshBeforeMinutes?: number;
+}
+
+export function evaluateShortLivedRefresh(input: ShortLivedRefreshInput): ShortLivedRefreshDecision {
+  if (!input.expiresAt) return { action: "skip", reason: "unknown-expiry" };
+  const expiresMs = Date.parse(input.expiresAt);
+  if (Number.isNaN(expiresMs)) return { action: "skip", reason: "unknown-expiry" };
+  const remainingMs = expiresMs - input.now.getTime();
+  if (remainingMs <= 0) return { action: "refresh", reason: "expired" };
+  const thresholdMs = (input.refreshBeforeMinutes ?? 30) * 60 * 1000;
+  if (remainingMs <= thresholdMs) return { action: "refresh", reason: "expiring" };
+  return { action: "skip", reason: "fresh" };
+}

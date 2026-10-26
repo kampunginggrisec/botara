@@ -40,6 +40,17 @@ describe("VaultCredentialProvider (Fase 3)", () => {
     expect(secrets.accessToken).toBe("from-env");
   });
 
+  test("app-level slots still fill from the fallback when a vault token resolves (TikTok refresh needs them)", async () => {
+    const provider = new VaultCredentialProvider(
+      { async getSecret() { return "vault-pair-json"; } },
+      new StaticCredentialProvider({ appId: "app-1", appSecret: "sec-1", accessToken: "env-token-must-not-win" }),
+    );
+    const secrets = await provider.resolve(account("vault:db:entry-2"));
+    expect(secrets.accessToken).toBe("vault-pair-json");
+    expect(secrets.appId).toBe("app-1");
+    expect(secrets.appSecret).toBe("sec-1");
+  });
+
   test("accounts without a ref delegate entirely to the fallback", async () => {
     const provider = new VaultCredentialProvider(
       { async getSecret() { throw new Error("vault must not be consulted"); } },

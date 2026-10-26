@@ -17,6 +17,8 @@ export interface EnvCredentialProviderOptions {
   appSecretEnv?: string;
   /** Env var holding a non-Meta webhook signing secret (Resend/Svix whsec_). */
   webhookSecretEnv?: string;
+  /** Env var holding a public app id / client key (TikTok tt_user OAuth). */
+  appIdEnv?: string;
   env?: Record<string, string | undefined>;
 }
 
@@ -36,6 +38,7 @@ export class EnvCredentialProvider implements CredentialProvider {
   private readonly botTokenEnv?: string;
   private readonly appSecretEnv?: string;
   private readonly webhookSecretEnv?: string;
+  private readonly appIdEnv?: string;
   private readonly env: Record<string, string | undefined>;
 
   constructor(options: EnvCredentialProviderOptions = {}) {
@@ -43,6 +46,7 @@ export class EnvCredentialProvider implements CredentialProvider {
     this.botTokenEnv = options.botTokenEnv;
     this.appSecretEnv = options.appSecretEnv;
     this.webhookSecretEnv = options.webhookSecretEnv;
+    this.appIdEnv = options.appIdEnv;
     this.env = options.env ?? process.env;
   }
 
@@ -55,6 +59,7 @@ export class EnvCredentialProvider implements CredentialProvider {
       botToken: fromRef ?? (this.botTokenEnv ? this.env[this.botTokenEnv] : undefined),
       appSecret: this.appSecretEnv ? this.env[this.appSecretEnv] : undefined,
       webhookSecret: this.webhookSecretEnv ? this.env[this.webhookSecretEnv] : undefined,
+      appId: this.appIdEnv ? this.env[this.appIdEnv] : undefined,
     };
   }
 }
@@ -76,6 +81,12 @@ export interface VaultSecretResolver {
  * 3. Otherwise the call delegates to the fallback provider (typically the
  *    per-channel EnvCredentialProvider).
  *
+ * App-level slots (appId / appSecret / webhookSecret) are NOT account
+ * secrets: when a vault token resolves, those slots are still filled from
+ * the fallback provider, because token-refresh calls (TikTok tt_user
+ * OAuth) need the app credentials alongside the account's token pair.
+ * Token slots themselves never fall through once a vault secret resolved.
+ *
  * Secrets are resolved at send-time and never cached on the account row.
  */
 export class VaultCredentialProvider implements CredentialProvider {
@@ -87,15 +98,28 @@ export class VaultCredentialProvider implements CredentialProvider {
 
   async resolve(account: ChannelAccountRef): Promise<ChannelSecrets> {
     const ref = account.tokenVaultRef;
+    let tokenSlots: ChannelSecrets | null = null;
     if (ref?.startsWith("vault:")) {
       const secret = await this.vault.getSecret(ref);
-      if (secret) return { accessToken: secret, botToken: secret };
+      if (secret) tokenSlots = { accessToken: secret, botToken: secret };
     } else if (ref?.startsWith("env:")) {
       const value = this.env[ref.slice("env:".length)];
-      if (value) return { accessToken: value, botToken: value };
+      if (value) tokenSlots = { accessToken: value, botToken: value };
     }
-    if (this.fallback) return this.fallback.resolve(account);
-    return {};
+    if (!tokenSlots) {
+      if (this.fallback) return this.fallback.resolve(account);
+      return {};
+    }
+    if (this.fallback) {
+      const appLevel = await this.fallback.resolve(account).catch(() => ({} as ChannelSecrets));
+      return {
+        ...tokenSlots,
+        appSecret: appLevel.appSecret,
+        webhookSecret: appLevel.webhookSecret,
+        appId: appLevel.appId,
+      };
+    }
+    return tokenSlots;
   }
 }
 
@@ -114,6 +138,7 @@ export class CompositeCredentialProvider implements CredentialProvider {
       merged.botToken ??= secrets.botToken;
       merged.appSecret ??= secrets.appSecret;
       merged.webhookSecret ??= secrets.webhookSecret;
+      merged.appId ??= secrets.appId;
     }
     return merged;
   }
@@ -137,3 +162,10 @@ export const envThreadsCredentials = (): CredentialProvider =>
 
 export const envEmailCredentials = (): CredentialProvider =>
   new EnvCredentialProvider({ tokenEnv: "RESEND_API_KEY", webhookSecretEnv: "RESEND_WEBHOOK_SECRET" });
+
+export const envTikTokCredentials = (): CredentialProvider =>
+  new EnvCredentialProvider({
+    tokenEnv: "TIKTOK_ACCESS_TOKEN",
+    appSecretEnv: "TIKTOK_APP_SECRET",
+    appIdEnv: "TIKTOK_APP_ID",
+  });

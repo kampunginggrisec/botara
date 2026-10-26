@@ -39,6 +39,31 @@ describe("capability matrix", () => {
     expect(CHANNEL_CAPABILITIES.webchat.catalog).toBe(false);
   });
 
+  test("tiktok is reactive-only: no initiation, no broadcast, 48h window, 10-message cap, reply-card buttons", () => {
+    const caps = CHANNEL_CAPABILITIES.tiktok;
+    expect(caps.canDM).toBe(true);
+    expect(caps.canBroadcast).toBe(false);
+    expect(caps.canInitiate).toBe(false);
+    expect(caps.windowHours).toBe(48);
+    expect(caps.maxConsecutiveOutbound).toBe(10);
+    expect(caps.richButtonStyle).toBe("reply-card");
+    expect(caps.richButtons).toBe(true);
+    expect(caps.richLists).toBe(false);
+    expect(caps.carousel).toBe(false);
+    expect(caps.catalog).toBe(false);
+    expect(caps.canPublish).toBe(false);
+    // Public comment moderation lives in TikTok's separate Accounts API.
+    expect(caps.canReplyToComments).toBe(false);
+    expect(caps.canHideComments).toBe(false);
+  });
+
+  test("tiktok resolves to the REAL adapter in the registry", () => {
+    const adapter = getAdapter("tiktok");
+    expect(adapter.key).toBe("tiktok");
+    expect(adapter.apiVersion).toBe("v1.3");
+    expect(adapter.capabilities.canBroadcast).toBe(false);
+  });
+
   test("threads resolves to the REAL adapter in Fase 2, and it still cannot DM", async () => {
     const threads = getAdapter("threads");
     expect(threads.capabilities.canDM).toBe(false);

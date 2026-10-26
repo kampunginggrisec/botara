@@ -23,11 +23,12 @@ export {
   StaticCredentialProvider, EnvCredentialProvider, VaultCredentialProvider,
   CompositeCredentialProvider, envWhatsAppCredentials,
   envTelegramCredentials, envInstagramCredentials, envMessengerCredentials,
-  envThreadsCredentials, envEmailCredentials,
+  envThreadsCredentials, envEmailCredentials, envTikTokCredentials,
   type EnvCredentialProviderOptions, type VaultSecretResolver,
 } from "./credentials";
 export {
   evaluateLongLivedRefresh, type RefreshDecision, type LongLivedRefreshInput,
+  evaluateShortLivedRefresh, type ShortLivedRefreshDecision, type ShortLivedRefreshInput,
 } from "./token-lifecycle";
 export {
   WhatsAppAdapter, routeForTemplateCategory, mapWhatsAppError,
@@ -56,3 +57,11 @@ export {
   EmailAdapter, verifyResendWebhookSignature,
   type EmailAdapterOptions, type InboundEmailContent,
 } from "./email";
+export {
+  TikTokAdapter, buildTikTokAuthorizeUrl, verifyTikTokWebhookSignature,
+  parseTikTokTokenPair, serializeTikTokTokenPair, configureTikTokTokenPersistence,
+  normalizeTikTokMessage, TIKTOK_BUSINESS_API_BASE, TIKTOK_OAUTH_BASE,
+  TIKTOK_OAUTH_SCOPES, TIKTOK_HIGH_INTENT_COMMENT_EVENT,
+  type TikTokAdapterOptions, type TikTokTokenPair, type TikTokInboundMessage,
+  type TikTokConversationSummary, type TikTokTokenPersistenceHandler,
+} from "./tiktok";

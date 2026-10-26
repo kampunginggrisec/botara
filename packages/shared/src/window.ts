@@ -24,11 +24,24 @@ export interface ReplyWindowDecision {
   reason: string;
 }
 
-/** Channels with a Meta-style user-message window for free-form replies. */
-const WINDOW_ENFORCED_CHANNELS = new Set(["whatsapp", "instagram", "messenger"]);
+/** Channels with a user-message window for free-form replies. */
+const WINDOW_ENFORCED_CHANNELS = new Set(["whatsapp", "instagram", "messenger", "tiktok"]);
+
+/**
+ * Per-channel window length in hours when it differs from the Meta 24h
+ * default. TikTok Business Messaging allows replies for 48 hours after the
+ * customer's last message (TikTok API for Business v1.3 rules) - and unlike
+ * Meta there is NO template/utility escape hatch outside the window.
+ */
+const CHANNEL_WINDOW_HOURS: Record<string, number> = { tiktok: 48 };
 
 export function channelEnforcesWindow(channel: string): boolean {
   return WINDOW_ENFORCED_CHANNELS.has(channel);
+}
+
+/** The reply-window length (hours) a channel enforces by default. */
+export function channelWindowHours(channel: string): number {
+  return CHANNEL_WINDOW_HOURS[channel] ?? WHATSAPP_FREE_FORM_WINDOW_HOURS;
 }
 
 /**
@@ -50,7 +63,7 @@ export function evaluateReplyWindow(input: {
     };
   }
   const windowOpen = isWithinWindow(
-    input.lastUserMessageAt, input.now, input.windowHours ?? WHATSAPP_FREE_FORM_WINDOW_HOURS,
+    input.lastUserMessageAt, input.now, input.windowHours ?? channelWindowHours(input.channel),
   );
   if (input.kind === "template") {
     return {
@@ -77,5 +90,34 @@ export class MessagingWindowClosedError extends AppError {
       { status: 422, details: { channel } },
     );
     this.name = "MessagingWindowClosedError";
+  }
+}
+
+/**
+ * Count the business (outbound) messages sent SINCE the customer's last
+ * inbound message, over a conversation's rows in chronological order.
+ * TikTok Business Messaging caps this at 10 per reply window: the business
+ * may send at most 10 consecutive messages before the customer speaks
+ * again. Pure helper - the API reply route and the worker send processor
+ * both count through it so the rule can never drift between call sites.
+ */
+export function countConsecutiveOutbound(rows: Array<{ direction: string }>): number {
+  let count = 0;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i]!.direction !== "out") break;
+    count++;
+  }
+  return count;
+}
+
+/** Typed error raised when a channel's consecutive-outbound cap is hit. */
+export class ConsecutiveSendCapError extends AppError {
+  constructor(channel: string, cap: number, consecutive: number) {
+    super(
+      "CONSECUTIVE_SEND_CAP",
+      `Cannot send on ${channel}: ${consecutive} consecutive business messages already sent since the customer's last message (provider cap: ${cap}). Wait for the customer to reply.`,
+      { status: 422, details: { channel, cap, consecutive } },
+    );
+    this.name = "ConsecutiveSendCapError";
   }
 }

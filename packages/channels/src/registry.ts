@@ -1,13 +1,14 @@
 import { NotImplementedError } from "@botara/shared";
 import {
   envEmailCredentials, envInstagramCredentials, envMessengerCredentials,
-  envTelegramCredentials, envThreadsCredentials, envWhatsAppCredentials,
+  envTelegramCredentials, envThreadsCredentials, envTikTokCredentials, envWhatsAppCredentials,
 } from "./credentials";
 import { EmailAdapter } from "./email";
 import { InstagramAdapter } from "./instagram";
 import { MessengerAdapter } from "./messenger";
 import { TelegramAdapter } from "./telegram";
 import { ThreadsAdapter } from "./threads";
+import { TikTokAdapter } from "./tiktok";
 import { WebchatAdapter } from "./webchat";
 import { WhatsAppAdapter } from "./whatsapp";
 import {
@@ -77,6 +78,7 @@ function credentialsFor(key: ChannelKey): CredentialProvider {
     case "messenger": return envMessengerCredentials();
     case "threads": return envThreadsCredentials();
     case "email": return envEmailCredentials();
+    case "tiktok": return envTikTokCredentials();
     case "webchat": return envWhatsAppCredentials(); // unused - webchat resolves no secrets
   }
 }
@@ -103,6 +105,8 @@ function createDefaultAdapter(key: ChannelKey): ChannelAdapter {
       return new ThreadsAdapter({ credentials: credentialsFor(key) });
     case "email":
       return new EmailAdapter({ credentials: credentialsFor(key) });
+    case "tiktok":
+      return new TikTokAdapter({ credentials: credentialsFor(key) });
     case "webchat":
       return new WebchatAdapter();
   }

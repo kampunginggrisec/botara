@@ -15,6 +15,29 @@ export interface CapabilitySet {
   canBroadcast: boolean;
   /** Provider natively supports scheduled sends (false = Botara schedules via its own queue). */
   canScheduleNatively: boolean;
+  /**
+   * May the business START a conversation (broadcasts, sequences, cold
+   * outreach)? Default true when omitted. false = reactive-only channel:
+   * the customer must always speak first (TikTok Business Messaging).
+   */
+  canInitiate?: boolean;
+  /**
+   * Free-form reply window length in hours when the channel enforces one
+   * (mirrors @botara/shared window policy: Meta 24h, TikTok 48h).
+   */
+  windowHours?: number;
+  /**
+   * Max consecutive business messages allowed after the customer's last
+   * message (TikTok: 10). Enforced by the API reply route and the worker
+   * send processor via the shared consecutive-outbound counter.
+   */
+  maxConsecutiveOutbound?: number;
+  /**
+   * How rich "buttons" blocks render: "native" (default) interactive
+   * buttons, or "reply-card" (TikTok QA cards: reply buttons only, no URL
+   * buttons, a tap sends the button title as the customer's reply).
+   */
+  richButtonStyle?: "native" | "reply-card";
   /** Rich blocks: native interactive reply/url/postback buttons. */
   richButtons: boolean;
   /** Rich blocks: native list-picker messages. */
@@ -30,7 +53,7 @@ export interface CapabilitySet {
   notes?: string;
 }
 
-export type ChannelKey = "whatsapp" | "instagram" | "messenger" | "threads" | "telegram" | "email" | "webchat";
+export type ChannelKey = "whatsapp" | "instagram" | "messenger" | "threads" | "telegram" | "email" | "webchat" | "tiktok";
 
 /**
  * Capability matrix — verified against Meta's current docs on 2026-10-22.
@@ -84,6 +107,13 @@ export const CHANNEL_CAPABILITIES: Record<ChannelKey, CapabilitySet> = {
     canLike: false, canFetchInsights: false, canBroadcast: false, canScheduleNatively: false,
     richButtons: true, richLists: true, carousel: false, catalog: false,
     notes: "Botara's own website widget (Meta's Customer Chat Plugin retired 2024-05-09, no replacement). Messages persist in Botara's DB via a store port - there is no external API. Rich buttons and lists render natively in the widget as clickable buttons (a tap posts the button payload back, where flow postback/keyword triggers match it); carousel/product/catalog blocks degrade to formatted plain text (typed warning).",
+  },
+  tiktok: {
+    canDM: true, canPublish: false, canReplyToComments: false, canHideComments: false,
+    canLike: false, canFetchInsights: false, canBroadcast: false, canScheduleNatively: false,
+    richButtons: true, richLists: false, carousel: false, catalog: false,
+    canInitiate: false, windowHours: 48, maxConsecutiveOutbound: 10, richButtonStyle: "reply-card",
+    notes: "TikTok Business Messaging API v1.3 (Open Beta, access-gated). REACTIVE ONLY: no business-initiated messages, no broadcasts, no outside-window templates. Replies live inside a 48h window from the customer's last message, max 10 consecutive business messages per window. Sends are addressed by provider conversation_id, never by user id. Rich buttons render as QA reply cards (reply buttons only - no URL buttons; links inside DMs are not clickable; a tap sends the button title as the customer's message). Public comment reply/hide live in TikTok's separate Accounts API (not this package); comment-to-DM covers TikTok-flagged high-intent comments for businesses registered in VN/ID/TH only. Image sending is market-gated per conversation (IMAGE_SEND capability). Access tokens live ~24h and rotate on refresh.",
   },
 };
 
@@ -146,8 +176,8 @@ export interface SyncedContact {
 
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
-  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral }
-  | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string }
+  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral; conversationExternalId?: string }
+  | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; conversationExternalId?: string }
   | { type: "contacts.synced"; channel: ChannelKey; accountExternalId: string; contacts: SyncedContact[]; receivedAt: string }
   | { type: "message.history"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; direction: "in" | "out"; text?: string; media?: MessageMedia; receivedAt: string }
   | { type: "comment.received"; channel: ChannelKey; accountExternalId: string; postExternalId: string; commentExternalId: string; text?: string; authorExternalId?: string; parentPostExternalId?: string; receivedAt: string }
@@ -201,6 +231,19 @@ export interface SendInput {
    * `text` should carry the block's own text for non-rich consumers.
    */
   rich?: RichBlock;
+  /**
+   * Provider conversation id for conversation-addressed channels
+   * (TikTok): sends go to a conversation, not to a user. Callers resolve
+   * it from the persisted conversation row; the adapter refuses to send
+   * without it (or without commentReplyExternalId) rather than guessing.
+   */
+  conversationExternalId?: string;
+  /**
+   * TikTok comment-to-DM: the high-intent comment id this send replies to
+   * (direct_reply). Used INSTEAD of conversationExternalId for the first
+   * message that opens a DM from a comment; mutually exclusive with it.
+   */
+  commentReplyExternalId?: string;
   /** REQUIRED: providers are called with this key so retries never double-send. */
   idempotencyKey: string;
 }
@@ -243,7 +286,13 @@ export interface ChannelAdapter {
 
   connect(input: { workspaceId: string; authCode?: string }): Promise<ChannelAccountRef>;
   disconnect(account: ChannelAccountRef): Promise<void>;
-  refreshTokenIfNeeded(account: ChannelAccountRef): Promise<{ refreshed: boolean; expiresAt?: string }>;
+  /**
+   * Refresh the account's access token when the channel's lifecycle says
+   * it is due. `rotatedSecret` is set when the provider ROTATES the
+   * credential itself (TikTok OAuth pairs): the caller MUST persist it
+   * back into the vault, or the next refresh uses a dead refresh token.
+   */
+  refreshTokenIfNeeded(account: ChannelAccountRef): Promise<{ refreshed: boolean; expiresAt?: string; rotatedSecret?: string }>;
   send(input: SendInput): Promise<SendResult>;
 
   publish?(input: PublishInput): Promise<{ externalPostId: string }>;
@@ -269,6 +318,12 @@ export interface ChannelSecrets {
   appSecret?: string;
   /** Webhook signing secret for non-Meta providers (Resend/Svix `whsec_...`). */
   webhookSecret?: string;
+  /**
+   * Public app id / client key when a token call needs it alongside the
+   * secret (TikTok tt_user OAuth: client_key + client_secret). App ids are
+   * not secret, but they travel with the credential set for convenience.
+   */
+  appId?: string;
 }
 
 /**
