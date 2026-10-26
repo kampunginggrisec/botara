@@ -215,6 +215,43 @@ describe("OAuth start + callback", () => {
     expect(location).toContain("state=");
   });
 
+  test("threads start via browser navigation (cookie session + ?workspace_id=) -> 302", async () => {
+    const app = createApp(testDeps({
+      env: { SESSION_SECRET: "test-session-secret", THREADS_APP_ID: "th-123" },
+    }));
+    const reg = await registerUser(app);
+    const res = await app.request(`/channels/threads/oauth/start?workspace_id=${reg.workspaceId}`, {
+      headers: { cookie: `botara_session=${reg.token}` },
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location") ?? "").toContain("threads.net/oauth/authorize");
+  });
+
+  test("oauth start with ?workspace_id= of a non-member workspace -> 403", async () => {
+    const app = createApp(testDeps({
+      env: { SESSION_SECRET: "test-session-secret", THREADS_APP_ID: "th-123" },
+    }));
+    const reg = await registerUser(app);
+    const other = await registerUser(app, "other@example.com", "Other");
+    const res = await app.request(`/channels/threads/oauth/start?workspace_id=${other.workspaceId}`, {
+      headers: { cookie: `botara_session=${reg.token}` },
+      redirect: "manual",
+    });
+    expect(res.status).toBe(403);
+  });
+
+  test("query workspace selector does not authorize mutating requests", async () => {
+    const app = createApp(testDeps({ env: { SESSION_SECRET: "test-session-secret" } }));
+    const reg = await registerUser(app);
+    const res = await app.request(`/channels/telegram/connect?workspace_id=${reg.workspaceId}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", cookie: `botara_session=${reg.token}` },
+      body: JSON.stringify({ botToken: "123456:fake-token-value" }),
+    });
+    expect(res.status).toBeGreaterThanOrEqual(400);
+  });
+
   test("messenger start without META_APP_ID -> 503", async () => {
     const app = createApp(testDeps());
     const reg = await registerUser(app);

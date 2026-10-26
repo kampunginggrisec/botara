@@ -1888,7 +1888,11 @@ function ChannelsPage() {
     }
   };
 
-  const oauthHref = (channel: string, extra = "") => `${BASE_URL}/channels/${channel}/oauth/start${extra}`;
+  const oauthHref = (channel: string, extra = "") => {
+    const params = new URLSearchParams(extra.startsWith("?") ? extra.slice(1) : extra);
+    params.set("workspace_id", workspaceId);
+    return `${BASE_URL}/channels/${channel}/oauth/start?${params.toString()}`;
+  };
   const workspaceId = getWorkspaceId();
   const widgetSnippet = `<script src="${window.location.origin}/widget.js" data-workspace-id="${workspaceId}" data-api-url="${window.location.origin}/api" data-lang="en" data-theme="auto" async></script>`;
 

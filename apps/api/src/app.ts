@@ -1000,7 +1000,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
    * is the ONLY path that trusts the header alone.
    */
   async function resolveAuthContext(c: Ctx): Promise<AuthContext> {
-    const selectedWorkspace = c.req.header("x-workspace-id");
+    // Browser top-level flows (the OAuth connect links) cannot send headers,
+    // so GET requests may select the workspace via ?workspace_id= instead.
+    // The membership verification below applies identically either way.
+    // Mutating methods stay header-only, so the selector cannot be ridden
+    // in cross-site on a victim's cookie session.
+    const selectedWorkspace =
+      c.req.header("x-workspace-id") ??
+      (c.req.method === "GET" ? c.req.query("workspace_id") : undefined);
     if (!extractSessionToken(c)) {
       if (deps.env.BOTARA_ALLOW_HEADER_WORKSPACE === "1" && selectedWorkspace) {
         return {
