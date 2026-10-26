@@ -1,9 +1,9 @@
 import {
-  addContactTag, createContact, createConversation, createMessage,
+  addContactTag, advanceConversationLastUserMessage, createContact, createConversation, createMessage,
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
-  listGrowthLinksByAccount, touchConversationLastUserMessage, type Database,
+  listGrowthLinksByAccount, touchConversationLastUserMessage, upsertContactByExternal, type Database,
 } from "@botara/db";
 import {
   commentTriggerConfig, flowTriggerMatches, type FlowTrigger,
@@ -40,6 +40,12 @@ import type { RealtimePublisher } from "./realtime-publish";
  * persistence) - typed text matches keyword triggers; widget button
  * clicks match postback triggers by payload and keyword triggers by the
  * button's title.
+ *
+ * WhatsApp coexistence events are handled here too, each with its own
+ * discipline: Business-app echoes persist as outbound inbox messages
+ * (never flow-triggering, never window-opening, never billed),
+ * app-state syncs upsert contacts by phone, and history backfill
+ * persists with original provider timestamps, deduped on the wamid.
  *
  * Persistence goes through the DispatchStore port: production wires the
  * Drizzle repositories, tests wire the in-memory store below.
@@ -119,6 +125,7 @@ export interface DispatchAccount {
 export interface DispatchContact {
   id: string;
   tags: string[];
+  displayName?: string | null;
 }
 
 export interface DispatchGrowthLink {
@@ -133,12 +140,16 @@ export interface DispatchStore {
   findAccountByExternal(channel: string, externalId: string): Promise<DispatchAccount | null>;
   listConnectedAccountsByChannel(channel: string): Promise<DispatchAccount[]>;
   getContactByExternal(workspaceId: string, channel: string, externalId: string): Promise<DispatchContact | null>;
-  createContact(input: { workspaceId: string; channel: string; externalId: string }): Promise<DispatchContact>;
+  createContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }): Promise<DispatchContact>;
+  /** Insert-or-update one contact from a coexistence state sync (name refresh). */
+  upsertSyncedContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }): Promise<void>;
   findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string } | null>;
   createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string }>;
   findMessageByExternalId(conversationId: string, externalId: string): Promise<{ id: string } | null>;
-  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string }): Promise<{ id: string }>;
+  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date }): Promise<{ id: string }>;
   touchConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
+  /** Forward-only window anchor move, for backfilled inbound messages. */
+  advanceConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
   listActiveFlows(workspaceId: string): Promise<Array<{ id: string; trigger: FlowTrigger }>>;
   findGrowthLinkBySlug(slug: string): Promise<DispatchGrowthLink | null>;
   listGrowthLinksByAccount(channelAccountId: string): Promise<DispatchGrowthLink[]>;
@@ -165,11 +176,14 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
     },
     async getContactByExternal(workspaceId, channel, externalId) {
       const row = await getContactByExternal(getDatabase(), workspaceId, channel, externalId);
-      return row ? { id: row.id, tags: (row.tags as string[]) ?? [] } : null;
+      return row ? { id: row.id, tags: (row.tags as string[]) ?? [], displayName: row.displayName } : null;
     },
     async createContact(input) {
       const row = await createContact(getDatabase(), input);
-      return { id: row.id, tags: (row.tags as string[]) ?? [] };
+      return { id: row.id, tags: (row.tags as string[]) ?? [], displayName: row.displayName };
+    },
+    async upsertSyncedContact(input) {
+      await upsertContactByExternal(getDatabase(), input, "update");
     },
     async findOpenConversation(input) {
       const row = await findOpenConversation(getDatabase(), input);
@@ -189,6 +203,9 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
     },
     async touchConversationLastUserMessage(conversationId, at) {
       await touchConversationLastUserMessage(getDatabase(), conversationId, at);
+    },
+    async advanceConversationLastUserMessage(conversationId, at) {
+      await advanceConversationLastUserMessage(getDatabase(), conversationId, at);
     },
     async listActiveFlows(workspaceId) {
       const rows = await listActiveFlows(getDatabase(), workspaceId);
@@ -223,8 +240,8 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
 export class InMemoryDispatchStore implements DispatchStore {
   readonly accounts: DispatchAccount[] = [];
   readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string }>();
-  readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string }>();
-  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string }> = [];
+  readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; lastUserMessageAt?: string }>();
+  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
   readonly conversions = new Map<string, number>();
@@ -246,10 +263,22 @@ export class InMemoryDispatchStore implements DispatchStore {
     return this.contacts.get(this.contactKey(workspaceId, channel, externalId)) ?? null;
   }
 
-  async createContact(input: { workspaceId: string; channel: string; externalId: string }) {
+  async createContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }) {
     const contact = { id: crypto.randomUUID(), tags: [] as string[], ...input };
     this.contacts.set(this.contactKey(input.workspaceId, input.channel, input.externalId), contact);
     return contact;
+  }
+
+  async upsertSyncedContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }) {
+    const existing = await this.getContactByExternal(input.workspaceId, input.channel, input.externalId);
+    if (!existing) {
+      await this.createContact(input);
+      return;
+    }
+    if (input.displayName) {
+      const row = this.contacts.get(this.contactKey(input.workspaceId, input.channel, input.externalId));
+      if (row) row.displayName = input.displayName;
+    }
   }
 
   async findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }) {
@@ -269,13 +298,25 @@ export class InMemoryDispatchStore implements DispatchStore {
     return found ? { id: externalId } : null;
   }
 
-  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string }) {
+  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date }) {
     const id = crypto.randomUUID();
-    this.messages.push({ id, ...input });
+    const { createdAt, ...rest } = input;
+    this.messages.push({ id, ...rest, createdAt: (createdAt ?? new Date()).toISOString() });
     return { id };
   }
 
-  async touchConversationLastUserMessage() {}
+  async touchConversationLastUserMessage(conversationId: string, at: Date) {
+    const conversation = this.conversations.get(conversationId);
+    if (conversation) conversation.lastUserMessageAt = at.toISOString();
+  }
+
+  async advanceConversationLastUserMessage(conversationId: string, at: Date) {
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation) return;
+    if (!conversation.lastUserMessageAt || new Date(conversation.lastUserMessageAt) < at) {
+      conversation.lastUserMessageAt = at.toISOString();
+    }
+  }
 
   async listActiveFlows(workspaceId: string) {
     return this.flows.filter((f) => f.workspaceId === workspaceId).map((f) => ({ id: f.id, trigger: f.trigger }));
@@ -531,6 +572,108 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
   }
 
   /**
+   * WhatsApp coexistence: a Business-app ECHO is a message the business
+   * sent from the WhatsApp Business app on the same number. It belongs
+   * in the inbox thread as an outbound message - and NOTHING more: it
+   * never matches flow triggers, never touches the reply-window anchor
+   * (only the customer opens the window), and never reaches the send
+   * path, so no billable-send ledger entry can exist for it (billing
+   * happens in the API/worker send paths, which echoes never enter;
+   * this dispatcher holds no ledger port at all). Deduped on the
+   * provider message id: Meta redelivers echo webhooks.
+   */
+  async function dispatchEcho(event: Extract<InboundEvent, { type: "message.echo" }>): Promise<void> {
+    if (!DISPATCH_CHANNELS.has(event.channel)) return;
+    if (!event.contactExternalId) return;
+    const account = await resolveAccount(event);
+    if (!account) return;
+    const workspaceId = account.workspaceId;
+
+    const contact = await findOrCreateContact(workspaceId, event.channel, event.contactExternalId);
+    if (!contact) return;
+    const conversation = await findOrCreateConversation(workspaceId, account.id, contact.id);
+
+    const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
+    if (existing) return;
+    const created = await deps.store.createMessage({
+      conversationId: conversation.id,
+      direction: "out",
+      type: event.media ? "media" : "text",
+      body: event.text,
+      externalId: event.messageExternalId,
+      status: "sent",
+    });
+    if (deps.publisher) {
+      await deps.publisher.publishInboxMessage({
+        workspaceId,
+        conversationId: conversation.id,
+        direction: "out",
+        messageId: created.id,
+      }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * WhatsApp coexistence: app-state contact sync. `add`/`update` upsert
+   * the contact (create, or refresh the display name). `remove` is
+   * deliberately NOT destructive: the contact was deleted from the
+   * phone's address book, but the platform record carries conversation
+   * history and campaign consent, so it is kept untouched.
+   */
+  async function dispatchContactsSynced(event: Extract<InboundEvent, { type: "contacts.synced" }>): Promise<void> {
+    if (!DISPATCH_CHANNELS.has(event.channel)) return;
+    const account = await resolveAccount(event);
+    if (!account) return;
+    for (const contact of event.contacts) {
+      if (contact.action === "remove") continue;
+      await deps.store.upsertSyncedContact({
+        workspaceId: account.workspaceId,
+        channel: event.channel,
+        externalId: contact.externalId,
+        displayName: contact.displayName,
+      });
+    }
+  }
+
+  /**
+   * WhatsApp coexistence: ONE backfilled history message. Persisted
+   * with its ORIGINAL provider timestamp and deduped on the provider
+   * message id (chunks overlap, and a backfilled message may also have
+   * arrived live). Quiet by design: no flow triggers, no realtime
+   * publish, no billing. A backfilled INBOUND message moves the
+   * reply-window anchor only forward, to its own original timestamp -
+   * an old message can neither fake a fresh window nor close one a
+   * live message opened.
+   */
+  async function dispatchHistoryMessage(event: Extract<InboundEvent, { type: "message.history" }>): Promise<void> {
+    if (!DISPATCH_CHANNELS.has(event.channel)) return;
+    if (!event.contactExternalId) return;
+    const account = await resolveAccount(event);
+    if (!account) return;
+    const workspaceId = account.workspaceId;
+
+    const contact = await findOrCreateContact(workspaceId, event.channel, event.contactExternalId);
+    if (!contact) return;
+    const conversation = await findOrCreateConversation(workspaceId, account.id, contact.id);
+
+    const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
+    if (existing) return;
+    const at = new Date(event.receivedAt);
+    await deps.store.createMessage({
+      conversationId: conversation.id,
+      direction: event.direction,
+      type: event.media ? "media" : "text",
+      body: event.text,
+      externalId: event.messageExternalId,
+      status: event.direction === "in" ? "delivered" : "sent",
+      createdAt: at,
+    });
+    if (event.direction === "in") {
+      await deps.store.advanceConversationLastUserMessage(conversation.id, at);
+    }
+  }
+
+  /**
    * Trigger evaluation for a PRE-PERSISTED webchat message (the public
    * widget route owns persistence + the realtime publish; this dispatcher
    * deliberately has no store writes on this path). Matching mirrors the
@@ -582,6 +725,12 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
             await dispatchMessageLike(event);
           } else if (event.type === "comment.received") {
             await dispatchComment(event);
+          } else if (event.type === "message.echo") {
+            await dispatchEcho(event);
+          } else if (event.type === "contacts.synced") {
+            await dispatchContactsSynced(event);
+          } else if (event.type === "message.history") {
+            await dispatchHistoryMessage(event);
           }
         } catch (err) {
           // Webhook acknowledgment is king: log and continue with the next event.

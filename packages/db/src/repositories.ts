@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
@@ -237,6 +237,12 @@ export async function createMessage(
     externalId?: string;
     status?: string;
     idempotencyKey?: string;
+    /**
+     * Explicit row timestamp for BACKFILLED messages (WhatsApp coexistence
+     * history): the provider's original send time, not the ingest time.
+     * Omitted for live traffic, where the DB default (now) is correct.
+     */
+    createdAt?: Date;
   },
 ): Promise<MessageRow> {
   const [row] = await db
@@ -250,6 +256,7 @@ export async function createMessage(
       externalId: input.externalId,
       status: input.status ?? "queued",
       idempotencyKey: input.idempotencyKey,
+      ...(input.createdAt ? { createdAt: input.createdAt } : {}),
     })
     .returning();
   return row!;
@@ -273,6 +280,29 @@ export async function touchConversationLastUserMessage(
   at: Date,
 ): Promise<void> {
   await db.update(conversations).set({ lastUserMessageAt: at }).where(eq(conversations.id, conversationId));
+}
+
+/**
+ * Forward-only variant for BACKFILLED inbound messages (coexistence
+ * history import): move last_user_message_at to `at` ONLY when that is
+ * later than the current anchor. An old replayed message must never pull
+ * the anchor backwards (which would falsely close the reply window) nor
+ * be stamped as "now" (which would falsely open it).
+ */
+export async function advanceConversationLastUserMessage(
+  db: Database,
+  conversationId: string,
+  at: Date,
+): Promise<void> {
+  await db
+    .update(conversations)
+    .set({ lastUserMessageAt: at })
+    .where(
+      and(
+        eq(conversations.id, conversationId),
+        or(isNull(conversations.lastUserMessageAt), lt(conversations.lastUserMessageAt, at)),
+      ),
+    );
 }
 
 // --------------------------------------------------------------- templates

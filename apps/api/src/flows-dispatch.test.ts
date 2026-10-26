@@ -253,3 +253,128 @@ describe("persisted webchat dispatch (clickable buttons)", () => {
     expect(flowRuns).toHaveLength(0);
   });
 });
+
+describe("whatsapp coexistence dispatch", () => {
+  function waSetup() {
+    const store = new InMemoryDispatchStore();
+    store.accounts.push({
+      id: "acc-wa", workspaceId: "ws-1", channel: "whatsapp", externalId: "10987", status: "connected",
+    });
+    const flowRuns: FlowRunJobPayload[] = [];
+    const published: Array<{ direction: string }> = [];
+    const dispatcher = createFlowDispatcher({
+      store,
+      flowEnqueuer: { async enqueueFlowRun(job) { flowRuns.push(job); } },
+      publisher: {
+        async publishInboxMessage(event) { published.push({ direction: event.direction }); },
+        async publishInboxUpdate() {},
+      },
+    });
+    return { store, dispatcher, flowRuns, published };
+  }
+
+  const waEcho = (text: string, id = "wamid.E1"): InboundEvent => ({
+    type: "message.echo", channel: "whatsapp", accountExternalId: "10987",
+    contactExternalId: "62812", messageExternalId: id,
+    text, receivedAt: new Date().toISOString(),
+  });
+
+  test("an echo persists ONCE as an outbound message, publishes once, and a redelivery dedupes", async () => {
+    const { store, dispatcher, published } = waSetup();
+    await dispatcher.dispatch([waEcho("dibalas dari HP")]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({
+      direction: "out", type: "text", body: "dibalas dari HP", externalId: "wamid.E1",
+    });
+    expect(published).toEqual([{ direction: "out" }]);
+    // Meta redelivers the echo webhook: no second row, no second publish.
+    await dispatcher.dispatch([waEcho("dibalas dari HP")]);
+    expect(store.messages).toHaveLength(1);
+    expect(published).toHaveLength(1);
+  });
+
+  test("an echo NEVER matches flow triggers and NEVER moves the reply-window anchor", async () => {
+    const { store, dispatcher, flowRuns } = waSetup();
+    // A keyword flow whose keyword appears verbatim in the echo text:
+    // echoes must still not fire it (the business wrote it, not the customer).
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "price" } } });
+    await dispatcher.dispatch([waEcho("the price is 5")]);
+    expect(flowRuns).toHaveLength(0);
+    const conversation = [...store.conversations.values()][0]!;
+    // The window anchor is driven ONLY by inbound customer messages.
+    expect(conversation.lastUserMessageAt).toBeUndefined();
+  });
+
+  test("state sync upserts contacts (create, then name refresh); remove keeps the platform contact", async () => {
+    const { store, dispatcher } = waSetup();
+    const sync = (contacts: Extract<InboundEvent, { type: "contacts.synced" }>["contacts"]): InboundEvent => ({
+      type: "contacts.synced", channel: "whatsapp", accountExternalId: "10987",
+      contacts, receivedAt: new Date().toISOString(),
+    });
+    await dispatcher.dispatch([sync([{ externalId: "628111", displayName: "Sari", action: "add" }])]);
+    let contact = await store.getContactByExternal("ws-1", "whatsapp", "628111");
+    expect(contact).not.toBeNull();
+    expect(contact!.displayName).toBe("Sari");
+    // Re-sync with a corrected name updates in place (no duplicate contact).
+    await dispatcher.dispatch([sync([{ externalId: "628111", displayName: "Sari Wijaya", action: "update" }])]);
+    contact = await store.getContactByExternal("ws-1", "whatsapp", "628111");
+    expect(contact!.displayName).toBe("Sari Wijaya");
+    expect(store.contacts.size).toBe(1);
+    // Phone-side removal must NOT delete the platform contact.
+    await dispatcher.dispatch([sync([{ externalId: "628111", action: "remove" }])]);
+    contact = await store.getContactByExternal("ws-1", "whatsapp", "628111");
+    expect(contact).not.toBeNull();
+    expect(contact!.displayName).toBe("Sari Wijaya");
+    expect(store.contacts.size).toBe(1);
+  });
+
+  test("history persists with ORIGINAL timestamps, dedupes on redelivery, and stays quiet", async () => {
+    const { store, dispatcher, flowRuns, published } = waSetup();
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "halo" } } });
+    const old = "2026-09-01T10:00:00.000Z";
+    const historyMsg: InboundEvent = {
+      type: "message.history", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.H1", direction: "in",
+      text: "halo lama", receivedAt: old,
+    };
+    await dispatcher.dispatch([historyMsg]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({ direction: "in", body: "halo lama", createdAt: old });
+    // No realtime publish, no flow run - backfill is a quiet import.
+    expect(published).toHaveLength(0);
+    expect(flowRuns).toHaveLength(0);
+    // The window anchor is the ORIGINAL time, not "now": an old message
+    // must not fake a fresh 24h window.
+    const conversation = [...store.conversations.values()][0]!;
+    expect(conversation.lastUserMessageAt).toBe(old);
+    // Redelivered chunk: deduped on the wamid.
+    await dispatcher.dispatch([historyMsg]);
+    expect(store.messages).toHaveLength(1);
+  });
+
+  test("an older backfilled inbound never pulls the window anchor backwards", async () => {
+    const { store, dispatcher } = waSetup();
+    const liveAt = "2026-10-20T10:00:00.000Z";
+    await dispatcher.dispatch([{
+      type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.LIVE1", text: "pesan live",
+      receivedAt: liveAt,
+    }]);
+    const conversation = [...store.conversations.values()][0]!;
+    expect(conversation.lastUserMessageAt).toBe(liveAt);
+    // An older history message (also already-live overlap) arrives after:
+    await dispatcher.dispatch([{
+      type: "message.history", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.H-OLD", direction: "in",
+      text: "pesan lama", receivedAt: "2026-08-01T10:00:00.000Z",
+    }]);
+    expect(conversation.lastUserMessageAt).toBe(liveAt);
+    // ... while a NEWER backfilled inbound (still older than now) advances it.
+    await dispatcher.dispatch([{
+      type: "message.history", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.H-NEWER", direction: "in",
+      text: "pesan agak baru", receivedAt: "2026-10-25T10:00:00.000Z",
+    }]);
+    expect(conversation.lastUserMessageAt).toBe("2026-10-25T10:00:00.000Z");
+  });
+});
