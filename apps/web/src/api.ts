@@ -162,6 +162,13 @@ export interface WorkspaceSummary {
   role: string;
   /** Workspace default currency (ISO 4217) for new deals - package #6. */
   defaultCurrency: string;
+  /**
+   * Workspace reply target in minutes (package #8). Present on the
+   * list/me views (the PATCH /workspaces/:id response included); the
+   * create-workspace response carries a reduced object without it -
+   * consumers must default (60) when absent.
+   */
+  replyTargetMinutes?: number;
 }
 
 export interface AuthResponse {
@@ -800,6 +807,40 @@ export interface StatsOverview {
   }>;
 }
 
+export interface StatsInsightsChannel {
+  channel: string;
+  conversationsOpened: number;
+  messagesIn: number;
+  messagesOut: number;
+}
+
+export interface StatsInsightsResponse {
+  waitingCount: number;
+  oldestWaitingMinutes: number | null;
+  overTargetCount: number;
+  medianFirstResponseMinutes: { human: number | null; ai: number | null };
+  previousMedianFirstResponseMinutes: { human: number | null; ai: number | null };
+}
+
+export interface StatsInsightsActivity {
+  id: string;
+  actor: { userId: string; name: string | null; email: string | null } | null;
+  action: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}
+
+/** GET /stats/insights body (package #8) - returned UNWRAPPED, like /stats/overview. */
+export interface StatsInsights {
+  days: number;
+  periodStart: string;
+  previousPeriodStart: string;
+  replyTargetMinutes: number;
+  channels: StatsInsightsChannel[];
+  response: StatsInsightsResponse;
+  activity: StatsInsightsActivity[];
+}
+
 export const api = {
   // ------------------------------------------------------------- auth
   async register(body: { email: string; password: string; name?: string; workspaceName?: string }): Promise<AuthResponse> {
@@ -1211,7 +1252,7 @@ export const api = {
   },
   renameWorkspace(
     workspaceDbId: string,
-    body: { name?: string; defaultCurrency?: string },
+    body: { name?: string; defaultCurrency?: string; replyTargetMinutes?: number },
   ): Promise<{ workspace: WorkspaceSummary | null }> {
     return request(`/workspaces/${workspaceDbId}`, { method: "PATCH", body: JSON.stringify(body) });
   },
@@ -1271,6 +1312,9 @@ export const api = {
   // -------------------------------------------------- stats + channels
   getStatsOverview(): Promise<StatsOverview> {
     return request("/stats/overview");
+  },
+  getStatsInsights(days: 7 | 30): Promise<StatsInsights> {
+    return request(`/stats/insights?days=${days}`);
   },
   getPublicConfig(): Promise<PublicConfig> {
     return request("/config/public");

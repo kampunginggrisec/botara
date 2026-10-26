@@ -10,7 +10,7 @@ import {
   type ContactImportResult, type Conversation, type Deal, type Flow, type GrowthLink, type KbDocument,
   type Member, type Message, type Pipeline, type PipelineSummary, type PublicConfig,
   type RichBlock, type ScheduledPost, type SegmentInfo,
-  type Sequence, type SequenceStep, type StatsOverview, type Template, type WorkspaceDomain,
+  type Sequence, type SequenceStep, type StatsInsights, type StatsOverview, type Template, type WorkspaceDomain,
   type WorkspaceSummary,
 } from "./api";
 import { LanguageProvider, LanguageSwitcher, useI18n } from "./i18n";
@@ -26,6 +26,8 @@ import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { formatDealMoney, groupDealsByStage, movedStageOrder, visibleDeals } from "./deals";
+import { formatMinutes, isStatsInsights, responseDelta } from "./insights";
+import { messageStatusLabelKey, messageStatusTicks } from "./message-status";
 import {
   TOKEN_RESOURCES, countPickedResources, defaultTokenFormState, emptyScopePicks, expiryIsoFromDays,
   picksToScopes, scopeParts, tokenIsExpired, type ScopePicks, type TokenResource,
@@ -36,7 +38,7 @@ import {
   type PlatformCardGroup,
 } from "./admin-settings-model";
 
-type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "deals" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
+type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "deals" | "analytics" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
 const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "dashboard", labelKey: "nav.dashboard" },
@@ -46,6 +48,7 @@ const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["
   { id: "broadcast", labelKey: "nav.broadcast" },
   { id: "sequences", labelKey: "nav.sequences" },
   { id: "deals", labelKey: "nav.deals" },
+  { id: "analytics", labelKey: "nav.analytics" },
   { id: "publish", labelKey: "nav.publish" },
   { id: "channels", labelKey: "nav.channels" },
   { id: "knowledge", labelKey: "nav.knowledge" },
@@ -212,6 +215,30 @@ const IMAGE_FILE_RE = /\.(png|jpe?g|gif|webp|avif)(\?|#|$)/i;
  * empty (storage has no public base configured) shows as an unlinked
  * chip - the file exists, it is just not publicly addressable.
  */
+/**
+ * Bubble delivery state (package #8): ticks for outbound rows (provider
+ * receipts advance queued → sent → delivered → read) plus the localized
+ * status label; inbound rows show the label only.
+ */
+function MessageStatusLine({ message }: { message: Message }) {
+  const { t } = useI18n();
+  const labelKey = messageStatusLabelKey(message.status);
+  const label = labelKey ? t(labelKey as Parameters<typeof t>[0]) : message.status;
+  const { ticks, read } = message.direction === "out"
+    ? messageStatusTicks(message.status)
+    : { ticks: "", read: false };
+  return (
+    <span>
+      {ticks && (
+        <span aria-hidden className={read ? "font-semibold text-sky-300 dark:text-sky-600" : undefined}>
+          {ticks}{" "}
+        </span>
+      )}
+      {label}
+    </span>
+  );
+}
+
 function MessageMediaList({ message }: { message: Message }) {
   const keys = message.mediaKeys ?? [];
   const urls = message.mediaUrls ?? [];
@@ -781,7 +808,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                               {t("inbox.aiBadge")}
                             </span>
                           )}
-                          <span>{m.status}</span>
+                          <MessageStatusLine message={m} />
                         </div>
                       </div>
                       <MessageMediaList message={m} />
@@ -2511,6 +2538,186 @@ function DashboardPage({ goTo }: { goTo: (page: PageId) => void }) {
                         <span className="text-xs text-slate-400">{conv.status}</span>
                       </span>
                     </button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Analytics (package #8): per-channel volume, the response-time block,
+ * the default pipeline's current value, and the workspace activity
+ * feed - all from GET /stats/insights + the pipeline summary. The
+ * payload is shape-checked before it is trusted (a drifted wire shape
+ * becomes a load error here, never a render crash).
+ */
+function AnalyticsPage({ workspace }: { workspace: WorkspaceSummary | undefined }) {
+  const { t } = useI18n();
+  const [days, setDays] = useState<7 | 30>(30);
+  const [insights, setInsights] = useState<StatsInsights | null>(null);
+  const [pipelineSummary, setPipelineSummary] = useState<PipelineSummary | null>(null);
+  const [pipelineName, setPipelineName] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.getStatsInsights(days)
+      .then((data) => {
+        if (cancelled) return;
+        if (!isStatsInsights(data)) {
+          setInsights(null);
+          setError(t("analytics.loadFailed"));
+          return;
+        }
+        setInsights(data);
+        setError(null);
+      })
+      .catch((err) => { if (!cancelled) setError(errText(err, t("analytics.loadFailed"))); });
+    return () => { cancelled = true; };
+  }, [days, t]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await api.listPipelines();
+        const def = res.pipelines.find((p) => p.isDefault) ?? res.pipelines[0];
+        if (!def || cancelled) return;
+        const sum = await api.getPipelineSummary(def.id);
+        if (!cancelled) {
+          setPipelineSummary(sum.summary);
+          setPipelineName(def.name);
+        }
+      } catch {
+        // The pipeline card is best-effort: no pipelines (or a failed
+        // fetch) simply leaves it out; the insights above stand alone.
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const currency = workspace?.defaultCurrency ?? "IDR";
+  const resp = insights?.response;
+  const humanDelta = resp ? responseDelta(resp.medianFirstResponseMinutes.human, resp.previousMedianFirstResponseMinutes.human) : null;
+  const aiDelta = resp ? responseDelta(resp.medianFirstResponseMinutes.ai, resp.previousMedianFirstResponseMinutes.ai) : null;
+
+  const deltaLine = (delta: ReturnType<typeof responseDelta>) => {
+    if (!delta) return <span className="text-slate-400">{t("analytics.deltaNone")}</span>;
+    if (delta.direction === "same") return <span className="text-slate-400">{t("analytics.deltaSame")}</span>;
+    return delta.direction === "faster"
+      ? <span className="text-emerald-600 dark:text-emerald-400">▼ {t("analytics.deltaFaster", { diff: formatMinutes(delta.diffMinutes) })}</span>
+      : <span className="text-red-600 dark:text-red-400">▲ {t("analytics.deltaSlower", { diff: formatMinutes(delta.diffMinutes) })}</span>;
+  };
+
+  return (
+    <div>
+      <PageTitle title={t("analytics.title")} subtitle={t("analytics.subtitle")} />
+      <div className="mt-4 flex gap-2">
+        {([7, 30] as const).map((d) => (
+          <button
+            key={d}
+            onClick={() => setDays(d)}
+            className={`rounded-md border px-3 py-1 text-xs font-medium ${days === d
+              ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
+              : "border-slate-300 text-slate-600 dark:border-slate-700 dark:text-slate-300"}`}
+          >
+            {t(d === 7 ? "analytics.period7" : "analytics.period30")}
+          </button>
+        ))}
+      </div>
+      {error && <div className="mt-4 max-w-xl"><ErrorBox error={error} /></div>}
+      {!insights && !error && <p className={`mt-6 ${mutedCls}`}>{t("app.loading")}</p>}
+      {insights && resp && (
+        <>
+          <div className="mt-6 grid grid-cols-2 md:grid-cols-3 gap-4 max-w-4xl">
+            <div className={`${cardCls} p-4`}>
+              <div className="text-2xl font-bold">{resp.waitingCount}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{t("analytics.waitingNow")}</div>
+            </div>
+            <div className={`${cardCls} p-4`}>
+              <div className="text-2xl font-bold">{formatMinutes(resp.oldestWaitingMinutes)}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{t("analytics.oldestWaiting")}</div>
+            </div>
+            <div className={`${cardCls} p-4`}>
+              <div className="text-2xl font-bold">{resp.overTargetCount}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                {t("analytics.overTarget", { target: formatMinutes(insights.replyTargetMinutes) })}
+              </div>
+            </div>
+            <div className={`${cardCls} p-4`}>
+              <div className="text-2xl font-bold">{formatMinutes(resp.medianFirstResponseMinutes.human)}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{t("analytics.medianHuman")}</div>
+              <div className="text-xs mt-1">{deltaLine(humanDelta)}</div>
+            </div>
+            <div className={`${cardCls} p-4`}>
+              <div className="text-2xl font-bold">{formatMinutes(resp.medianFirstResponseMinutes.ai)}</div>
+              <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">{t("analytics.medianAi")}</div>
+              <div className="text-xs mt-1">{deltaLine(aiDelta)}</div>
+            </div>
+            {pipelineSummary && (
+              <div className={`${cardCls} p-4`}>
+                <div className="text-2xl font-bold">{formatDealMoney(pipelineSummary.open.value, currency)}</div>
+                <div className="text-xs text-slate-500 dark:text-slate-400 mt-1">
+                  {t("analytics.pipelineOpen", { pipeline: pipelineName ?? "" })}
+                </div>
+                <div className="text-xs mt-1 text-slate-500 dark:text-slate-400">
+                  {t("analytics.pipelineWonLost", {
+                    won: formatDealMoney(pipelineSummary.won.value, currency),
+                    lost: formatDealMoney(pipelineSummary.lost.value, currency),
+                  })}
+                </div>
+                <div className="text-[11px] mt-1 text-slate-400">{t("analytics.pipelineCurrentNote")}</div>
+              </div>
+            )}
+          </div>
+
+          <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+            <div className="font-medium text-sm">{t("analytics.channelsTitle")}</div>
+            {insights.channels.length === 0 ? (
+              <p className={`mt-2 ${mutedCls}`}>{t("analytics.channelsEmpty")}</p>
+            ) : (
+              <table className="mt-2 w-full text-sm">
+                <thead>
+                  <tr className="text-left text-xs text-slate-500 dark:text-slate-400">
+                    <th className="py-1 font-medium">{t("analytics.colChannel")}</th>
+                    <th className="py-1 font-medium">{t("analytics.colOpened")}</th>
+                    <th className="py-1 font-medium">{t("analytics.colIn")}</th>
+                    <th className="py-1 font-medium">{t("analytics.colOut")}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {insights.channels.map((row) => (
+                    <tr key={row.channel} className="border-t border-slate-100 dark:border-slate-800">
+                      <td className="py-1.5"><span className={chipCls}>{row.channel}</span></td>
+                      <td className="py-1.5">{row.conversationsOpened}</td>
+                      <td className="py-1.5">{row.messagesIn}</td>
+                      <td className="py-1.5">{row.messagesOut}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+
+          <div className={`mt-4 max-w-4xl ${cardCls} p-4`}>
+            <div className="font-medium text-sm">{t("analytics.activityTitle")}</div>
+            {insights.activity.length === 0 ? (
+              <p className={`mt-2 ${mutedCls}`}>{t("analytics.activityEmpty")}</p>
+            ) : (
+              <ul className="mt-2 divide-y divide-slate-100 dark:divide-slate-800">
+                {insights.activity.map((entry) => (
+                  <li key={entry.id} className="flex items-center justify-between gap-3 py-2 text-sm">
+                    <span className="min-w-0">
+                      <span className="font-medium">{entry.actor?.name ?? entry.actor?.email ?? t("analytics.systemActor")}</span>
+                      {" "}
+                      <span className={chipCls}>{entry.action}</span>
+                    </span>
+                    <span className="shrink-0 text-xs text-slate-400">{fmtDateTime(entry.createdAt)}</span>
                   </li>
                 ))}
               </ul>
@@ -5480,6 +5687,7 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const [name, setName] = useState(user.name ?? "");
   const [wsName, setWsName] = useState(workspace?.name ?? "");
   const [wsCurrency, setWsCurrency] = useState(workspace?.defaultCurrency ?? "IDR");
+  const [wsReplyTarget, setWsReplyTarget] = useState(String(workspace?.replyTargetMinutes ?? 60));
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [members, setMembers] = useState<Member[]>([]);
@@ -5500,6 +5708,7 @@ function SettingsPage({ user, workspace, refreshSession }: {
   const [tokenExpiryDays, setTokenExpiryDays] = useState("");
 
   useEffect(() => { setWsName(workspace?.name ?? ""); }, [workspace?.name]);
+  useEffect(() => { setWsReplyTarget(String(workspace?.replyTargetMinutes ?? 60)); }, [workspace?.replyTargetMinutes]);
 
   const loadTokens = useCallback(async () => {
     try {
@@ -5591,7 +5800,11 @@ function SettingsPage({ user, workspace, refreshSession }: {
     if (!workspace) return;
     setBusy(true); setError(null); setNotice(null);
     try {
-      await api.renameWorkspace(workspace.id, { name: wsName.trim(), defaultCurrency: wsCurrency });
+      await api.renameWorkspace(workspace.id, {
+        name: wsName.trim(),
+        defaultCurrency: wsCurrency,
+        replyTargetMinutes: Number(wsReplyTarget),
+      });
       setNotice(t("settings.workspaceSaved"));
       refreshSession();
     } catch (err) {
@@ -5682,8 +5895,22 @@ function SettingsPage({ user, workspace, refreshSession }: {
             />
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("settings.defaultCurrencyHint")}</p>
           </div>
+          <div>
+            <label className={labelCls}>{t("settings.replyTarget")}</label>
+            <input
+              type="number"
+              min={1}
+              max={10080}
+              step={1}
+              value={wsReplyTarget}
+              onChange={(e) => setWsReplyTarget(e.target.value.replace(/[^0-9]/g, "").slice(0, 5))}
+              disabled={!canRename}
+              className={`${inputCls} ${!canRename ? "opacity-60" : ""}`}
+            />
+            <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("settings.replyTargetHint")}</p>
+          </div>
           {!canRename && <p className="text-xs text-amber-600 dark:text-amber-400">{t("settings.renameForbidden")}</p>}
-          <button onClick={() => void saveWorkspace()} disabled={busy || !canRename || !wsName.trim() || wsCurrency.length !== 3} className={primaryBtn}>{t("common.save")}</button>
+          <button onClick={() => void saveWorkspace()} disabled={busy || !canRename || !wsName.trim() || wsCurrency.length !== 3 || !(Number(wsReplyTarget) >= 1 && Number(wsReplyTarget) <= 10080)} className={primaryBtn}>{t("common.save")}</button>
         </div>
 
         <div className={section}>
@@ -6333,6 +6560,7 @@ function AuthedApp() {
         {page === "broadcast" && <BroadcastPage />}
         {page === "sequences" && <SequencesPage />}
         {page === "deals" && <DealsPage workspace={currentWorkspace} />}
+        {page === "analytics" && <AnalyticsPage workspace={currentWorkspace} />}
         {page === "publish" && <PublishPage />}
         {page === "channels" && <ChannelsPage />}
         {page === "knowledge" && <KnowledgePage />}
