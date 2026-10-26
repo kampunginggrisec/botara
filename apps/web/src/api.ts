@@ -316,6 +316,8 @@ export interface BroadcastSummary {
   id: string;
   channelAccountId: string;
   templateId: string | null;
+  /** Per-recipient body parameter templates (variables package #1). */
+  templateParams: string[] | null;
   name: string | null;
   tag: string | null;
   country: string | null;
@@ -516,7 +518,13 @@ export interface FlowTestRunResult {
 export interface SequenceStep {
   delaySeconds: number;
   text?: string;
-  template?: { name: string; language: string; latestCategory: string };
+  template?: {
+    name: string;
+    language: string;
+    latestCategory: string;
+    /** Per-recipient body parameter templates (variables package #1). */
+    templateParams?: string[];
+  };
 }
 
 export interface Sequence {
@@ -730,7 +738,7 @@ export const api = {
   reply(
     conversationId: string,
     body: { kind: "free_form" | "template"; text?: string; templateId?: string; rich?: RichBlock },
-  ): Promise<{ message: unknown; delivery: string; warnings?: string[] }> {
+  ): Promise<{ message: unknown; delivery: string; warnings?: string[]; interpolationWarnings?: string[] }> {
     return request(`/conversations/${conversationId}/reply`, {
       method: "POST",
       body: JSON.stringify(body),
@@ -831,6 +839,8 @@ export const api = {
   createBroadcast(body: {
     channelAccountId: string;
     templateId?: string;
+    /** Ordered per-recipient body parameter templates (variables #1). */
+    templateParams?: string[];
     name?: string;
     country?: string;
     recipientCount?: number;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, Handle, Position,
   addEdge, useEdgesState, useNodesState,
@@ -13,6 +13,7 @@ import {
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 import { RICH_BUTTONS_EXAMPLE } from "../rich-example";
+import { VariablePicker } from "../variable-picker";
 
 /**
  * Visual flow builder (Fase 4) on @xyflow/react.
@@ -246,6 +247,8 @@ function RichBlockEditor({ node, patch, t, products }: {
 }) {
   const rich = (node.rich && typeof node.rich === "object" ? (node.rich as RichBlock) : null);
   const setRich = (next: RichBlock | undefined) => patch({ rich: next });
+  // Variable picker target for the block's main text field (variables #1).
+  const richTextRef = useRef<HTMLTextAreaElement | null>(null);
 
   if (!rich) {
     return (
@@ -316,12 +319,16 @@ function RichBlockEditor({ node, patch, t, products }: {
         <div>
           <label className={richLabelCls}>{t("flows.field.text")}</label>
           <textarea
+            ref={richTextRef}
             value={rich.text ?? ""}
             onChange={(e) => setRich({ ...rich, text: e.target.value } as RichBlock)}
             rows={2}
             className={richInputCls}
             placeholder={rich.kind === "buttons" && RICH_BUTTONS_EXAMPLE.kind === "buttons" ? RICH_BUTTONS_EXAMPLE.text : undefined}
           />
+          <div className="mt-1">
+            <VariablePicker target={() => richTextRef.current} includeVars />
+          </div>
         </div>
       )}
 
@@ -520,6 +527,8 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [testText, setTestText] = useState("");
+  // Variable picker target for the send_message text editor (variables #1).
+  const sendTextRef = useRef<HTMLTextAreaElement | null>(null);
   const [testActions, setTestActions] = useState<Array<Record<string, unknown>> | null>(null);
   const [testStatus, setTestStatus] = useState<string | null>(null);
   // Synced catalog products feed the rich product/catalog pickers.
@@ -773,7 +782,10 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                   <>
                     <div>
                       <label className={labelCls}>{t("flows.field.text")}</label>
-                      <textarea value={str(selected, "text")} onChange={(e) => patchSelected({ text: e.target.value })} rows={3} className={inputCls} />
+                      <textarea ref={sendTextRef} value={str(selected, "text")} onChange={(e) => patchSelected({ text: e.target.value })} rows={3} className={inputCls} />
+                      <div className="mt-1">
+                        <VariablePicker target={() => sendTextRef.current} includeVars />
+                      </div>
                     </div>
                     <RichBlockEditor node={selected} patch={patchSelected} t={t} products={catalogProducts} />
                     <div>

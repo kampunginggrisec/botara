@@ -20,6 +20,7 @@ import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
+import { VariablePicker } from "./variable-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
   type PlatformCardGroup,
@@ -234,6 +235,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const [selected, setSelected] = useState<Conversation | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [replyText, setReplyText] = useState("");
+  const replyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
   const [sending, setSending] = useState(false);
@@ -468,6 +470,9 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
       if (res.warnings && res.warnings.length > 0) {
         setRichWarning(t("inbox.richDegraded", { warnings: res.warnings.join(", ") }));
       }
+      if (res.interpolationWarnings && res.interpolationWarnings.length > 0) {
+        pushToast("err", t("inbox.variablesUnknown", { vars: res.interpolationWarnings.join(", ") }));
+      }
       setReplyText("");
       setRichButtons([]);
       setRichKind("none");
@@ -651,6 +656,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
               <div className="border-t border-slate-100 dark:border-slate-800 p-3">
                 <div className="flex gap-2">
                   <textarea
+                    ref={replyTextareaRef}
                     value={replyText}
                     onChange={(e) => setReplyText(e.target.value)}
                     rows={2}
@@ -676,6 +682,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                   >
                     {checkBusy ? t("inbox.checking") : t("inbox.checkDraft")}
                   </button>
+                  <VariablePicker target={() => replyTextareaRef.current} />
                 </div>
                 <div className="mt-2 flex items-center gap-2">
                   <label className="text-xs text-slate-500 dark:text-slate-400" htmlFor="inbox-rich-kind">
@@ -1305,6 +1312,11 @@ function BroadcastPage() {
   const { t } = useI18n();
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templateId, setTemplateId] = useState("");
+  // Template body parameters (variables #1): ordered param templates,
+  // each rendered per recipient at send time. Inputs are ref-tracked so
+  // the variable picker inserts at the caret of the focused row.
+  const [templateParams, setTemplateParams] = useState<string[]>([]);
+  const paramInputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const [channelAccountId, setChannelAccountId] = useState("");
   const [recipients, setRecipients] = useState(100);
   const [country, setCountry] = useState("ID");
@@ -1414,6 +1426,11 @@ function BroadcastPage() {
   };
 
   const doCreate = async () => {
+    const cleanedParams = templateParams.map((p) => p.trim());
+    if (templateId && cleanedParams.some((p) => p.length === 0)) {
+      setError(t("templateParams.blank"));
+      return;
+    }
     setBusy(true);
     setError(null);
     setCreated(null);
@@ -1421,6 +1438,7 @@ function BroadcastPage() {
       const data = await api.createBroadcast({
         channelAccountId,
         templateId: templateId || undefined,
+        ...(templateId && cleanedParams.length > 0 ? { templateParams: cleanedParams } : {}),
         country: country.toUpperCase(),
         recipientCount: recipients,
       });
@@ -1461,6 +1479,39 @@ function BroadcastPage() {
           <input value={country} onChange={(e) => setCountry(e.target.value)} className={inputCls} />
         </div>
       </div>
+      {templateId && (
+        <div className="mt-4 max-w-3xl">
+          <label className={labelCls}>{t("templateParams.label")}</label>
+          <p className="mb-2 text-xs text-slate-500 dark:text-slate-400">{t("templateParams.hint")}</p>
+          <div className="space-y-2">
+            {templateParams.map((param, i) => (
+              <div key={i} className="flex items-center gap-2">
+                <span className="w-8 text-xs text-slate-400">{`{{${i + 1}}}`}</span>
+                <input
+                  ref={(el) => { paramInputRefs.current[i] = el; }}
+                  value={param}
+                  onChange={(e) => setTemplateParams((prev) => prev.map((p, idx) => (idx === i ? e.target.value : p)))}
+                  placeholder={t("templateParams.placeholder")}
+                  className={inputCls}
+                />
+                <VariablePicker target={() => paramInputRefs.current[i] ?? null} />
+                <button
+                  onClick={() => setTemplateParams((prev) => prev.filter((_, idx) => idx !== i))}
+                  className="text-xs text-red-600 underline dark:text-red-400"
+                >
+                  {t("templateParams.remove")}
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            onClick={() => setTemplateParams((prev) => [...prev, ""])}
+            className="mt-2 text-xs text-slate-600 underline dark:text-slate-300"
+          >
+            {t("templateParams.add")}
+          </button>
+        </div>
+      )}
       <div className="mt-4 flex gap-2">
         <button onClick={() => void doEstimate()} disabled={busy} className={primaryBtn}>{t("broadcast.estimateButton")}</button>
         <button onClick={() => void doCreate()} disabled={busy || !channelAccountId} className={outlineBtn}>{t("broadcast.createButton")}</button>
@@ -1541,6 +1592,9 @@ function BroadcastPage() {
               <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.costEntries")}</dt><dd>{detail.costEntries} · {detail.costUnits} units</dd></div>
               {detail.tag && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.tagLabel")}</dt><dd>{detail.tag}</dd></div>}
               {detail.country && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.colCountry")}</dt><dd>{detail.country}</dd></div>}
+              {detail.templateParams && detail.templateParams.length > 0 && (
+                <div><dt className="text-slate-500 dark:text-slate-400">{t("templateParams.detailLabel")}</dt><dd>{detail.templateParams.join(" · ")}</dd></div>
+              )}
             </dl>
           </div>
         )}
@@ -2300,10 +2354,13 @@ interface StepDraft {
   templateName: string;
   templateLanguage: string;
   templateCategory: string;
+  /** Per-recipient body parameter templates (variables package #1). */
+  templateParams: string[];
 }
 
 const emptyStep = (): StepDraft => ({
   delayHours: 24, kind: "text", body: "", templateName: "", templateLanguage: "id", templateCategory: "utility",
+  templateParams: [],
 });
 
 function stepToDraft(step: SequenceStep): StepDraft {
@@ -2314,6 +2371,7 @@ function stepToDraft(step: SequenceStep): StepDraft {
     templateName: step.template?.name ?? "",
     templateLanguage: step.template?.language ?? "id",
     templateCategory: step.template?.latestCategory ?? "utility",
+    templateParams: step.template?.templateParams ?? [],
   };
 }
 
@@ -2321,7 +2379,10 @@ function draftToStep(draft: StepDraft): SequenceStep {
   return draft.kind === "template"
     ? {
         delaySeconds: Math.max(0, Math.round(draft.delayHours * 3600)),
-        template: { name: draft.templateName, language: draft.templateLanguage, latestCategory: draft.templateCategory },
+        template: {
+          name: draft.templateName, language: draft.templateLanguage, latestCategory: draft.templateCategory,
+          ...(draft.templateParams.some((p) => p.trim()) ? { templateParams: draft.templateParams.map((p) => p.trim()) } : {}),
+        },
       }
     : { delaySeconds: Math.max(0, Math.round(draft.delayHours * 3600)), text: draft.body };
 }
@@ -2417,6 +2478,16 @@ function SequencesPage() {
     setSteps((prev) => prev.map((s, i) => (i === index ? { ...s, ...patch } : s)));
   };
 
+  // Variable-picker targets (variables #1): text-step bodies by step
+  // index, template-param inputs by "step:param" key.
+  const stepTextRefs = useRef<Array<HTMLTextAreaElement | null>>([]);
+  const stepParamRefs = useRef(new Map<string, HTMLInputElement | null>());
+  const patchStepParam = (stepIndex: number, paramIndex: number, value: string) => {
+    setSteps((prev) => prev.map((s, i) => (i === stepIndex
+      ? { ...s, templateParams: s.templateParams.map((p, j) => (j === paramIndex ? value : p)) }
+      : s)));
+  };
+
   return (
     <div>
       <PageTitle title={t("sequences.title")} subtitle={t("sequences.subtitle")} />
@@ -2465,26 +2536,67 @@ function SequencesPage() {
                   {step.kind === "text" ? (
                     <div>
                       <label className={labelCls}>{t("sequences.stepBody")}</label>
-                      <textarea value={step.body} onChange={(e) => patchStep(i, { body: e.target.value })} rows={2} className={inputCls} />
+                      <textarea
+                        ref={(el) => { stepTextRefs.current[i] = el; }}
+                        value={step.body}
+                        onChange={(e) => patchStep(i, { body: e.target.value })}
+                        rows={2}
+                        className={inputCls}
+                      />
+                      <div className="mt-1">
+                        <VariablePicker target={() => stepTextRefs.current[i] ?? null} />
+                      </div>
                     </div>
                   ) : (
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                      <div>
-                        <label className={labelCls}>{t("sequences.templateName")}</label>
-                        <input value={step.templateName} onChange={(e) => patchStep(i, { templateName: e.target.value })} className={inputCls} />
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                        <div>
+                          <label className={labelCls}>{t("sequences.templateName")}</label>
+                          <input value={step.templateName} onChange={(e) => patchStep(i, { templateName: e.target.value })} className={inputCls} />
+                        </div>
+                        <div>
+                          <label className={labelCls}>{t("sequences.templateLanguage")}</label>
+                          <input value={step.templateLanguage} onChange={(e) => patchStep(i, { templateLanguage: e.target.value })} className={inputCls} />
+                        </div>
+                        <div>
+                          <label className={labelCls}>{t("sequences.templateCategory")}</label>
+                          <select value={step.templateCategory} onChange={(e) => patchStep(i, { templateCategory: e.target.value })} className={inputCls}>
+                            <option value="marketing">marketing</option>
+                            <option value="utility">utility</option>
+                            <option value="authentication">authentication</option>
+                            <option value="service">service</option>
+                          </select>
+                        </div>
                       </div>
                       <div>
-                        <label className={labelCls}>{t("sequences.templateLanguage")}</label>
-                        <input value={step.templateLanguage} onChange={(e) => patchStep(i, { templateLanguage: e.target.value })} className={inputCls} />
-                      </div>
-                      <div>
-                        <label className={labelCls}>{t("sequences.templateCategory")}</label>
-                        <select value={step.templateCategory} onChange={(e) => patchStep(i, { templateCategory: e.target.value })} className={inputCls}>
-                          <option value="marketing">marketing</option>
-                          <option value="utility">utility</option>
-                          <option value="authentication">authentication</option>
-                          <option value="service">service</option>
-                        </select>
+                        <label className={labelCls}>{t("templateParams.label")}</label>
+                        <div className="space-y-2">
+                          {step.templateParams.map((param, j) => (
+                            <div key={j} className="flex items-center gap-2">
+                              <span className="w-8 text-xs text-slate-400">{`{{${j + 1}}}`}</span>
+                              <input
+                                ref={(el) => { stepParamRefs.current.set(`${i}:${j}`, el); }}
+                                value={param}
+                                onChange={(e) => patchStepParam(i, j, e.target.value)}
+                                placeholder={t("templateParams.placeholder")}
+                                className={inputCls}
+                              />
+                              <VariablePicker target={() => stepParamRefs.current.get(`${i}:${j}`) ?? null} />
+                              <button
+                                onClick={() => patchStep(i, { templateParams: step.templateParams.filter((_, idx) => idx !== j) })}
+                                className="text-xs text-red-600 underline dark:text-red-400"
+                              >
+                                {t("templateParams.remove")}
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                        <button
+                          onClick={() => patchStep(i, { templateParams: [...step.templateParams, ""] })}
+                          className="mt-1 text-xs text-slate-600 underline dark:text-slate-300"
+                        >
+                          {t("templateParams.add")}
+                        </button>
                       </div>
                     </div>
                   )}
