@@ -15,6 +15,13 @@
       "when": 1792978953413,
       "tag": "0001_flippant_garia",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1792980419149,
+      "tag": "0002_romantic_mandrill",
+      "breakpoints": true
     }
   ]
 }

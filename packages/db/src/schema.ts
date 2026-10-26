@@ -28,6 +28,16 @@ export const users = pgTable("users", {
    * email, and registration later claims it by setting the hash.
    */
   passwordHash: varchar("password_hash", { length: 300 }),
+  /**
+   * Platform operator flag (admin panel). NOT a workspace role: it marks
+   * the deployment's operator, who can open /admin. Bootstrap rule: the
+   * FIRST registered user (users table empty at registration) receives it;
+   * platform admins can grant/revoke it later, but never from the last
+   * remaining platform admin.
+   */
+  isPlatformAdmin: boolean("is_platform_admin").notNull().default(false),
+  /** Last successful login - the honest basis for "active users" counts. */
+  lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex("users_email_idx").on(t.email)]);
 
@@ -467,6 +477,29 @@ export const catalogProducts = pgTable("catalog_products", {
   uniqueIndex("catalog_products_account_catalog_retailer_idx").on(t.channelAccountId, t.catalogId, t.retailerId),
   index("catalog_products_ws_idx").on(t.workspaceId),
 ]);
+
+/**
+ * Platform settings (admin panel): operator-managed deployment settings
+ * (app credentials, verify tokens, R2, Resend, AI) stored in the DB so
+ * they can be changed from the admin panel instead of editing .env.
+ * Resolution order is DB -> env -> unset (see
+ * packages/db/src/platform-settings.ts for the managed-key registry).
+ * Non-secret values live in `value`; secrets live ONLY in
+ * `secretCiphertext` (AES-256-GCM sealed with TOKEN_VAULT_KEY, the same
+ * scheme as the token vault in vault.ts) - a row carries exactly one of
+ * the two. `value` and `secretCiphertext` must NEVER both be set.
+ */
+export const platformSettings = pgTable("platform_settings", {
+  /** The env var name this setting overrides (e.g. "META_APP_ID"). PK. */
+  key: varchar("key", { length: 120 }).primaryKey(),
+  /** Plaintext value - non-secret settings only. */
+  value: text("value"),
+  /** Base64 AES-256-GCM ciphertext - secret settings only (iv/tag embedded, see platform-settings.ts). */
+  secretCiphertext: text("secret_ciphertext"),
+  /** The platform admin who last wrote the row (users.id; no FK - settings outlive accounts). */
+  updatedBy: uuid("updated_by"),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const costLedger = pgTable("cost_ledger", {
   id: uuid("id").primaryKey().defaultRandom(),

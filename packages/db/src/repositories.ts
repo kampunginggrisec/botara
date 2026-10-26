@@ -3,6 +3,7 @@ import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
   dataDeletionRequests, flows, growthLinks, kbChunks, kbDocuments, messages,
+  platformSettings,
   processedComments,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
   users, webchatSessions, workspaceDomains, workspaceMembers, workspaces,
@@ -1094,7 +1095,7 @@ export type WorkspaceMemberRow = typeof workspaceMembers.$inferSelect;
 
 export async function createUser(
   db: Database,
-  input: { email: string; name?: string; passwordHash?: string },
+  input: { email: string; name?: string; passwordHash?: string; isPlatformAdmin?: boolean },
 ): Promise<UserRow> {
   const [row] = await db
     .insert(users)
@@ -1102,6 +1103,7 @@ export async function createUser(
       email: input.email.toLowerCase(),
       name: input.name,
       passwordHash: input.passwordHash,
+      isPlatformAdmin: input.isPlatformAdmin ?? false,
     })
     .returning();
   return row!;
@@ -2130,6 +2132,275 @@ export async function listCatalogProductKeys(
 
 export async function deleteCatalogProduct(db: Database, id: string): Promise<void> {
   await db.delete(catalogProducts).where(eq(catalogProducts.id, id));
+}
+
+/**
+ * Best-effort purge of everything Botara holds for one provider user id
+ * (the id Meta puts in a data-deletion signed_request): contacts with that
+ * external id, plus their messages, webchat sessions, sequence enrollments
+ * and conversations. Channel accounts are the WORKSPACE's credentials, not
+ * the end user's data, and are never touched here.
+ */
+// ------------------------------------------- platform admin (admin panel)
+
+export type PlatformSettingRow = typeof platformSettings.$inferSelect;
+
+export async function getPlatformSetting(db: Database, key: string): Promise<PlatformSettingRow | null> {
+  const [row] = await db.select().from(platformSettings).where(eq(platformSettings.key, key)).limit(1);
+  return row ?? null;
+}
+
+export async function listPlatformSettings(db: Database): Promise<PlatformSettingRow[]> {
+  return db.select().from(platformSettings).orderBy(asc(platformSettings.key));
+}
+
+/**
+ * Insert or replace one platform setting. Exactly one of `value` /
+ * `secretCiphertext` carries the payload (plaintext for non-secrets,
+ * AES-256-GCM sealed blob for secrets - see platform-settings.ts); the
+ * other is always written as null so a key can never hold both.
+ */
+export async function upsertPlatformSetting(
+  db: Database,
+  input: { key: string; value?: string | null; secretCiphertext?: string | null; updatedBy?: string },
+): Promise<PlatformSettingRow> {
+  const values = {
+    key: input.key,
+    value: input.value ?? null,
+    secretCiphertext: input.secretCiphertext ?? null,
+    updatedBy: input.updatedBy,
+    updatedAt: new Date(),
+  };
+  const [row] = await db
+    .insert(platformSettings)
+    .values(values)
+    .onConflictDoUpdate({
+      target: platformSettings.key,
+      set: { value: values.value, secretCiphertext: values.secretCiphertext, updatedBy: values.updatedBy, updatedAt: values.updatedAt },
+    })
+    .returning();
+  return row!;
+}
+
+/** Remove the DB value for a key (env fallback then applies). Returns false when no row existed. */
+export async function deletePlatformSetting(db: Database, key: string): Promise<boolean> {
+  const rows = await db.delete(platformSettings).where(eq(platformSettings.key, key)).returning();
+  return rows.length > 0;
+}
+
+/** Total registered users - the platform-admin bootstrap checks this for 0. */
+export async function countUsers(db: Database): Promise<number> {
+  const rows = await db.select({ value: sql<number>`count(*)::int` }).from(users);
+  return Number(rows[0]?.value ?? 0);
+}
+
+export async function countPlatformAdmins(db: Database): Promise<number> {
+  const rows = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(users)
+    .where(eq(users.isPlatformAdmin, true));
+  return Number(rows[0]?.value ?? 0);
+}
+
+/** Grant or revoke the platform-operator flag. Returns the updated row (null when no such user). */
+export async function setUserPlatformAdmin(
+  db: Database,
+  userId: string,
+  isPlatformAdmin: boolean,
+): Promise<UserRow | null> {
+  const [row] = await db
+    .update(users)
+    .set({ isPlatformAdmin })
+    .where(eq(users.id, userId))
+    .returning();
+  return row ?? null;
+}
+
+/** Stamp a successful login (drives the admin panel's "active users"). */
+export async function touchUserLastLogin(db: Database, userId: string, at: Date): Promise<void> {
+  await db.update(users).set({ lastLoginAt: at }).where(eq(users.id, userId));
+}
+
+/** Users whose last login is at/after `since` (active-user windows). */
+export async function countActiveUsers(db: Database, since: Date): Promise<number> {
+  const rows = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(users)
+    .where(sql`${users.lastLoginAt} >= ${since.toISOString()}::timestamptz`);
+  return Number(rows[0]?.value ?? 0);
+}
+
+export async function listRecentUsers(db: Database, limit: number): Promise<UserRow[]> {
+  return db.select().from(users).orderBy(desc(users.createdAt)).limit(limit);
+}
+
+export interface AdminUserView extends UserRow {
+  memberships: Array<{ workspaceId: string; workspaceName: string; role: string }>;
+}
+
+/** Every user with their workspace memberships (admin Users view). */
+export async function listUsersAdmin(db: Database): Promise<AdminUserView[]> {
+  const userRows = await db.select().from(users).orderBy(asc(users.createdAt));
+  const memberRows = await db
+    .select({
+      userId: workspaceMembers.userId,
+      workspaceId: workspaces.id,
+      workspaceName: workspaces.name,
+      role: workspaceMembers.role,
+    })
+    .from(workspaceMembers)
+    .innerJoin(workspaces, eq(workspaceMembers.workspaceId, workspaces.id));
+  const byUser = new Map<string, AdminUserView["memberships"]>();
+  for (const m of memberRows) {
+    const list = byUser.get(m.userId) ?? [];
+    list.push({ workspaceId: m.workspaceId, workspaceName: m.workspaceName, role: m.role });
+    byUser.set(m.userId, list);
+  }
+  return userRows.map((u) => ({ ...u, memberships: byUser.get(u.id) ?? [] }));
+}
+
+export interface AdminWorkspaceView extends WorkspaceRow {
+  ownerEmail: string | null;
+  memberCount: number;
+  channelAccountCount: number;
+  messageCount: number;
+}
+
+/** Every workspace with owner + headline counts (admin Workspaces view). */
+export async function listWorkspacesAdmin(db: Database): Promise<AdminWorkspaceView[]> {
+  const wsRows = await db.select().from(workspaces).orderBy(asc(workspaces.createdAt));
+  const ownerRows = await db
+    .select({ workspaceId: workspaceMembers.workspaceId, email: users.email })
+    .from(workspaceMembers)
+    .innerJoin(users, eq(workspaceMembers.userId, users.id))
+    .where(eq(workspaceMembers.role, "owner"));
+  const memberCounts = await db
+    .select({ workspaceId: workspaceMembers.workspaceId, value: sql<number>`count(*)::int` })
+    .from(workspaceMembers)
+    .groupBy(workspaceMembers.workspaceId);
+  const accountCounts = await db
+    .select({ workspaceId: channelAccounts.workspaceId, value: sql<number>`count(*)::int` })
+    .from(channelAccounts)
+    .groupBy(channelAccounts.workspaceId);
+  // Messages carry no workspace column (by design) - count through conversations.
+  const messageCounts = await db
+    .select({ workspaceId: conversations.workspaceId, value: sql<number>`count(*)::int` })
+    .from(messages)
+    .innerJoin(conversations, eq(messages.conversationId, conversations.id))
+    .groupBy(conversations.workspaceId);
+  const ownerByWs = new Map(ownerRows.map((r) => [r.workspaceId, r.email]));
+  const membersByWs = new Map(memberCounts.map((r) => [r.workspaceId, Number(r.value)]));
+  const accountsByWs = new Map(accountCounts.map((r) => [r.workspaceId, Number(r.value)]));
+  const messagesByWs = new Map(messageCounts.map((r) => [r.workspaceId, Number(r.value)]));
+  return wsRows.map((w) => ({
+    ...w,
+    ownerEmail: ownerByWs.get(w.id) ?? null,
+    memberCount: membersByWs.get(w.id) ?? 0,
+    channelAccountCount: accountsByWs.get(w.id) ?? 0,
+    messageCount: messagesByWs.get(w.id) ?? 0,
+  }));
+}
+
+export async function countWorkspaces(db: Database): Promise<number> {
+  const rows = await db.select({ value: sql<number>`count(*)::int` }).from(workspaces);
+  return Number(rows[0]?.value ?? 0);
+}
+
+/** Channel account totals per channel key (admin Overview). */
+export async function countChannelAccountsByChannel(
+  db: Database,
+): Promise<Array<{ channel: string; count: number }>> {
+  const rows = await db
+    .select({ channel: channelAccounts.channel, value: sql<number>`count(*)::int` })
+    .from(channelAccounts)
+    .groupBy(channelAccounts.channel)
+    .orderBy(asc(channelAccounts.channel));
+  return rows.map((r) => ({ channel: r.channel, count: Number(r.value) }));
+}
+
+/** All messages, or only those created at/after `since` when given. */
+export async function countMessages(db: Database, since?: Date): Promise<number> {
+  const rows = await db
+    .select({ value: sql<number>`count(*)::int` })
+    .from(messages)
+    .where(since ? sql`${messages.createdAt} >= ${since.toISOString()}::timestamptz` : undefined);
+  return Number(rows[0]?.value ?? 0);
+}
+
+export interface AdminAuditView {
+  id: string;
+  workspaceId: string | null;
+  userId: string | null;
+  actorEmail: string | null;
+  action: string;
+  details: Record<string, unknown>;
+  createdAt: Date;
+}
+
+/** Most recent audit rows across the whole deployment (admin Audit view). */
+export async function listRecentAuditLogs(db: Database, limit: number): Promise<AdminAuditView[]> {
+  const rows = await db
+    .select({
+      id: auditLog.id,
+      workspaceId: auditLog.workspaceId,
+      userId: auditLog.userId,
+      actorEmail: users.email,
+      action: auditLog.action,
+      details: auditLog.details,
+      createdAt: auditLog.createdAt,
+    })
+    .from(auditLog)
+    .leftJoin(users, eq(auditLog.userId, users.id))
+    .orderBy(desc(auditLog.createdAt))
+    .limit(limit);
+  return rows.map((r) => ({ ...r, details: (r.details as Record<string, unknown>) ?? {} }));
+}
+
+export interface PlatformBillingRow {
+  workspaceId: string;
+  workspaceName: string;
+  category: string;
+  currency: string;
+  /** Billable units (messages) in this category over the window. */
+  units: number;
+  /** Charged entries in the ledger for this slice. */
+  entries: number;
+  /** Estimated cost: the ledger `amount` sum, in `currency` major units (USD in practice). */
+  amount: number;
+}
+
+/**
+ * Per-workspace usage/cost aggregation over the WhatsApp cost ledger
+ * (cost_ledger) since `since`. The ledger records one row per rated send:
+ * units = messages, amount = the rated cost in the row's currency (the
+ * writer always stamps USD today; grouped by currency so a future
+ * multi-currency writer stays correct).
+ */
+export async function getPlatformBilling(db: Database, since: Date): Promise<PlatformBillingRow[]> {
+  const rows = await db
+    .select({
+      workspaceId: costLedger.workspaceId,
+      workspaceName: workspaces.name,
+      category: costLedger.category,
+      currency: costLedger.currency,
+      units: sql<string>`coalesce(sum(${costLedger.units}),0)`,
+      entries: sql<number>`count(*)::int`,
+      amount: sql<string>`coalesce(sum(${costLedger.amount}),0)`,
+    })
+    .from(costLedger)
+    .innerJoin(workspaces, eq(costLedger.workspaceId, workspaces.id))
+    .where(sql`${costLedger.createdAt} >= ${since.toISOString()}::timestamptz`)
+    .groupBy(costLedger.workspaceId, workspaces.name, costLedger.category, costLedger.currency)
+    .orderBy(asc(workspaces.name), asc(costLedger.category));
+  return rows.map((r) => ({
+    workspaceId: r.workspaceId,
+    workspaceName: r.workspaceName,
+    category: r.category,
+    currency: r.currency,
+    units: Number(r.units),
+    entries: Number(r.entries),
+    amount: Number(r.amount),
+  }));
 }
 
 /**
