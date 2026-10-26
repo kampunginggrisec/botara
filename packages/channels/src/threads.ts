@@ -142,24 +142,40 @@ export class ThreadsAdapter implements ChannelAdapter {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: form.toString(),
     });
-    const json = (await res.json().catch(() => ({}))) as {
-      access_token?: string; user_id?: string | number;
-    } & GraphErrorBodyShape;
+    const raw = await res.text();
+    let json: { access_token?: string; user_id?: string | number } & GraphErrorBodyShape = {};
+    try {
+      json = JSON.parse(raw) as typeof json;
+    } catch { /* non-JSON body: handled by the checks below */ }
     if (!res.ok || !json.access_token || json.user_id === undefined) {
       throw mapGraphError(json, res.status, "threads");
     }
-    return { accessToken: json.access_token, userId: String(json.user_id) };
+    // Threads sends user_id as a JSON number, and Threads ids exceed 2^53,
+    // so JSON.parse silently rounds them (a real id ...312 was stored as
+    // ...310 - a nonexistent account). Recover the exact digits from the
+    // raw body; the parsed value is only a fallback for string ids.
+    const rawId = /"user_id"\s*:\s*"?(\d+)"?/.exec(raw)?.[1];
+    return { accessToken: json.access_token, userId: rawId ?? String(json.user_id) };
   }
 
-  /** Best-effort profile lookup for display names during onboarding. */
-  async getProfile(input: { userId: string; accessToken: string }): Promise<{ username?: string; name?: string }> {
-    const url = new URL(`${this.base()}/${input.userId}`);
-    url.searchParams.set("fields", "username,name");
+  /**
+   * Profile lookup for the token's own account via /me - the canonical
+   * identity source during onboarding: /me returns the id as a string
+   * (unlike the exchange's lossy numeric user_id) plus the username used
+   * for display names. Best-effort: returns {} on any failure.
+   */
+  async getProfile(input: { accessToken: string }): Promise<{ userId?: string; username?: string; name?: string }> {
+    const url = new URL(`${this.base()}/me`);
+    url.searchParams.set("fields", "id,username,name");
     url.searchParams.set("access_token", input.accessToken);
     const res = await this.fetchFn(url.toString());
-    const json = (await res.json().catch(() => ({}))) as { username?: string; name?: string };
     if (!res.ok) return {};
-    return { username: json.username, name: json.name };
+    const json = (await res.json().catch(() => ({}))) as { id?: string | number; username?: string; name?: string };
+    return {
+      userId: json.id !== undefined ? String(json.id) : undefined,
+      username: json.username,
+      name: json.name,
+    };
   }
 
   /**

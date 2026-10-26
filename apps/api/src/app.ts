@@ -1662,17 +1662,22 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       const redirectUri = oauthRedirectUri(deps, c, "threads");
       const short = await adapter.exchangeCode({ appId, appSecret, code, redirectUri });
       const long = await adapter.exchangeShortLivedToken({ shortLivedToken: short.accessToken, appSecret });
+      // Canonical identity comes from /me (string id + username); the
+      // exchange's user id is only a fallback if the profile call fails.
+      let externalId = short.userId;
       let username: string | undefined;
       try {
-        username = (await adapter.getProfile({ userId: short.userId, accessToken: long.accessToken })).username;
-      } catch { /* display name is best-effort only */ }
+        const profile = await adapter.getProfile({ accessToken: long.accessToken });
+        if (profile.userId) externalId = profile.userId;
+        username = profile.username;
+      } catch { /* identity/display name are best-effort only */ }
       const ref = await deps.vault.store({
         channel: "threads", workspaceId: state.w,
-        label: username ? `@${username}` : short.userId, secret: long.accessToken,
+        label: username ? `@${username}` : externalId, secret: long.accessToken,
       });
       await persistConnectedAccount({
-        workspaceId: state.w, channel: "threads", externalId: short.userId,
-        displayName: username ? `@${username}` : short.userId, authMode: "threads-oauth",
+        workspaceId: state.w, channel: "threads", externalId,
+        displayName: username ? `@${username}` : externalId, authMode: "threads-oauth",
         tokenVaultRef: ref, tokenExpiresAt: new Date(long.expiresAt),
       });
       await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "threads" } })

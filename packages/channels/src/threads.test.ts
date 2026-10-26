@@ -171,3 +171,37 @@ describe("threads webhooks", () => {
     expect(th.capabilities.canLike).toBe(false);
   });
 });
+
+describe("threads onboarding identity", () => {
+  test("exchangeCode preserves a >2^53 numeric user_id exactly", async () => {
+    // Meta's wire format carries the id as a JSON number; a plain
+    // JSON.parse would round it (real-world case: ...312 stored as ...310).
+    const fetchFn: FetchLike = async () =>
+      new Response('{"access_token":"short-tok","user_id":29490699623849312}', {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    const out = await th.exchangeCode({
+      appId: "app-1", appSecret: "test-secret", code: "code-1", redirectUri: "https://example.com/cb",
+    });
+    expect(out.accessToken).toBe("short-tok");
+    expect(out.userId).toBe("29490699623849312");
+  });
+
+  test("getProfile reads /me and returns the string id + username", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { id: "29490699623849312", username: "syahid" } }]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    const profile = await th.getProfile({ accessToken: "long-tok" });
+    expect(profile.userId).toBe("29490699623849312");
+    expect(profile.username).toBe("syahid");
+    expect(calls[0]!.url).toContain("https://graph.threads.net/v1.0/me?");
+    expect(calls[0]!.url).toContain("fields=id%2Cusername%2Cname");
+  });
+
+  test("getProfile returns {} on an API error (best-effort)", async () => {
+    const { fetchFn } = mockFetch([{ status: 400, body: { error: { message: "nope" } } }]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    expect(await th.getProfile({ accessToken: "bad" })).toEqual({});
+  });
+});

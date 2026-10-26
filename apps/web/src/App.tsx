@@ -3313,7 +3313,11 @@ function AppRoutes() {
 
 function AuthedApp() {
   const { t } = useI18n();
-  const [page, setPage] = useState<PageId>("dashboard");
+  // OAuth callbacks return to /#/channels?connected=... - land on the
+  // Channels page so its success/error banner is the first thing seen.
+  const [page, setPage] = useState<PageId>(() =>
+    window.location.hash.startsWith("#/channels") ? "channels" : "dashboard",
+  );
   const [ready, setReady] = useState(false);
   const [user, setUser] = useState<AuthUser | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceSummary[]>([]);
