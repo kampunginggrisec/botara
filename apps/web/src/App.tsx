@@ -18,6 +18,7 @@ import {
 } from "./realtime";
 import { ThemeProvider, ThemeToggle } from "./theme";
 import { FlowBuilder, starterGraph } from "./flows/FlowBuilder";
+import { downloadFlowExport, parseFlowImport } from "./flows/flow-transfer";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
@@ -2321,7 +2322,35 @@ function FlowsPage() {
   const [editing, setEditing] = useState<Flow | null>(null);
   const [newName, setNewName] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [importNotice, setImportNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+
+  /**
+   * Import a `.botara-flow.json` file: the envelope + graph are
+   * validated client-side with the engine's own graph schema (the same
+   * validator the API applies), then created as a NEW draft through
+   * POST /flows - imports never overwrite an existing flow.
+   */
+  const importFile = async (file: File) => {
+    setError(null);
+    setImportNotice(null);
+    const parsed = parseFlowImport(await file.text());
+    if (!parsed.ok) {
+      setError(t(`flows.transfer.error.${parsed.error}` as Parameters<typeof t>[0]));
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await api.createFlow({ name: parsed.name, trigger: parsed.trigger, graph: parsed.graph });
+      setFlows((prev) => [res.flow, ...prev]);
+      setImportNotice(t("flows.transfer.imported"));
+      setEditing(res.flow);
+    } catch (err) {
+      setError(errText(err, t("flows.createFailed")));
+    } finally {
+      setBusy(false);
+    }
+  };
 
   const load = useCallback(async () => {
     try {
@@ -2394,7 +2423,23 @@ function FlowsPage() {
       <div className="mt-5 flex gap-2 max-w-lg">
         <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={t("flows.namePlaceholder")} className={inputCls} />
         <button onClick={() => void create()} disabled={busy || !newName.trim()} className={primaryBtn}>{t("flows.new")}</button>
+        <label className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700 cursor-pointer self-center whitespace-nowrap dark:border-slate-700 dark:text-slate-200">
+          {t("flows.transfer.import")}
+          <input
+            type="file"
+            accept=".json,application/json"
+            className="hidden"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              e.target.value = "";
+              if (file) void importFile(file);
+            }}
+          />
+        </label>
       </div>
+      {importNotice && !error && (
+        <div className="mt-3 max-w-xl rounded-lg border border-emerald-300 bg-emerald-50 px-4 py-2 text-sm text-emerald-900 dark:border-emerald-900 dark:bg-emerald-950 dark:text-emerald-200">{importNotice}</div>
+      )}
       <div className="mt-5 space-y-2 max-w-4xl">
         {flows.length === 0 && !error && <EmptyState>{t("flows.empty")}</EmptyState>}
         {flows.map((flow) => (
@@ -2411,6 +2456,7 @@ function FlowsPage() {
               {flow.status === "active" ? t("flows.statusActive") : t("flows.statusDraft")}
             </span>
             <button onClick={() => setEditing(flow)} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs dark:border-slate-700">{t("flows.openBuilder")}</button>
+            <button onClick={() => downloadFlowExport(flow)} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs dark:border-slate-700">{t("flows.transfer.export")}</button>
             <button onClick={() => void toggle(flow)} className="rounded-md border border-slate-300 px-3 py-1.5 text-xs dark:border-slate-700">
               {flow.status === "active" ? t("flows.deactivate") : t("flows.activate")}
             </button>

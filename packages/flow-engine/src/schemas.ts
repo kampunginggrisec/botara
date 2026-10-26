@@ -1,5 +1,8 @@
 import { z } from "zod";
-import { richBlockSchema } from "@botara/channels";
+// Subpath import: the channels root pulls node:crypto adapters into
+// any bundle that touches it; the rich schema module is browser-safe,
+// which is what lets the web builder validate graphs client-side.
+import { richBlockSchema } from "@botara/channels/rich";
 
 /**
  * Flow node schemas (Fase 0 set). The same Zod schemas validate flows in the

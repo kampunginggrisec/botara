@@ -7,6 +7,10 @@
     ".": {
       "types": "./src/index.ts",
       "default": "./src/index.ts"
+    },
+    "./graph": {
+      "types": "./src/graph.ts",
+      "default": "./src/graph.ts"
     }
   },
   "scripts": {

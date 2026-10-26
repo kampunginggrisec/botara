@@ -8,12 +8,17 @@ import "@xyflow/react/dist/style.css";
 import {
   api, ApiError,
   type CatalogProduct, type ChannelAccount, type Flow, type FlowGraph, type FlowTrigger,
-  type RichBlock, type RichButton,
+  type Member, type RichBlock, type RichButton, type Sequence,
 } from "../api";
 import { useI18n } from "../i18n";
 import { useTheme } from "../theme";
 import { RICH_BUTTONS_EXAMPLE } from "../rich-example";
 import { VariablePicker } from "../variable-picker";
+import {
+  NODE_ACCENT, NODE_TYPES, cfg, cfgStr, defaultEngineNode, newNodeId, nodeSummary, str,
+  type EngineNode, type NodeType,
+} from "./flow-nodes";
+import { downloadFlowExport } from "./flow-transfer";
 
 /**
  * Visual flow builder (Fase 4) on @xyflow/react.
@@ -26,78 +31,7 @@ import { VariablePicker } from "../variable-picker";
  * trigger node, keeping both views of the trigger in sync by construction.
  */
 
-type EngineNode = Record<string, unknown> & { id: string; type: string };
 type BuilderNode = Node<{ engine: EngineNode }, "botara">;
-
-const NODE_TYPES = ["trigger", "send_message", "condition", "delay", "webhook", "set_field", "ai_reply"] as const;
-type NodeType = (typeof NODE_TYPES)[number];
-
-const NODE_ACCENT: Record<NodeType, string> = {
-  trigger: "bg-amber-500",
-  send_message: "bg-sky-500",
-  condition: "bg-violet-500",
-  delay: "bg-slate-500",
-  webhook: "bg-emerald-500",
-  set_field: "bg-teal-500",
-  ai_reply: "bg-fuchsia-500",
-};
-
-let nodeSeq = 0;
-function newNodeId(type: NodeType): string {
-  nodeSeq += 1;
-  return `${type.slice(0, 4)}_${Date.now().toString(36)}${nodeSeq}`;
-}
-
-function defaultEngineNode(type: NodeType, id: string): EngineNode {
-  switch (type) {
-    case "trigger":
-      return { id, type, trigger: "keyword", config: { flowTriggerType: "keyword", keyword: "", match: "contains" }, next: null };
-    case "send_message":
-      return { id, type, text: "", next: null };
-    case "condition":
-      return { id, type, field: "", operator: "equals", value: "", whenTrue: null, whenFalse: null, next: null };
-    case "delay":
-      return { id, type, seconds: 60, next: null };
-    case "webhook":
-      return { id, type, url: "https://", method: "POST", next: null };
-    case "set_field":
-      return { id, type, field: "", value: "", next: null };
-    case "ai_reply":
-      return { id, type, prompt: "", fallbackText: "", next: null };
-  }
-}
-
-const str = (node: EngineNode, key: string): string =>
-  typeof node[key] === "string" ? (node[key] as string) : "";
-const cfg = (node: EngineNode): Record<string, unknown> =>
-  (node.config && typeof node.config === "object" ? (node.config as Record<string, unknown>) : {});
-const cfgStr = (node: EngineNode, key: string): string => {
-  const v = cfg(node)[key];
-  return typeof v === "string" ? v : "";
-};
-
-function nodeSummary(node: EngineNode): string {
-  switch (node.type) {
-    case "trigger": {
-      const kind = cfgStr(node, "flowTriggerType") || (node.trigger === "keyword" ? "keyword" : "manual");
-      if (kind === "keyword") return `"${cfgStr(node, "keyword")}"`;
-      if (kind === "comment_keyword") return `comment: "${cfgStr(node, "keyword")}"`;
-      if (kind === "postback") return `payload: ${cfgStr(node, "payload")}`;
-      return "manual";
-    }
-    case "send_message": {
-      const rich = node.rich as RichBlock | undefined;
-      const base = str(node, "text").slice(0, 60) || "...";
-      return rich ? `${base} [+${rich.kind}]` : base;
-    }
-    case "condition": return `${str(node, "field")} ${str(node, "operator")} ${str(node, "value")}`.trim();
-    case "delay": return `${String(node.seconds ?? 0)}s`;
-    case "webhook": return str(node, "url").slice(0, 40);
-    case "set_field": return `${str(node, "field")} = ${str(node, "value")}`;
-    case "ai_reply": return str(node, "prompt").slice(0, 50) || "KB-grounded reply";
-    default: return "";
-  }
-}
 
 function BotaraNodeCard({ data, selected }: NodeProps<BuilderNode>) {
   const { t } = useI18n();
@@ -544,6 +478,39 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
     return () => { cancelled = true; };
   }, []);
 
+  // Action-step pickers (package #3): workspace members for the
+  // assign step, sequences for subscribe/unsubscribe, and the distinct
+  // contact tags as suggestions for the tag steps. All enhancements -
+  // the underlying id fields stay editable if a load fails.
+  const [members, setMembers] = useState<Member[]>([]);
+  const [sequences, setSequences] = useState<Sequence[]>([]);
+  const [tagSuggestions, setTagSuggestions] = useState<string[]>([]);
+  // Variable picker target for the collect_input prompt editor.
+  const collectPromptRef = useRef<HTMLTextAreaElement | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [m, s, c] = await Promise.all([
+          api.listMembers(flow.workspaceId),
+          api.listSequences(),
+          api.listContacts(),
+        ]);
+        if (cancelled) return;
+        setMembers(m.members);
+        setSequences(s.sequences);
+        setTagSuggestions([...new Set(c.contacts.flatMap((ct) => ct.tags))].sort());
+      } catch { /* pickers are an enhancement; manual ids still work */ }
+    })();
+    return () => { cancelled = true; };
+  }, [flow.workspaceId]);
+
+  /** Export the CURRENT canvas (incl. unsaved edits) as a JSON file. */
+  const exportFlow = () => {
+    const graph = buildGraph(nodes, edges);
+    downloadFlowExport({ name: name.trim() || flow.name, trigger: deriveTrigger(graph), graph });
+  };
+
   const selected = useMemo(
     () => nodes.find((n) => n.id === selectedId)?.data.engine ?? null,
     [nodes, selectedId],
@@ -648,6 +615,9 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
           {flow.status === "active" ? t("flows.statusActive") : t("flows.statusDraft")}
         </span>
         <div className="ml-auto flex gap-2">
+          <button onClick={exportFlow} className="rounded-md border border-slate-300 px-4 py-2 text-sm text-slate-700 dark:border-slate-700 dark:text-slate-200">
+            {t("flows.transfer.export")}
+          </button>
           <button onClick={() => void toggleActive()} disabled={busy} className="rounded-md border border-slate-900 px-4 py-2 text-sm text-slate-900 disabled:opacity-50 dark:border-slate-100 dark:text-slate-100">
             {flow.status === "active" ? t("flows.deactivate") : t("flows.activate")}
           </button>
@@ -865,6 +835,120 @@ function BuilderInner({ flow, accounts, onBack, onChanged }: BuilderProps) {
                     <div>
                       <label className={labelCls}>{t("flows.field.fallback")}</label>
                       <textarea value={str(selected, "fallbackText")} onChange={(e) => patchSelected({ fallbackText: e.target.value })} rows={2} className={inputCls} />
+                    </div>
+                  </>
+                )}
+                {(selected.type === "add_tag" || selected.type === "remove_tag") && (
+                  <div>
+                    <label className={labelCls}>{t("flows.field.tag")}</label>
+                    <input
+                      value={str(selected, "tag")}
+                      onChange={(e) => patchSelected({ tag: e.target.value })}
+                      className={inputCls}
+                      list="flow-tag-suggestions"
+                      placeholder="vip"
+                    />
+                    <datalist id="flow-tag-suggestions">
+                      {tagSuggestions.map((tag) => <option key={tag} value={tag} />)}
+                    </datalist>
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.tagHint")}</p>
+                  </div>
+                )}
+                {selected.type === "assign" && (
+                  <div>
+                    <label className={labelCls}>{t("flows.field.assignee")}</label>
+                    <select
+                      value={str(selected, "userId")}
+                      onChange={(e) => patchSelected({ userId: e.target.value || null })}
+                      className={inputCls}
+                    >
+                      <option value="">{t("flows.field.unassign")}</option>
+                      {members.map((m) => (
+                        <option key={m.userId} value={m.userId}>{m.name ?? m.email} ({m.role})</option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.assigneeHint")}</p>
+                  </div>
+                )}
+                {selected.type === "set_conversation_status" && (
+                  <div>
+                    <label className={labelCls}>{t("flows.field.conversationStatus")}</label>
+                    <select
+                      value={str(selected, "status") || "resolved"}
+                      onChange={(e) => patchSelected({ status: e.target.value })}
+                      className={inputCls}
+                    >
+                      <option value="resolved">{t("flows.field.statusResolved")}</option>
+                      <option value="open">{t("flows.field.statusOpen")}</option>
+                    </select>
+                  </div>
+                )}
+                {(selected.type === "sequence_subscribe" || selected.type === "sequence_unsubscribe") && (
+                  <div>
+                    <label className={labelCls}>{t("flows.field.sequence")}</label>
+                    <select
+                      value={str(selected, "sequenceId")}
+                      onChange={(e) => patchSelected({ sequenceId: e.target.value })}
+                      className={inputCls}
+                    >
+                      <option value="">{t("flows.field.sequencePick")}</option>
+                      {selected.type === "sequence_unsubscribe" && (
+                        <option value="all">{t("flows.field.sequenceAll")}</option>
+                      )}
+                      {sequences.map((s) => (
+                        <option key={s.id} value={s.id}>{s.name} ({s.status})</option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.sequenceHint")}</p>
+                  </div>
+                )}
+                {selected.type === "collect_input" && (
+                  <>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.promptText")}</label>
+                      <textarea
+                        ref={collectPromptRef}
+                        value={str(selected, "promptText")}
+                        onChange={(e) => patchSelected({ promptText: e.target.value })}
+                        rows={2}
+                        className={inputCls}
+                      />
+                      <div className="mt-1">
+                        <VariablePicker target={() => collectPromptRef.current} includeVars />
+                      </div>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.variableName")}</label>
+                      <input
+                        value={str(selected, "variable")}
+                        onChange={(e) => patchSelected({ variable: e.target.value })}
+                        className={inputCls}
+                        placeholder="city"
+                      />
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.variableNameHint")}</p>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.saveToField")}</label>
+                      <input
+                        value={str(selected, "saveToContactField")}
+                        onChange={(e) => patchSelected({ saveToContactField: e.target.value || undefined })}
+                        className={inputCls}
+                        placeholder="city"
+                      />
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.saveToFieldHint")}</p>
+                    </div>
+                    <div>
+                      <label className={labelCls}>{t("flows.field.timeoutHours")}</label>
+                      <input
+                        type="number"
+                        min={0}
+                        step="any"
+                        value={selected.timeoutHours === undefined ? "" : String(selected.timeoutHours)}
+                        onChange={(e) => patchSelected({ timeoutHours: e.target.value === "" ? undefined : Number(e.target.value) })}
+                        className={inputCls}
+                        placeholder="24"
+                      />
+                      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("flows.field.timeoutHoursHint")}</p>
                     </div>
                   </>
                 )}
