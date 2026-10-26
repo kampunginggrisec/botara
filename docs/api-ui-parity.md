@@ -77,6 +77,9 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 | PATCH /conversations/{}/assign | UI | Inbox header assignee select |
 | PATCH /conversations/{}/status | UI | Inbox header status select |
 | POST /conversations/{}/ai-suggest | UI | Inbox composer "AI suggest" (F4) — fills the draft, never auto-sends; honest 503 toast when no AI provider is configured |
+| POST /conversations/{}/ai-analyze | UI | Inbox AI strip "Analyze"/"Refresh" (package #7) — persists summary + intent on the conversation; 503 toast when unconfigured, 502 toast on malformed model output (nothing saved) |
+| POST /conversations/{}/ai-pause | UI | Inbox AI strip "Pause AI" (package #7) — pauses AUTOMATIC AI sends (flow ai_reply) on the thread; agent tools stay available |
+| POST /conversations/{}/ai-resume | UI | Inbox AI strip "Resume AI" (package #7) — clears the takeover pause |
 | POST /conversations/{}/notes | UI | Inbox composer Note mode (package #2) — internal timeline notes, never sent |
 | GET /saved-replies | UI | Inbox composer saved-replies picker (package #2) |
 | POST /saved-replies | UI | Saved-replies picker → New form |
