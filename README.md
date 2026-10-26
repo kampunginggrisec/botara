@@ -189,6 +189,10 @@ needs the external items in the checklist below):
 - **App Review package:** `docs/app-review/` — paste-ready permission
   justifications, shot-by-shot screencast scripts, and a submission
   checklist marking exactly which steps are the account owner's.
+- **Meta setup:** `docs/meta-setup.md` — the operator's end-to-end Meta
+  app configuration guide (Indonesian): architecture table, credentials
+  via the admin panel, per-product webhook/OAuth steps, Embedded
+  Signup, the WhatsApp test number, troubleshooting, final checklist.
 - **Web:** login/register, token-based API client, workspace switcher,
   Knowledge Base page, and public `/privacy` + `/terms` template pages.
 
