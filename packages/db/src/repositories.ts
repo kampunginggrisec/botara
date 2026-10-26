@@ -2,7 +2,8 @@ import { and, asc, desc, eq, inArray, isNotNull, isNull, lt, lte, or, sql } from
 import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
-  dataDeletionRequests, flows, flowWaits, growthLinks, kbChunks, kbDocuments, messages,
+  dataDeletionRequests, deals, flows, flowWaits, growthLinks, kbChunks, kbDocuments, messages,
+  pipelines, pipelineStages,
   platformSettings,
   processedComments,
   savedReplies,
@@ -1840,6 +1841,7 @@ export interface WorkspaceMembershipView {
   workspaceId: string;
   workspaceName: string;
   slug: string;
+  defaultCurrency: string;
   role: string;
   createdAt: Date;
 }
@@ -1851,6 +1853,7 @@ export async function listWorkspacesForUser(db: Database, userId: string): Promi
       workspaceId: workspaces.id,
       workspaceName: workspaces.name,
       slug: workspaces.slug,
+      defaultCurrency: workspaces.defaultCurrency,
       role: workspaceMembers.role,
       createdAt: workspaces.createdAt,
     })
@@ -2479,6 +2482,15 @@ export async function updateUserName(db: Database, userId: string, name: string)
 
 export async function updateWorkspaceName(db: Database, workspaceId: string, name: string): Promise<void> {
   await db.update(workspaces).set({ name }).where(eq(workspaces.id, workspaceId));
+}
+
+/** Workspace default currency (package #6): the deal form's preset. */
+export async function updateWorkspaceDefaultCurrency(
+  db: Database,
+  workspaceId: string,
+  currency: string,
+): Promise<void> {
+  await db.update(workspaces).set({ defaultCurrency: currency }).where(eq(workspaces.id, workspaceId));
 }
 
 // ------------------------------------------------------- dashboard stats
@@ -3213,8 +3225,464 @@ export async function purgeExternalUserData(
     await db.delete(webchatSessions).where(eq(webchatSessions.contactId, contact.id));
     await db.delete(sequenceEnrollments).where(eq(sequenceEnrollments.contactId, contact.id));
     await db.delete(broadcastRecipients).where(eq(broadcastRecipients.contactId, contact.id));
+    // Deals (package #6) FK-reference the contact (and optionally a
+    // conversation) with NO ACTION - they must go before both.
+    await db.delete(deals).where(eq(deals.contactId, contact.id));
     await db.delete(conversations).where(eq(conversations.contactId, contact.id));
     await db.delete(contacts).where(eq(contacts.id, contact.id));
   }
   return { contacts: rows.length };
+}
+
+// ------------------------------------------- sales pipelines + deals (#6)
+
+export type PipelineRow = typeof pipelines.$inferSelect;
+export type PipelineStageRow = typeof pipelineStages.$inferSelect;
+export type DealRow = typeof deals.$inferSelect;
+export type DealStatus = "open" | "won" | "lost";
+
+/** Default stage names for a fresh pipeline (create-with-defaults path). */
+export const DEFAULT_PIPELINE_STAGE_NAMES = ["New", "Contacted", "Qualified", "Proposal", "Negotiation"] as const;
+
+export async function listPipelines(db: Database, workspaceId: string): Promise<PipelineRow[]> {
+  return db
+    .select()
+    .from(pipelines)
+    .where(eq(pipelines.workspaceId, workspaceId))
+    .orderBy(asc(pipelines.createdAt));
+}
+
+export async function getPipeline(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<PipelineRow | null> {
+  const [row] = await db
+    .select()
+    .from(pipelines)
+    .where(and(eq(pipelines.id, id), eq(pipelines.workspaceId, workspaceId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** The workspace's default pipeline (flow create_deal's landing spot). */
+export async function getDefaultPipeline(db: Database, workspaceId: string): Promise<PipelineRow | null> {
+  const rows = await listPipelines(db, workspaceId);
+  return rows.find((r) => r.isDefault) ?? rows[0] ?? null;
+}
+
+/**
+ * Create a pipeline with its stages in one transaction. `isDefault`
+ * demotes any previous default (at most one default per workspace -
+ * application-enforced, like the stage-position density below).
+ */
+export async function createPipeline(
+  db: Database,
+  input: { workspaceId: string; name: string; isDefault?: boolean; stageNames?: string[] },
+): Promise<{ pipeline: PipelineRow; stages: PipelineStageRow[] }> {
+  return db.transaction(async (tx) => {
+    if (input.isDefault) {
+      await tx
+        .update(pipelines)
+        .set({ isDefault: false, updatedAt: new Date() })
+        .where(eq(pipelines.workspaceId, input.workspaceId));
+    }
+    const [pipeline] = await tx
+      .insert(pipelines)
+      .values({ workspaceId: input.workspaceId, name: input.name, isDefault: input.isDefault ?? false })
+      .returning();
+    const stages: PipelineStageRow[] = [];
+    for (const [position, name] of (input.stageNames ?? []).entries()) {
+      const [stage] = await tx
+        .insert(pipelineStages)
+        .values({ pipelineId: pipeline!.id, name, position })
+        .returning();
+      stages.push(stage!);
+    }
+    return { pipeline: pipeline!, stages };
+  });
+}
+
+/** Partial update; `isDefault: true` demotes the previous default. */
+export async function updatePipeline(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: { name?: string; isDefault?: boolean },
+): Promise<PipelineRow | null> {
+  return db.transaction(async (tx) => {
+    if (patch.isDefault) {
+      await tx
+        .update(pipelines)
+        .set({ isDefault: false, updatedAt: new Date() })
+        .where(eq(pipelines.workspaceId, workspaceId));
+    }
+    const [row] = await tx
+      .update(pipelines)
+      .set({ ...patch, updatedAt: new Date() })
+      .where(and(eq(pipelines.id, id), eq(pipelines.workspaceId, workspaceId)))
+      .returning();
+    return row ?? null;
+  });
+}
+
+/** Delete a pipeline with its stages and deals (the caller gates on the deal count / force). */
+export async function deletePipelineCascade(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getPipeline(db, workspaceId, id);
+  if (!existing) return false;
+  await db.transaction(async (tx) => {
+    await tx.delete(deals).where(eq(deals.pipelineId, id));
+    await tx.delete(pipelineStages).where(eq(pipelineStages.pipelineId, id));
+    await tx.delete(pipelines).where(eq(pipelines.id, id));
+  });
+  return true;
+}
+
+export async function countPipelineDeals(db: Database, pipelineId: string): Promise<number> {
+  const rows = await db.select({ id: deals.id }).from(deals).where(eq(deals.pipelineId, pipelineId));
+  return rows.length;
+}
+
+export async function listPipelineStages(db: Database, pipelineId: string): Promise<PipelineStageRow[]> {
+  return db
+    .select()
+    .from(pipelineStages)
+    .where(eq(pipelineStages.pipelineId, pipelineId))
+    .orderBy(asc(pipelineStages.position));
+}
+
+export async function getPipelineStage(
+  db: Database,
+  pipelineId: string,
+  stageId: string,
+): Promise<PipelineStageRow | null> {
+  const [row] = await db
+    .select()
+    .from(pipelineStages)
+    .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)))
+    .limit(1);
+  return row ?? null;
+}
+
+/** Append a stage at the end of the pipeline (positions stay dense). */
+export async function createPipelineStage(
+  db: Database,
+  pipelineId: string,
+  name: string,
+): Promise<PipelineStageRow> {
+  const existing = await listPipelineStages(db, pipelineId);
+  const [row] = await db
+    .insert(pipelineStages)
+    .values({ pipelineId, name, position: existing.length })
+    .returning();
+  return row!;
+}
+
+export async function updatePipelineStage(
+  db: Database,
+  pipelineId: string,
+  stageId: string,
+  patch: { name?: string },
+): Promise<PipelineStageRow | null> {
+  const [row] = await db
+    .update(pipelineStages)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)))
+    .returning();
+  return row ?? null;
+}
+
+/**
+ * Delete a stage, then re-densify the remaining positions (ascending
+ * rewrites never collide on the (pipeline, position) unique index:
+ * every target position is <= the position it replaces).
+ */
+export async function deletePipelineStage(
+  db: Database,
+  pipelineId: string,
+  stageId: string,
+): Promise<boolean> {
+  const existing = await getPipelineStage(db, pipelineId, stageId);
+  if (!existing) return false;
+  await db.delete(pipelineStages).where(eq(pipelineStages.id, stageId));
+  const rest = await listPipelineStages(db, pipelineId);
+  for (const [position, stage] of rest.entries()) {
+    if (stage.position !== position) {
+      await db
+        .update(pipelineStages)
+        .set({ position, updatedAt: new Date() })
+        .where(eq(pipelineStages.id, stage.id));
+    }
+  }
+  return true;
+}
+
+/**
+ * Rewrite a pipeline's stage order. `orderedStageIds` must be exactly
+ * the pipeline's stages (the route validates). Two-phase write through
+ * negative positions so the unique index never sees a transient clash.
+ */
+export async function reorderPipelineStages(
+  db: Database,
+  pipelineId: string,
+  orderedStageIds: string[],
+): Promise<PipelineStageRow[]> {
+  await db.transaction(async (tx) => {
+    for (const [i, stageId] of orderedStageIds.entries()) {
+      await tx
+        .update(pipelineStages)
+        .set({ position: -1 - i, updatedAt: new Date() })
+        .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)));
+    }
+    for (const [position, stageId] of orderedStageIds.entries()) {
+      await tx
+        .update(pipelineStages)
+        .set({ position, updatedAt: new Date() })
+        .where(and(eq(pipelineStages.id, stageId), eq(pipelineStages.pipelineId, pipelineId)));
+    }
+  });
+  return listPipelineStages(db, pipelineId);
+}
+
+export async function countStageDeals(db: Database, stageId: string): Promise<number> {
+  const rows = await db.select({ id: deals.id }).from(deals).where(eq(deals.stageId, stageId));
+  return rows.length;
+}
+
+export interface DealWithContact extends DealRow {
+  contactDisplayName: string | null;
+  contactExternalId: string;
+  contactChannel: string;
+}
+
+const dealWithContactProjection = {
+  id: deals.id,
+  workspaceId: deals.workspaceId,
+  pipelineId: deals.pipelineId,
+  stageId: deals.stageId,
+  contactId: deals.contactId,
+  conversationId: deals.conversationId,
+  title: deals.title,
+  value: deals.value,
+  currency: deals.currency,
+  status: deals.status,
+  expectedCloseDate: deals.expectedCloseDate,
+  notes: deals.notes,
+  createdByUserId: deals.createdByUserId,
+  stageChangedAt: deals.stageChangedAt,
+  closedAt: deals.closedAt,
+  createdAt: deals.createdAt,
+  updatedAt: deals.updatedAt,
+  contactDisplayName: contacts.displayName,
+  contactExternalId: contacts.externalId,
+  contactChannel: contacts.channel,
+};
+
+/**
+ * Deals of a workspace, newest first, with the contact's display fields
+ * joined in (the Kanban card never needs a second fetch). `total` is the
+ * full filtered count; limit/offset slice in JS (the broadcast-recipient
+ * precedent - one query shape for Postgres and the in-memory fake).
+ */
+export async function listDeals(
+  db: Database,
+  workspaceId: string,
+  filter: {
+    pipelineId?: string;
+    stageId?: string;
+    status?: string;
+    contactId?: string;
+    limit?: number;
+    offset?: number;
+  } = {},
+): Promise<{ deals: DealWithContact[]; total: number }> {
+  const rows = await db
+    .select(dealWithContactProjection)
+    .from(deals)
+    .innerJoin(contacts, eq(deals.contactId, contacts.id))
+    .where(
+      and(
+        eq(deals.workspaceId, workspaceId),
+        filter.pipelineId ? eq(deals.pipelineId, filter.pipelineId) : undefined,
+        filter.stageId ? eq(deals.stageId, filter.stageId) : undefined,
+        filter.status ? eq(deals.status, filter.status) : undefined,
+        filter.contactId ? eq(deals.contactId, filter.contactId) : undefined,
+      ),
+    )
+    .orderBy(desc(deals.createdAt));
+  const total = rows.length;
+  const offset = filter.offset ?? 0;
+  const sliced = filter.limit === undefined ? rows.slice(offset) : rows.slice(offset, offset + filter.limit);
+  return { deals: sliced as DealWithContact[], total };
+}
+
+export async function getDeal(
+  db: Database,
+  workspaceId: string,
+  id: string,
+): Promise<DealWithContact | null> {
+  const [row] = await db
+    .select(dealWithContactProjection)
+    .from(deals)
+    .innerJoin(contacts, eq(deals.contactId, contacts.id))
+    .where(and(eq(deals.id, id), eq(deals.workspaceId, workspaceId)))
+    .limit(1);
+  return (row as DealWithContact | undefined) ?? null;
+}
+
+export async function createDeal(
+  db: Database,
+  input: {
+    workspaceId: string;
+    pipelineId: string;
+    stageId: string;
+    contactId: string;
+    conversationId?: string | null;
+    title: string;
+    /** Decimal string for the numeric column; null = unsized. */
+    value?: string | null;
+    currency: string;
+    status?: DealStatus;
+    expectedCloseDate?: string | null;
+    notes?: string | null;
+    createdByUserId?: string | null;
+  },
+): Promise<DealRow> {
+  const [row] = await db
+    .insert(deals)
+    .values({
+      workspaceId: input.workspaceId,
+      pipelineId: input.pipelineId,
+      stageId: input.stageId,
+      contactId: input.contactId,
+      conversationId: input.conversationId ?? null,
+      title: input.title,
+      value: input.value ?? null,
+      currency: input.currency,
+      status: input.status ?? "open",
+      expectedCloseDate: input.expectedCloseDate ?? null,
+      notes: input.notes ?? null,
+      createdByUserId: input.createdByUserId ?? null,
+      stageChangedAt: new Date(),
+      closedAt: input.status === "won" || input.status === "lost" ? new Date() : null,
+    })
+    .returning();
+  return row!;
+}
+
+export interface DealPatch {
+  title?: string;
+  pipelineId?: string;
+  stageId?: string;
+  conversationId?: string | null;
+  /** Decimal string, or null to clear the size. */
+  value?: string | null;
+  currency?: string;
+  status?: DealStatus;
+  expectedCloseDate?: string | null;
+  notes?: string | null;
+  /** Maintained by the caller (route / flow): set when the stage changes. */
+  stageChangedAt?: Date;
+  /** Maintained by the caller: stamped on close, cleared on reopen. */
+  closedAt?: Date | null;
+}
+
+/** Partial update; returns null when the deal is not in the workspace. */
+export async function updateDeal(
+  db: Database,
+  workspaceId: string,
+  id: string,
+  patch: DealPatch,
+): Promise<DealRow | null> {
+  const [row] = await db
+    .update(deals)
+    .set({ ...patch, updatedAt: new Date() })
+    .where(and(eq(deals.id, id), eq(deals.workspaceId, workspaceId)))
+    .returning();
+  return row ?? null;
+}
+
+/** Hard delete (workspace-scoped); false when the deal is not the workspace's. */
+export async function deleteDeal(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const existing = await getDeal(db, workspaceId, id);
+  if (!existing) return false;
+  await db.delete(deals).where(eq(deals.id, id));
+  return true;
+}
+
+export interface PipelineStageSummary {
+  stageId: string;
+  name: string;
+  position: number;
+  openCount: number;
+  /** Sum of OPEN deal values in the stage (won/lost are reported apart). */
+  openValue: number;
+}
+
+export interface PipelineSummary {
+  pipelineId: string;
+  stages: PipelineStageSummary[];
+  open: { count: number; value: number };
+  won: { count: number; value: number };
+  lost: { count: number; value: number };
+}
+
+/**
+ * The board's money view (package #8 analytics consumes the same shape):
+ * per-stage OPEN counts + value sums, plus won/lost totals across all
+ * stages. Aggregation runs in JS over the pipeline's deals - one query
+ * shape for Postgres and the in-memory fake, and pipelines are small.
+ * Values are decimal strings on the row; sums round to cents at the end.
+ */
+export async function getPipelineSummary(
+  db: Database,
+  workspaceId: string,
+  pipelineId: string,
+): Promise<PipelineSummary> {
+  const stages = await listPipelineStages(db, pipelineId);
+  const rows = await db
+    .select()
+    .from(deals)
+    .where(and(eq(deals.workspaceId, workspaceId), eq(deals.pipelineId, pipelineId)));
+  const byStage = new Map<string, { count: number; value: number }>(
+    stages.map((s) => [s.id, { count: 0, value: 0 }]),
+  );
+  const won = { count: 0, value: 0 };
+  const lost = { count: 0, value: 0 };
+  const open = { count: 0, value: 0 };
+  for (const deal of rows) {
+    const value = deal.value === null || deal.value === undefined ? 0 : Number(deal.value);
+    if (deal.status === "won") {
+      won.count += 1;
+      won.value += value;
+    } else if (deal.status === "lost") {
+      lost.count += 1;
+      lost.value += value;
+    } else {
+      open.count += 1;
+      open.value += value;
+      const bucket = byStage.get(deal.stageId);
+      if (bucket) {
+        bucket.count += 1;
+        bucket.value += value;
+      }
+    }
+  }
+  const cents = (n: number) => Math.round(n * 100) / 100;
+  return {
+    pipelineId,
+    stages: stages.map((s) => {
+      const bucket = byStage.get(s.id)!;
+      return {
+        stageId: s.id,
+        name: s.name,
+        position: s.position,
+        openCount: bucket.count,
+        openValue: cents(bucket.value),
+      };
+    }),
+    open: { count: open.count, value: cents(open.value) },
+    won: { count: won.count, value: cents(won.value) },
+    lost: { count: lost.count, value: cents(lost.value) },
+  };
 }

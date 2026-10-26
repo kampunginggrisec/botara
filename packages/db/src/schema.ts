@@ -1,6 +1,6 @@
 import { sql } from "drizzle-orm";
 import {
-  pgTable, uuid, varchar, text, timestamp, boolean, jsonb, integer, numeric, uniqueIndex, index,
+  pgTable, uuid, varchar, text, timestamp, boolean, jsonb, integer, numeric, date, uniqueIndex, index,
 } from "drizzle-orm/pg-core";
 
 /**
@@ -16,6 +16,13 @@ export const workspaces = pgTable("workspaces", {
   id: uuid("id").primaryKey().defaultRandom(),
   name: varchar("name", { length: 200 }).notNull(),
   slug: varchar("slug", { length: 120 }).notNull(),
+  /**
+   * Default currency for money the workspace denominates itself (deal
+   * values, package #6). ISO 4217 code; IDR-first per the adoption
+   * program defaults - Indonesian workspaces are the primary audience,
+   * and a deal created without an explicit currency lands here.
+   */
+  defaultCurrency: varchar("default_currency", { length: 3 }).notNull().default("IDR"),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [uniqueIndex("workspaces_slug_idx").on(t.slug)]);
 
@@ -669,3 +676,70 @@ export const costLedger = pgTable("cost_ledger", {
   referenceId: varchar("reference_id", { length: 200 }), // message id / job id
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 }, (t) => [index("cost_ledger_ws_created_idx").on(t.workspaceId, t.createdAt)]);
+
+/**
+ * Sales pipelines + deals (adoption package #6, wacrm gap §5).
+ *
+ * A workspace runs MULTIPLE pipelines (e.g. "Retail" and "Wholesale");
+ * each pipeline is an ordered list of stages rendered as Kanban columns.
+ * A deal sits in exactly one stage of one pipeline, REQUIRES a contact,
+ * and OPTIONALLY links the conversation it grew out of.
+ *
+ * Won/lost is deliberately a deal STATUS (open|won|lost), NOT a pair of
+ * special stages: a deal is won or lost FROM whatever stage it reached,
+ * and the stage it closed in stays meaningful for reporting (package
+ * #8 analytics reads the summary aggregates built on this split).
+ */
+export const pipelines = pgTable("pipelines", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  name: varchar("name", { length: 200 }).notNull(),
+  /** The workspace's default pipeline (flow create_deal lands here). At most one per workspace - enforced by the API, not the schema. */
+  isDefault: boolean("is_default").notNull().default(false),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [index("pipelines_ws_idx").on(t.workspaceId)]);
+
+export const pipelineStages = pgTable("pipeline_stages", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id),
+  name: varchar("name", { length: 200 }).notNull(),
+  /** Column order within the pipeline (0-based, dense). */
+  position: integer("position").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  uniqueIndex("pipeline_stages_pipeline_position_idx").on(t.pipelineId, t.position),
+  index("pipeline_stages_pipeline_idx").on(t.pipelineId),
+]);
+
+export const deals = pgTable("deals", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
+  pipelineId: uuid("pipeline_id").notNull().references(() => pipelines.id),
+  stageId: uuid("stage_id").notNull().references(() => pipelineStages.id),
+  /** A deal is always ABOUT a contact - the one hard link in the model. */
+  contactId: uuid("contact_id").notNull().references(() => contacts.id),
+  /** The conversation the deal grew out of, when it came from the inbox. */
+  conversationId: uuid("conversation_id").references(() => conversations.id),
+  title: varchar("title", { length: 300 }).notNull(),
+  /** Deal size in `currency`; null = not yet sized. numeric(14,2) like catalog prices. */
+  value: numeric("value", { precision: 14, scale: 2 }),
+  currency: varchar("currency", { length: 3 }).notNull(),
+  /** open|won|lost - separate from the stage (see the package note above). */
+  status: varchar("status", { length: 20 }).notNull().default("open"),
+  expectedCloseDate: date("expected_close_date"),
+  notes: text("notes"),
+  /** Who created the deal; null when a flow's create_deal step made it. */
+  createdByUserId: uuid("created_by_user_id").references(() => users.id),
+  /** Last time the deal changed stage (board dwell-time reporting). */
+  stageChangedAt: timestamp("stage_changed_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Stamped when status becomes won/lost; cleared on reopen. */
+  closedAt: timestamp("closed_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+}, (t) => [
+  index("deals_ws_idx").on(t.workspaceId),
+  index("deals_pipeline_stage_idx").on(t.pipelineId, t.stageId),
+  index("deals_contact_idx").on(t.contactId),
+]);

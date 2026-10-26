@@ -5,7 +5,7 @@ export {
   webchatSessions, scheduledPosts, sequences, sequenceEnrollments,
   tokenVault, workspaceDomains, auditLog, kbDocuments, kbChunks,
   dataDeletionRequests, flows, flowWaits, apiTokens, processedComments, growthLinks,
-  catalogProducts, platformSettings,
+  catalogProducts, platformSettings, pipelines, pipelineStages, deals,
 } from "./schema";
 export { getDb, closeDb, type Database } from "./client";
 /** Re-exported so API/worker code can build raw SQL fragments without depending on drizzle-orm directly. */
