@@ -93,8 +93,10 @@ describe("/admin/settings", () => {
       body: JSON.stringify({ updates: [{ key: "META_APP_ID", value: "db-app-id" }] }),
     });
     expect(put.status).toBe(200);
-    const putBody = (await put.json()) as { settings: Array<{ key: string; source: string | null }> };
+    const putBody = (await put.json()) as { settings: Array<{ key: string; source: string | null; value: string | null }> };
     expect(putBody.settings.find((s) => s.key === "META_APP_ID")?.source).toBe("db");
+    // Non-secret settings expose their resolved value (panel prefills inputs).
+    expect(putBody.settings.find((s) => s.key === "META_APP_ID")?.value).toBe("db-app-id");
     // The writing process applies the change to its live env immediately.
     expect(env.META_APP_ID).toBe("db-app-id");
     const pub = await app.request("/config/public");
@@ -126,8 +128,10 @@ describe("/admin/settings", () => {
     const get = await app.request("/admin/settings", { headers: auth(admin.token) });
     const getText = await get.text();
     expect(getText).not.toContain(SECRET);
-    const body = JSON.parse(getText) as { settings: Array<{ key: string; source: string | null; secret: boolean }> };
+    const body = JSON.parse(getText) as { settings: Array<{ key: string; source: string | null; secret: boolean; value: string | null }> };
     expect(body.settings.find((s) => s.key === "META_APP_SECRET")).toMatchObject({ source: "db", secret: true });
+    // Even though the value is set, the view never carries it.
+    expect(body.settings.find((s) => s.key === "META_APP_SECRET")?.value).toBeNull();
 
     // At rest: ciphertext only.
     const row = storage.rows.get("META_APP_SECRET");

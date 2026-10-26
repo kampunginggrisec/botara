@@ -183,8 +183,14 @@ export interface PlatformSettingView {
   group: ManagedSettingGroup;
   label: string;
   hint?: string;
-  /** True when a value resolves from either source. Plaintext values are NEVER included. */
+  /** True when a value resolves from either source. */
   isSet: boolean;
+  /**
+   * Resolved plaintext for NON-secret settings only (app ids and config —
+   * already public via /config/public), so the panel can prefill inputs.
+   * Secret values NEVER leave the server: always null for secret keys.
+   */
+  value: string | null;
   source: "db" | "env" | null;
   updatedAt: string | null;
   updatedBy: string | null;
@@ -250,6 +256,9 @@ export class PlatformSettingsService {
       return {
         key: def.key, secret: def.secret, group: def.group, label: def.label, hint: def.hint,
         isSet: true, source: "db",
+        // Non-secret DB rows hold plaintext; secret rows hold ciphertext
+        // in a separate column and their `value` column is always null.
+        value: def.secret ? null : row.value,
         updatedAt: row.updatedAt.toISOString(), updatedBy: row.updatedBy,
       };
     }
@@ -258,11 +267,12 @@ export class PlatformSettingsService {
     return {
       key: def.key, secret: def.secret, group: def.group, label: def.label, hint: def.hint,
       isSet: fromEnv, source: fromEnv ? "env" : null,
+      value: !def.secret && fromEnv ? (envValue as string) : null,
       updatedAt: null, updatedBy: null,
     };
   }
 
-  /** All managed keys with set/source metadata - NEVER any plaintext value. */
+  /** All managed keys with set/source metadata; values only for non-secret keys. */
   async listViews(): Promise<PlatformSettingView[]> {
     const rows = await this.storage.list();
     const byKey = new Map(rows.map((r) => [r.key, r]));

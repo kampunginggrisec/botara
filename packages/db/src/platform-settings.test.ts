@@ -80,7 +80,7 @@ describe("resolution order: DB -> env -> unset", () => {
     expect(view.isSet).toBe(true);
   });
 
-  test("views report source db/env/null and never a plaintext value", async () => {
+  test("views report source db/env/null; a secret value never appears", async () => {
     const { service } = makeService({ R2_BUCKET: "env-bucket" });
     await service.setValue("AI_API_KEY", "sk-live-123");
     const views = await service.listViews();
@@ -89,6 +89,24 @@ describe("resolution order: DB -> env -> unset", () => {
     expect(byKey.get("R2_BUCKET")).toMatchObject({ isSet: true, source: "env", secret: false });
     expect(byKey.get("TIKTOK_APP_ID")).toMatchObject({ isSet: false, source: null });
     expect(JSON.stringify(views)).not.toContain("sk-live-123");
+  });
+
+  test("views expose the resolved value for NON-secret keys only", async () => {
+    const { service } = makeService({ R2_BUCKET: "env-bucket", META_APP_SECRET: "env-secret-value" });
+    await service.setValue("AI_API_KEY", "sk-live-123");
+    await service.setValue("META_APP_ID", "db-app-id");
+    const views = await service.listViews();
+    const byKey = new Map(views.map((v) => [v.key, v]));
+    // Non-secret: DB value wins, env value is the fallback, unset is null.
+    expect(byKey.get("META_APP_ID")?.value).toBe("db-app-id");
+    expect(byKey.get("R2_BUCKET")?.value).toBe("env-bucket");
+    expect(byKey.get("TIKTOK_APP_ID")?.value).toBeNull();
+    // Secret: value is ALWAYS null, from DB or env alike.
+    expect(byKey.get("AI_API_KEY")?.value).toBeNull();
+    expect(byKey.get("META_APP_SECRET")?.value).toBeNull();
+    const json = JSON.stringify(views);
+    expect(json).not.toContain("sk-live-123");
+    expect(json).not.toContain("env-secret-value");
   });
 
   test("unmanaged keys are rejected with 400 VALIDATION", async () => {
