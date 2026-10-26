@@ -201,3 +201,9 @@ export {
   DEFAULT_EMBEDDING_MODEL, chunkText, cosineSimilarity, rankChunks,
   type RankedChunk, type TextChunk,
 } from "./kb";
+
+export {
+  AI_INTENT_LABELS, CONVERSATION_ANALYSIS_HISTORY_CAP,
+  buildConversationAnalysisMessages, parseConversationAnalysis,
+  type AiIntentLabel, type ConversationAnalysis,
+} from "./analysis";
