@@ -234,6 +234,7 @@ widget, not the operator SPA.
 | Route | Class | UI location / reason |
 |---|---|---|
 | GET /stats/overview | UI | Dashboard |
+| GET /stats/insights | UI | Analytics |
 | GET /config/public | UI | Channels connect gating (configured app ids) |
 
 ### Platform admin
