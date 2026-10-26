@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { AppError } from "@botara/shared";
+import { AppError, parseApiTokenScopes } from "@botara/shared";
 import {
   countPlatformAdmins, countUsers, sql,
   createApiToken as createApiTokenRow, createUser, createWorkspace,
@@ -66,10 +66,43 @@ export interface ApiTokenView {
   name: string;
   /** Non-secret display fragment, e.g. "bta_AbCd1234". */
   prefix: string;
+  /** Scoped tokens (#5): bound workspace id; null = any of the user's workspaces. */
+  workspaceId: string | null;
+  /** Scoped tokens (#5): granted scopes; null = unrestricted (legacy). */
+  scopes: string[] | null;
+  /** Scoped tokens (#5): ISO expiry; null = never expires. */
+  expiresAt: string | null;
   lastUsedAt: string | null;
   revokedAt: string | null;
   createdAt: string;
 }
+
+/** Optional restrictions for a newly minted token (#5). All default to legacy NULLs. */
+export interface CreateApiTokenOptions {
+  workspaceId?: string | null;
+  scopes?: string[] | null;
+  expiresAt?: Date | null;
+}
+
+/**
+ * What a presented token grants, resolved at authentication time (#5).
+ * `scopes: null` means the legacy unrestricted grant; a non-null list is
+ * enforced against the route's required scope. `workspaceId` binds the
+ * token to one workspace. Expiry is NOT part of enforcement here - an
+ * expired token never resolves to "ok" (see ApiTokenResolution).
+ */
+export interface ApiTokenGrant {
+  tokenId: string;
+  workspaceId: string | null;
+  scopes: string[] | null;
+  expiresAt: string | null;
+}
+
+/** Discriminated result of resolving a presented `bta_...` token. */
+export type ApiTokenResolution =
+  | { status: "ok"; user: AuthUser; grant: ApiTokenGrant }
+  | { status: "expired"; grant: ApiTokenGrant }
+  | { status: "invalid" };
 
 export const API_TOKEN_PREFIX = "bta_";
 
@@ -112,11 +145,17 @@ export interface AuthStore {
   updateUserName(userId: string, name: string): Promise<void>;
   renameWorkspace(workspaceId: string, name: string): Promise<void>;
   /** API tokens (adopted features): create returns the raw token ONCE. */
-  createApiToken(userId: string, name: string): Promise<{ raw: string; token: ApiTokenView }>;
+  createApiToken(userId: string, name: string, options?: CreateApiTokenOptions): Promise<{ raw: string; token: ApiTokenView }>;
   listApiTokens(userId: string): Promise<ApiTokenView[]>;
   revokeApiToken(userId: string, id: string): Promise<boolean>;
   /** Resolve a presented `bta_...` token to its user (null when unknown/revoked). */
   findUserByApiToken(rawToken: string): Promise<AuthUser | null>;
+  /**
+   * Full token resolution (#5): user + grant for a valid token, a
+   * distinct "expired" for a past-expiry token, "invalid" otherwise
+   * (unknown hash, revoked, or the owning user no longer exists).
+   */
+  resolveApiToken(rawToken: string): Promise<ApiTokenResolution>;
   audit(entry: {
     workspaceId?: string;
     userId?: string;
@@ -130,6 +169,41 @@ const toAuthUser = (row: {
 }): AuthUser => ({
   id: row.id, email: row.email, name: row.name, passwordHash: row.passwordHash,
   isPlatformAdmin: row.isPlatformAdmin,
+});
+
+/** Shape of an api_tokens row as the stores consume it (Db + in-memory share the mapping). */
+interface ApiTokenRowLike {
+  id: string;
+  name: string;
+  prefix: string;
+  workspaceId: string | null;
+  scopes: string[] | null;
+  expiresAt: Date | null;
+  lastUsedAt: Date | null;
+  revokedAt: Date | null;
+  createdAt: Date;
+}
+
+const toApiTokenView = (row: ApiTokenRowLike): ApiTokenView => ({
+  id: row.id, name: row.name, prefix: row.prefix,
+  workspaceId: row.workspaceId ?? null,
+  scopes: row.scopes ?? null,
+  expiresAt: row.expiresAt?.toISOString() ?? null,
+  lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
+  revokedAt: row.revokedAt?.toISOString() ?? null,
+  createdAt: row.createdAt.toISOString(),
+});
+
+/**
+ * Row -> grant. Stored scopes are validated against the taxonomy; a
+ * corrupt stored list fails CLOSED (restricted, grants nothing) instead
+ * of silently widening to the legacy unrestricted grant.
+ */
+const toApiTokenGrant = (row: ApiTokenRowLike): ApiTokenGrant => ({
+  tokenId: row.id,
+  workspaceId: row.workspaceId ?? null,
+  scopes: row.scopes == null ? null : (parseApiTokenScopes(row.scopes) ?? []),
+  expiresAt: row.expiresAt?.toISOString() ?? null,
 });
 
 /** Production AuthStore over the Drizzle repositories. */
@@ -228,45 +302,47 @@ export class DbAuthStore implements AuthStore {
     await updateWorkspaceName(this.getDatabase(), workspaceId, name);
   }
 
-  async createApiToken(userId: string, name: string) {
+  async createApiToken(userId: string, name: string, options: CreateApiTokenOptions = {}) {
     const raw = generateApiToken();
     const row = await createApiTokenRow(this.getDatabase(), {
       userId,
       name,
       tokenHash: hashApiToken(raw),
       prefix: apiTokenDisplayPrefix(raw),
+      workspaceId: options.workspaceId ?? null,
+      scopes: options.scopes ?? null,
+      expiresAt: options.expiresAt ?? null,
     });
-    return {
-      raw,
-      token: {
-        id: row.id, name: row.name, prefix: row.prefix,
-        lastUsedAt: null, revokedAt: null, createdAt: row.createdAt.toISOString(),
-      },
-    };
+    return { raw, token: toApiTokenView(row) };
   }
 
   async listApiTokens(userId: string) {
     const rows = await listApiTokensByUser(this.getDatabase(), userId);
-    return rows.map((row) => ({
-      id: row.id, name: row.name, prefix: row.prefix,
-      lastUsedAt: row.lastUsedAt?.toISOString() ?? null,
-      revokedAt: row.revokedAt?.toISOString() ?? null,
-      createdAt: row.createdAt.toISOString(),
-    }));
+    return rows.map(toApiTokenView);
   }
 
   async revokeApiToken(userId: string, id: string) {
     return revokeApiTokenRow(this.getDatabase(), userId, id);
   }
 
-  async findUserByApiToken(rawToken: string) {
+  async resolveApiToken(rawToken: string): Promise<ApiTokenResolution> {
     const db = this.getDatabase();
     const row = await findApiTokenByHash(db, hashApiToken(rawToken));
-    if (!row) return null;
+    if (!row) return { status: "invalid" };
+    const grant = toApiTokenGrant(row);
+    if (row.expiresAt && row.expiresAt.getTime() <= Date.now()) {
+      return { status: "expired", grant };
+    }
+    const user = await getUserById(db, row.userId);
+    if (!user) return { status: "invalid" };
     // Best-effort usage stamp - a failed stamp must never fail auth.
     await touchApiToken(db, row.id, new Date()).catch(() => undefined);
-    const user = await getUserById(db, row.userId);
-    return user ? toAuthUser(user) : null;
+    return { status: "ok", user: toAuthUser(user), grant };
+  }
+
+  async findUserByApiToken(rawToken: string) {
+    const resolution = await this.resolveApiToken(rawToken);
+    return resolution.status === "ok" ? resolution.user : null;
   }
 
   async audit(entry: { workspaceId?: string; userId?: string; action: string; details?: Record<string, unknown> }) {
@@ -387,7 +463,7 @@ export class InMemoryAuthStore implements AuthStore {
     this.auditLog.push(entry);
   }
 
-  async createApiToken(userId: string, name: string) {
+  async createApiToken(userId: string, name: string, options: CreateApiTokenOptions = {}) {
     const raw = generateApiToken();
     const token: ApiTokenView & { userId: string; tokenHash: string } = {
       id: crypto.randomUUID(),
@@ -395,6 +471,9 @@ export class InMemoryAuthStore implements AuthStore {
       name,
       prefix: apiTokenDisplayPrefix(raw),
       tokenHash: hashApiToken(raw),
+      workspaceId: options.workspaceId ?? null,
+      scopes: options.scopes ? [...options.scopes] : null,
+      expiresAt: options.expiresAt?.toISOString() ?? null,
       lastUsedAt: null,
       revokedAt: null,
       createdAt: new Date().toISOString(),
@@ -417,12 +496,28 @@ export class InMemoryAuthStore implements AuthStore {
     return true;
   }
 
-  async findUserByApiToken(rawToken: string) {
+  async resolveApiToken(rawToken: string): Promise<ApiTokenResolution> {
     const hash = hashApiToken(rawToken);
     const token = [...this.apiTokens.values()].find((tk) => tk.tokenHash === hash && !tk.revokedAt);
-    if (!token) return null;
+    if (!token) return { status: "invalid" };
+    const grant: ApiTokenGrant = {
+      tokenId: token.id,
+      workspaceId: token.workspaceId,
+      scopes: token.scopes ? [...token.scopes] : null,
+      expiresAt: token.expiresAt,
+    };
+    if (token.expiresAt && new Date(token.expiresAt).getTime() <= Date.now()) {
+      return { status: "expired", grant };
+    }
+    const user = this.users.get(token.userId);
+    if (!user) return { status: "invalid" };
     token.lastUsedAt = new Date().toISOString();
-    return this.users.get(token.userId) ?? null;
+    return { status: "ok", user, grant };
+  }
+
+  async findUserByApiToken(rawToken: string) {
+    const resolution = await this.resolveApiToken(rawToken);
+    return resolution.status === "ok" ? resolution.user : null;
   }
 }
 
@@ -497,6 +592,12 @@ export interface AuthContext {
   role?: string;
   /** True when context came from the BOTARA_ALLOW_HEADER_WORKSPACE dev fallback. */
   viaHeaderFallback?: boolean;
+  /**
+   * Set when the request authenticated with an API token (#5): the
+   * token's grant. Absent for session JWTs - sessions are never
+   * scope-limited. Enforcement lives in app.ts (route scope map).
+   */
+  apiToken?: ApiTokenGrant;
 }
 
 /**
