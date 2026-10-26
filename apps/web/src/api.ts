@@ -346,7 +346,14 @@ export interface BroadcastSummary {
   status: string;
   sentCount: number;
   failedCount: number;
-  estimatedCostUsd: number;
+  /**
+   * Create-time estimate from a NULLABLE numeric column; the API
+   * passes the raw row through, so this is a number, a numeric string
+   * (postgres-js returns numerics as strings), or null when the row
+   * carries no estimate. Render only via formatUsd/broadcastCostUsd -
+   * never call .toFixed on it directly.
+   */
+  estimatedCostUsd: number | string | null;
   /** Realized cost from the ledger (0 until sends are recorded). */
   totalCostUsd: number;
   ratesVersion: string;

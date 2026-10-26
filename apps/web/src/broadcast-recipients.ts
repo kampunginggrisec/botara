@@ -53,6 +53,46 @@ export function recipientStatusTone(status: string): string {
   }
 }
 
+/**
+ * Money on broadcast rows. `estimatedCostUsd` is a NULLABLE numeric
+ * column and the API passes the raw row through; postgres-js returns
+ * numerics as strings, so over the wire the value is a number, a
+ * numeric string, or null. Rendering must never call `.toFixed` on it
+ * raw - a null (or string) value used to white-screen the whole
+ * Broadcast page. These helpers are the only sanctioned way to turn
+ * broadcast money fields into display text.
+ */
+export type UsdValue = number | string | null | undefined;
+
+/** Coerce an API money value to a finite number, or null when unknown. */
+export function usdNumber(value: UsdValue): number | null {
+  if (value === null || value === undefined) return null;
+  // Number("") is 0, but an empty wire value means "no value", not free.
+  if (typeof value === "string" && value.trim() === "") return null;
+  const n = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * The cost a broadcast row shows: the realized ledger total once any
+ * send is recorded, otherwise the create-time estimate, otherwise
+ * null (unknown - the row predates estimates or was made without one).
+ */
+export function broadcastCostUsd(b: {
+  totalCostUsd?: UsdValue;
+  estimatedCostUsd?: UsdValue;
+}): number | null {
+  const total = usdNumber(b.totalCostUsd);
+  if (total !== null && total > 0) return total;
+  return usdNumber(b.estimatedCostUsd);
+}
+
+/** "$x.xxxx" for a known cost, an em dash for an unknown one. */
+export function formatUsd(value: UsdValue): string {
+  const n = usdNumber(value);
+  return n === null ? "—" : `$${n.toFixed(4)}`;
+}
+
 export interface RecipientStamp { status: RecipientStatus; at: string }
 
 /**

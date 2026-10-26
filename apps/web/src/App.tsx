@@ -23,7 +23,7 @@ import { downloadFlowExport, parseFlowImport } from "./flows/flow-transfer";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
-import { RECIPIENT_STATUSES, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
+import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { SavedRepliesPicker } from "./saved-replies-picker";
 import {
   buildGroupUpdates, groupHasChanges, inputValueFor, platformConfigured,
@@ -1467,7 +1467,16 @@ function BroadcastPage() {
     if (detail?.id === id) { setDetail(null); return; }
     try {
       const res = await api.getBroadcast(id);
-      setDetail(res.broadcast);
+      // The API returns the cost report as SIBLING fields of the
+      // broadcast row, not on it - merge them in so the detail matches
+      // its declared BroadcastDetail shape (totalCostUsd & friends
+      // were undefined at runtime before this).
+      setDetail({
+        ...res.broadcast,
+        totalCostUsd: res.totalCostUsd,
+        costEntries: res.costEntries,
+        costUnits: res.costUnits,
+      });
       setRecipientStatusFilter("");
       void loadRecipients(id, "");
     } catch (err) {
@@ -1696,7 +1705,7 @@ function BroadcastPage() {
                   <td className="py-1.5">{b.name ?? t("broadcast.unnamed")}</td>
                   <td className="py-1.5">{b.status}</td>
                   <td className="py-1.5">{b.sentCount}/{b.recipientCount}{b.failedCount > 0 ? ` · ${b.failedCount} ${t("broadcast.failedLabel").toLowerCase()}` : ""}</td>
-                  <td className="py-1.5">${(b.totalCostUsd > 0 ? b.totalCostUsd : b.estimatedCostUsd).toFixed(4)}</td>
+                  <td className="py-1.5">{formatUsd(broadcastCostUsd(b))}</td>
                   <td className="py-1.5">{fmtDateTime(b.createdAt)}</td>
                 </tr>
               ))}
@@ -1710,8 +1719,8 @@ function BroadcastPage() {
               <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.recipientsLabel")}</dt><dd>{detail.recipientCount}</dd></div>
               <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.sentLabel")}</dt><dd>{detail.sentCount}</dd></div>
               <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.failedLabel")}</dt><dd>{detail.failedCount}</dd></div>
-              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.estimatedCost")}</dt><dd>${detail.estimatedCostUsd.toFixed(4)}</dd></div>
-              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.actualCost")}</dt><dd>${detail.totalCostUsd.toFixed(4)}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.estimatedCost")}</dt><dd>{formatUsd(detail.estimatedCostUsd)}</dd></div>
+              <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.actualCost")}</dt><dd>{formatUsd(detail.totalCostUsd)}</dd></div>
               <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.costEntries")}</dt><dd>{detail.costEntries} · {detail.costUnits} units</dd></div>
               {detail.tag && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.tagLabel")}</dt><dd>{detail.tag}</dd></div>}
               {detail.country && <div><dt className="text-slate-500 dark:text-slate-400">{t("broadcast.colCountry")}</dt><dd>{detail.country}</dd></div>}

@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  RECIPIENT_STATUSES, countRecipientsByStatus, filterRecipientsByStatus,
-  isRecipientStatus, recipientTimeline,
+  RECIPIENT_STATUSES, broadcastCostUsd, countRecipientsByStatus, filterRecipientsByStatus,
+  formatUsd, isRecipientStatus, recipientTimeline, usdNumber,
 } from "./broadcast-recipients";
 import type { BroadcastRecipient } from "./api";
 
@@ -53,5 +53,43 @@ describe("broadcast recipients view model (package #4)", () => {
     expect(recipientTimeline(row({
       sentAt: "t1", deliveredAt: "t2", readAt: "t3", repliedAt: "t4",
     })).map((s) => s.status)).toEqual(["sent", "delivered", "read", "replied"]);
+  });
+});
+
+describe("broadcast cost helpers (null-safe money rendering)", () => {
+  test("usdNumber coerces numbers and numeric strings, rejects the unknown", () => {
+    expect(usdNumber(0.25)).toBe(0.25);
+    expect(usdNumber(0)).toBe(0);
+    expect(usdNumber("0.250000")).toBe(0.25);
+    expect(usdNumber(null)).toBeNull();
+    expect(usdNumber(undefined)).toBeNull();
+    expect(usdNumber("")).toBeNull();
+    expect(usdNumber("not-a-number")).toBeNull();
+  });
+
+  test("null estimate falls back: no cost is known, none is invented", () => {
+    // The white-screen regression: totalCostUsd 0 + estimatedCostUsd null.
+    expect(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: null })).toBeNull();
+    expect(formatUsd(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: null }))).toBe("—");
+    expect(formatUsd(null)).toBe("—");
+    expect(formatUsd(undefined)).toBe("—");
+  });
+
+  test("0 total with an estimate shows the estimate (number or wire string)", () => {
+    expect(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: 0.25 })).toBe(0.25);
+    expect(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: "0.250000" })).toBe(0.25);
+    expect(formatUsd(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: "0.250000" }))).toBe("$0.2500");
+  });
+
+  test("positive total wins over the estimate", () => {
+    expect(broadcastCostUsd({ totalCostUsd: 1.5, estimatedCostUsd: 0.25 })).toBe(1.5);
+    expect(broadcastCostUsd({ totalCostUsd: "1.500000", estimatedCostUsd: null })).toBe(1.5);
+    expect(formatUsd(1.5)).toBe("$1.5000");
+  });
+
+  test("a genuine zero is rendered as $0.0000, not as unknown", () => {
+    expect(broadcastCostUsd({ totalCostUsd: 0, estimatedCostUsd: 0 })).toBe(0);
+    expect(formatUsd(0)).toBe("$0.0000");
+    expect(formatUsd("0.000000")).toBe("$0.0000");
   });
 });
