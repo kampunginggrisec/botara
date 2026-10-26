@@ -26,6 +26,26 @@ export type FlowAction =
   | { type: "schedule_delay"; seconds: number }
   | { type: "call_webhook"; url: string; method: "GET" | "POST" }
   | { type: "set_contact_field"; field: string; value: string }
+  // Action steps (adoption package #3): world mutations, pass-through.
+  | { type: "add_tag"; tag: string }
+  | { type: "remove_tag"; tag: string }
+  | { type: "assign_conversation"; userId: string | null }
+  | { type: "set_conversation_status"; status: "resolved" | "open" }
+  | { type: "sequence_subscribe"; sequenceId: string }
+  | { type: "sequence_unsubscribe"; sequenceId: string }
+  /**
+   * Pause-and-listen: the executor sends `promptText`, persists a wait
+   * via its awaitInput port, and the run resumes when the contact's
+   * next reply (or the timeout) claims the wait - the answer enters
+   * the run through the resume event's variables under `variable`.
+   */
+  | {
+      type: "collect_input";
+      promptText: string;
+      variable: string;
+      saveToContactField?: string;
+      timeoutHours?: number;
+    }
   | { type: "complete" };
 
 export function initialState(flow: Flow): FlowState {
@@ -70,6 +90,34 @@ export function step(flow: Flow, state: FlowState, event: FlowEvent): { state: F
       return {
         state: advance(node.next),
         actions: [{ type: "set_contact_field", field: node.field, value }],
+      };
+    }
+    case "add_tag":
+      return { state: advance(node.next), actions: [{ type: "add_tag", tag: node.tag }] };
+    case "remove_tag":
+      return { state: advance(node.next), actions: [{ type: "remove_tag", tag: node.tag }] };
+    case "assign":
+      return { state: advance(node.next), actions: [{ type: "assign_conversation", userId: node.userId }] };
+    case "set_conversation_status":
+      return { state: advance(node.next), actions: [{ type: "set_conversation_status", status: node.status }] };
+    case "sequence_subscribe":
+      return { state: advance(node.next), actions: [{ type: "sequence_subscribe", sequenceId: node.sequenceId }] };
+    case "sequence_unsubscribe":
+      return { state: advance(node.next), actions: [{ type: "sequence_unsubscribe", sequenceId: node.sequenceId }] };
+    case "collect_input": {
+      // Same pause shape as delay: the state is already advanced past
+      // this node (status "waiting"); the resume event carries the
+      // captured answer in its variables, merged by the step() preamble.
+      const promptText = node.promptText.replace(/\{\{(\w+)\}\}/g, (_m, k: string) => variables[k] ?? "");
+      return {
+        state: { ...advance(node.next), status: "waiting" },
+        actions: [{
+          type: "collect_input",
+          promptText,
+          variable: node.variable,
+          ...(node.saveToContactField ? { saveToContactField: node.saveToContactField } : {}),
+          ...(node.timeoutHours !== undefined ? { timeoutHours: node.timeoutHours } : {}),
+        }],
       };
     }
     case "ai_reply": {

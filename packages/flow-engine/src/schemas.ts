@@ -76,9 +76,80 @@ export const aiReplyNodeSchema = z.object({
   channel: z.string().optional(),
 });
 
+/**
+ * Action steps (adoption package #3): single-next pass-through nodes
+ * that MUTATE the world around the run (contact tags, conversation
+ * assignment/status, sequence enrollments) instead of sending content.
+ * Config is deliberately shallow: ids are validated for SHAPE here;
+ * existence (sequence, assignee) is a runtime concern - a missing
+ * target produces a run warning, never a save-time rejection or a
+ * crashed run.
+ */
+export const addTagNodeSchema = z.object({
+  ...base,
+  type: z.literal("add_tag"),
+  /** Literal tag (never interpolated - tags are data, not copy). */
+  tag: z.string().min(1),
+});
+
+export const removeTagNodeSchema = z.object({
+  ...base,
+  type: z.literal("remove_tag"),
+  tag: z.string().min(1),
+});
+
+export const assignNodeSchema = z.object({
+  ...base,
+  type: z.literal("assign"),
+  /** Workspace member to own the conversation; null = unassign. */
+  userId: z.string().min(1).nullable(),
+});
+
+export const setConversationStatusNodeSchema = z.object({
+  ...base,
+  type: z.literal("set_conversation_status"),
+  /** "resolved" is the audit's "archive" step; "open" reopens. */
+  status: z.enum(["resolved", "open"]),
+});
+
+export const sequenceSubscribeNodeSchema = z.object({
+  ...base,
+  type: z.literal("sequence_subscribe"),
+  sequenceId: z.string().min(1),
+});
+
+export const sequenceUnsubscribeNodeSchema = z.object({
+  ...base,
+  type: z.literal("sequence_unsubscribe"),
+  /** A sequence id, or "all" to cancel every active enrollment. */
+  sequenceId: z.string().min(1),
+});
+
+/**
+ * Collect-input step (adoption package #3): send a prompt, PAUSE the
+ * run, and resume it with the contact's next reply stored in the run
+ * variable bag (readable downstream as `{{vars.<variable>}}`). The
+ * optional contact field ALSO persists the answer (readable in later
+ * runs as `{{contact.<field>}}`). A timeout (when set) resumes the run
+ * with an empty value instead of waiting forever. Single outgoing edge:
+ * reply, timeout, and media-only replies all continue at `next`.
+ */
+export const collectInputNodeSchema = z.object({
+  ...base,
+  type: z.literal("collect_input"),
+  /** The question to send (interpolated like send_message text). */
+  promptText: z.string().min(1),
+  /** Run-variable name the answer lands in (identifier-shaped). */
+  variable: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/),
+  saveToContactField: z.string().min(1).optional(),
+  timeoutHours: z.number().positive().max(24 * 30).optional(),
+});
+
 export const flowNodeSchema = z.discriminatedUnion("type", [
   triggerNodeSchema, sendMessageNodeSchema, conditionNodeSchema, delayNodeSchema, webhookNodeSchema,
   setFieldNodeSchema, aiReplyNodeSchema,
+  addTagNodeSchema, removeTagNodeSchema, assignNodeSchema, setConversationStatusNodeSchema,
+  sequenceSubscribeNodeSchema, sequenceUnsubscribeNodeSchema, collectInputNodeSchema,
 ]);
 
 export type FlowNode = z.infer<typeof flowNodeSchema>;
