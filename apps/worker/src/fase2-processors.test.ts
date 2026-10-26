@@ -252,6 +252,63 @@ describe("sequence processor (fake ports)", () => {
     expect(res.completed).toBe(1);
     expect(f.sent).toHaveLength(0);
   });
+
+  test("variables #1: text steps render against the enrolled contact", async () => {
+    const f = fakeSequencePorts({
+      async listDueEnrollments() {
+        return [{
+          ...fakeSequencePorts().enrollment,
+          steps: [{ delaySeconds: 0, text: "Selamat datang, {{contact.name}} dari {{contact.city}}!" }],
+          contactDisplayName: "Lala",
+          contactChannel: "whatsapp",
+          contactTags: ["baru"],
+          contactCustomFields: { city: "Semarang" },
+          workspaceName: "Toko Uji",
+        }];
+      },
+    });
+    const res = await processSequenceAdvance(f.ports, { now });
+    expect(res.advanced).toBe(1);
+    expect(f.sent).toEqual([{ idempotencyKey: "seq:enr-1:0", text: "Selamat datang, Lala dari Semarang!" }]);
+  });
+
+  test("variables #1: template step params render into body components", async () => {
+    const jobs: Array<{ template?: unknown }> = [];
+    const base = fakeSequencePorts();
+    const ports: SequencePorts = {
+      ...base.ports,
+      async listDueEnrollments() {
+        return [{
+          ...base.enrollment,
+          steps: [{
+            delaySeconds: 0,
+            template: {
+              name: "promo", language: "id", latestCategory: "utility",
+              templateParams: ["{{contact.name}}", "kode-{{contact.city}}"],
+            },
+          }],
+          contactDisplayName: "Lala",
+          contactChannel: "whatsapp",
+          contactCustomFields: { city: "Semarang" },
+        }];
+      },
+      async enqueueSendMessage(data) { jobs.push({ template: data.template }); },
+    };
+    const res = await processSequenceAdvance(ports, { now });
+    expect(res.advanced).toBe(1);
+    expect(jobs).toEqual([{
+      template: {
+        name: "promo", language: "id", latestCategory: "utility",
+        components: [{
+          type: "body",
+          parameters: [
+            { type: "text", text: "Lala" },
+            { type: "text", text: "kode-Semarang" },
+          ],
+        }],
+      },
+    }]);
+  });
 });
 
 // ------------------------------------------------------------- email inbound

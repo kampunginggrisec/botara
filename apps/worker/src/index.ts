@@ -5,7 +5,7 @@ import {
 } from "@botara/ai";
 import {
   getDb, getBroadcastById, getChannelAccount, getChannelAccountById, getTemplate, listContacts,
-  getFlowById, getContact,
+  getFlowById, getContact, getWorkspaceById,
   insertCostLedger, updateMessageStatus, incrementBroadcastCounts, updateContact,
   countServiceUnitsInRange,
   getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
@@ -208,6 +208,7 @@ function buildProdPorts(db: Database): WorkerPorts {
         ?? await findOpenConversation(db, {
           workspaceId: ref.workspaceId, channelAccountId: account.id, contactId: contact.id,
         });
+      const workspace = await getWorkspaceById(db, ref.workspaceId);
       return {
         flow: toRunnableFlow(flowRow.id, parsed.data),
         ...(state ? { state } : {}),
@@ -224,6 +225,12 @@ function buildProdPorts(db: Database): WorkerPorts {
           contactId: contact.id,
           contactExternalId: contact.externalId,
           conversationExternalId: runConversation?.externalId ?? undefined,
+          // Variable-interpolation context (variables #1).
+          contactDisplayName: contact.displayName,
+          contactTags: (contact.tags as string[]) ?? [],
+          contactCustomFields: fields,
+          workspaceName: workspace?.name,
+          channelDisplayName: account.displayName,
         },
       };
     },
@@ -305,6 +312,7 @@ function buildProdPorts(db: Database): WorkerPorts {
       const account = await getChannelAccount(db, row.workspaceId, row.channelAccountId);
       if (!account) return null;
       const template = row.templateId ? await getTemplate(db, row.workspaceId, row.templateId) : null;
+      const workspace = await getWorkspaceById(db, row.workspaceId);
       return {
         id: row.id,
         workspaceId: row.workspaceId,
@@ -316,14 +324,24 @@ function buildProdPorts(db: Database): WorkerPorts {
         template: template
           ? { name: template.name, language: template.language, latestCategory: template.latestCategory ?? template.category ?? "utility" }
           : undefined,
+        templateParams: row.templateParams ?? undefined,
         tag: row.tag ?? undefined,
         country: row.country ?? undefined,
+        workspaceName: workspace?.name,
+        channelDisplayName: account.displayName,
       };
     },
     async listBroadcastTargets(broadcast) {
       if (!broadcast.tag) return [];
       const rows = await listContacts(db, broadcast.workspaceId, { tag: broadcast.tag });
-      return rows.map((r) => ({ contactId: r.id, externalId: r.externalId }));
+      return rows.map((r) => ({
+        contactId: r.id,
+        externalId: r.externalId,
+        displayName: r.displayName,
+        channel: r.channel,
+        tags: (r.tags as string[]) ?? [],
+        customFields: (r.customFields as Record<string, unknown>) ?? {},
+      }));
     },
     async enqueueSendMessage(data: SendMessageJobData) {
       const queue = queueByName.get("send-message");

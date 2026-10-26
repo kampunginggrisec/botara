@@ -299,3 +299,75 @@ describe("disconnected-account send guards", () => {
     expect(statusUpdates).toEqual([{ id: "b-disc", status: "failed" }]);
   });
 });
+
+describe("variables package #1 (broadcast params + flow context)", () => {
+  test("broadcast: templateParams render PER RECIPIENT into body components", async () => {
+    const f = fakePorts({
+      async loadBroadcast() {
+        return {
+          id: "b-vars", workspaceId: "ws1", channelAccountId: "acc1", channel: "whatsapp",
+          accountExternalId: "62812",
+          template: { name: "promo", language: "id", latestCategory: "marketing" },
+          templateParams: ["Halo {{contact.name}} dari {{contact.city}}", "{{workspace.name}}"],
+          workspaceName: "Toko Uji",
+          channelDisplayName: "WA Bisnis",
+          tag: "vip", country: "ID",
+        };
+      },
+      async listBroadcastTargets() {
+        return [
+          { contactId: "c1", externalId: "628111", displayName: "Andi", channel: "whatsapp", tags: [], customFields: { city: "Jakarta" } },
+          { contactId: "c2", externalId: "628222", displayName: "Rina", channel: "whatsapp", tags: [], customFields: { city: "Bogor" } },
+        ];
+      },
+    });
+    const result = await processBroadcast(f.ports, { broadcastId: "b-vars" });
+    expect(result.enqueued).toBe(2);
+    expect(f.sent[0]!.template?.components).toEqual([{
+      type: "body",
+      parameters: [
+        { type: "text", text: "Halo Andi dari Jakarta" },
+        { type: "text", text: "Toko Uji" },
+      ],
+    }]);
+    expect(f.sent[1]!.template?.components).toEqual([{
+      type: "body",
+      parameters: [
+        { type: "text", text: "Halo Rina dari Bogor" },
+        { type: "text", text: "Toko Uji" },
+      ],
+    }]);
+    // Template identity survives alongside the components.
+    expect(f.sent[0]!.template?.name).toBe("promo");
+  });
+
+  test("broadcast: without templateParams the template passes through with no components", async () => {
+    const f = fakePorts();
+    await processBroadcast(f.ports, { broadcastId: "b1" });
+    expect(f.sent[0]!.template).toEqual({ name: "promo", language: "id", latestCategory: "marketing" });
+  });
+
+  test("flow-run: send_message renders against the run context (contact + run vars)", async () => {
+    const f = fakePorts();
+    const result = await processFlowRun(f.ports, {
+      flow: {
+        id: "vars-flow", version: 1, startNodeId: "t1",
+        nodes: [
+          { id: "t1", type: "trigger", trigger: "keyword", config: { keyword: "halo" }, next: "s1" },
+          { id: "s1", type: "send_message", text: "Halo {{contact.name}}, kode {{vars.code}} dari {{workspace.name}}!", next: null },
+        ],
+      },
+      event: { type: "message.received", text: "halo", variables: { code: "K-9" } },
+      context: {
+        workspaceId: "ws1", channelAccountId: "acc1", channel: "telegram",
+        accountExternalId: "bot", contactId: "c1", contactExternalId: "42",
+        contactDisplayName: "Bima", contactTags: [], contactCustomFields: {},
+        workspaceName: "Toko Uji", channelDisplayName: "Bot Uji",
+      },
+    });
+    expect(result.state.status).toBe("completed");
+    expect(f.sent).toHaveLength(1);
+    expect(f.sent[0]).toMatchObject({ text: "Halo Bima, kode K-9 dari Toko Uji!" });
+    expect(result.warnings).toEqual([]);
+  });
+});

@@ -1,4 +1,5 @@
 import { CHANNEL_CAPABILITIES, type ChannelKey } from "@botara/channels";
+import { buildVariableContext, interpolate, type VariableContext } from "@botara/shared";
 import type { SendMessageJobData } from "./processors";
 
 /**
@@ -16,7 +17,13 @@ import type { SendMessageJobData } from "./processors";
 export interface SequenceStepSnapshot {
   delaySeconds: number;
   text?: string;
-  template?: { name: string; language: string; latestCategory: string };
+  template?: {
+    name: string;
+    language: string;
+    latestCategory: string;
+    /** Per-recipient body parameter templates (variables #1). */
+    templateParams?: string[];
+  };
 }
 
 export interface DueEnrollment {
@@ -31,6 +38,13 @@ export interface DueEnrollment {
   channel: string;
   accountExternalId: string;
   tokenVaultRef?: string;
+  /** Variable-interpolation context (variables #1). */
+  contactDisplayName?: string | null;
+  contactChannel?: string;
+  contactTags?: string[];
+  contactCustomFields?: Record<string, unknown>;
+  workspaceName?: string | null;
+  channelDisplayName?: string | null;
 }
 
 export interface SequencePorts {
@@ -69,6 +83,42 @@ export async function processSequenceAdvance(
       continue;
     }
     advanced++;
+    // Variable interpolation (variables #1): the step's text and its
+    // template params render against the ENROLLED contact at send time;
+    // unknown variables render empty (warned in the log), never raw.
+    const varCtx: VariableContext = buildVariableContext({
+      contact: {
+        displayName: enrollment.contactDisplayName,
+        externalId: enrollment.contactExternalId,
+        channel: enrollment.contactChannel ?? enrollment.channel,
+        tags: enrollment.contactTags,
+        customFields: enrollment.contactCustomFields,
+      },
+      workspaceName: enrollment.workspaceName,
+      channelAccount: { displayName: enrollment.channelDisplayName, channel: enrollment.channel },
+    });
+    const renderStep = (template: string): string => {
+      const rendered = interpolate(template, varCtx);
+      if (rendered.warnings.length > 0) {
+        console.warn(
+          `[worker] sequence ${enrollment.sequenceId} enrollment ${enrollment.enrollmentId}: unknown variables rendered empty (${rendered.warnings.map((w) => w.path).join(", ")})`,
+        );
+      }
+      return rendered.text;
+    };
+    let template: SendMessageJobData["template"];
+    if (step.template) {
+      const { templateParams, ...templateCore } = step.template;
+      template = templateParams && templateParams.length > 0
+        ? {
+            ...templateCore,
+            components: [{
+              type: "body",
+              parameters: templateParams.map((p) => ({ type: "text", text: renderStep(p) })),
+            }],
+          }
+        : templateCore;
+    }
     await ports.enqueueSendMessage({
       workspaceId: enrollment.workspaceId,
       channelAccountId: enrollment.channelAccountId,
@@ -76,8 +126,8 @@ export async function processSequenceAdvance(
       accountExternalId: enrollment.accountExternalId,
       tokenVaultRef: enrollment.tokenVaultRef,
       toExternalId: enrollment.contactExternalId,
-      text: step.text,
-      template: step.template,
+      text: step.text !== undefined ? renderStep(step.text) : undefined,
+      template,
       idempotencyKey: `seq:${enrollment.enrollmentId}:${enrollment.currentStep}`,
     });
     const nextIndex = enrollment.currentStep + 1;

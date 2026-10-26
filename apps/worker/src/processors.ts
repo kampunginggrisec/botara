@@ -4,7 +4,8 @@ import {
   CHANNEL_CAPABILITIES, type ChannelKey, type RichBlock, type SendInput, type SendResult,
 } from "@botara/channels";
 import {
-  ChannelInitiationError, ConsecutiveSendCapError, ConversationAddressMissingError,
+  buildVariableContext, ChannelInitiationError, ConsecutiveSendCapError, ConversationAddressMissingError,
+  interpolate,
 } from "@botara/shared";
 
 /**
@@ -26,7 +27,13 @@ export interface SendMessageJobData {
   text?: string;
   /** Rich block from a flow send_message node (rendered per channel by the adapter). */
   rich?: RichBlock;
-  template?: { name: string; language: string; latestCategory: string };
+  template?: {
+    name: string;
+    language: string;
+    latestCategory: string;
+    /** Provider template components (broadcast/sequence per-recipient params, variables #1). */
+    components?: unknown[];
+  };
   /** Recipient country (rating); defaults to ID for WhatsApp estimates. */
   country?: string;
   /** Explicit billing category; falls back to the template category, then "service". */
@@ -54,6 +61,11 @@ export interface BroadcastTarget {
   contactId: string;
   externalId: string;
   country?: string;
+  /** Variable-interpolation context for this recipient (variables #1). */
+  displayName?: string | null;
+  channel?: string;
+  tags?: string[];
+  customFields?: Record<string, unknown>;
 }
 
 export interface BroadcastSnapshot {
@@ -66,8 +78,13 @@ export interface BroadcastSnapshot {
   accountStatus?: string;
   tokenVaultRef?: string;
   template?: { name: string; language: string; latestCategory: string };
+  /** Ordered per-recipient body parameter templates (variables #1). */
+  templateParams?: string[];
   tag?: string;
   country?: string;
+  /** Variable-interpolation context shared by all recipients. */
+  workspaceName?: string | null;
+  channelDisplayName?: string | null;
 }
 
 export interface FlowRunContext {
@@ -81,6 +98,12 @@ export interface FlowRunContext {
   /** Provider conversation id (TikTok), resolved from the conversation row. */
   conversationExternalId?: string;
   country?: string;
+  /** Variable-interpolation context (variables #1), filled by loadFlowRun. */
+  contactDisplayName?: string | null;
+  contactTags?: string[];
+  contactCustomFields?: Record<string, unknown>;
+  workspaceName?: string | null;
+  channelDisplayName?: string | null;
 }
 
 export interface FlowRunJobData {
@@ -305,7 +328,38 @@ export async function processBroadcast(
     return { enqueued: 0 };
   }
   const targets = await ports.listBroadcastTargets(broadcast);
+  const paramTemplates = broadcast.templateParams ?? [];
   for (const target of targets) {
+    // Per-recipient template parameters (variables #1): each param
+    // template renders against THIS recipient's contact, then rides the
+    // send job as the template's body components - the WhatsApp adapter
+    // passes components through to Meta verbatim. No param schema is
+    // validated here (template rows carry none); a wrong count surfaces
+    // as a per-recipient provider error in the send processor, as before.
+    let template: SendMessageJobData["template"] = broadcast.template;
+    if (template && paramTemplates.length > 0) {
+      const varCtx = buildVariableContext({
+        contact: {
+          displayName: target.displayName,
+          externalId: target.externalId,
+          channel: target.channel ?? broadcast.channel,
+          tags: target.tags,
+          customFields: target.customFields,
+        },
+        workspaceName: broadcast.workspaceName,
+        channelAccount: { displayName: broadcast.channelDisplayName, channel: broadcast.channel },
+      });
+      const parameters = paramTemplates.map((paramTemplate) => {
+        const rendered = interpolate(paramTemplate, varCtx);
+        if (rendered.warnings.length > 0) {
+          console.warn(
+            `[worker] broadcast ${broadcast.id} -> contact ${target.contactId}: unknown variables rendered empty (${rendered.warnings.map((w) => w.path).join(", ")})`,
+          );
+        }
+        return { type: "text", text: rendered.text };
+      });
+      template = { ...template, components: [{ type: "body", parameters }] };
+    }
     await ports.enqueueSendMessage({
       workspaceId: broadcast.workspaceId,
       channelAccountId: broadcast.channelAccountId,
@@ -313,7 +367,7 @@ export async function processBroadcast(
       accountExternalId: broadcast.accountExternalId,
       tokenVaultRef: broadcast.tokenVaultRef,
       toExternalId: target.externalId,
-      template: broadcast.template,
+      template,
       country: target.country ?? broadcast.country,
       referenceId: broadcast.id,
       idempotencyKey: `${broadcast.id}:${target.contactId}`,
@@ -382,5 +436,25 @@ export async function processFlowRun(
       return ports.aiReply({ workspaceId: ctx.workspaceId, prompt, query });
     },
   };
-  return runFlow(flowPorts, data.flow, data.state, data.event);
+  // Variable interpolation (variables #1): the executor renders every
+  // send_message against this context; the run's own variables (trigger
+  // data + contact fields the dispatcher merged) form the `vars` root.
+  const interpolation = buildVariableContext({
+    contact: {
+      displayName: ctx.contactDisplayName,
+      externalId: ctx.contactExternalId,
+      channel: ctx.channel,
+      tags: ctx.contactTags,
+      customFields: ctx.contactCustomFields,
+    },
+    workspaceName: ctx.workspaceName,
+    channelAccount: { displayName: ctx.channelDisplayName, channel: ctx.channel },
+  });
+  const result = await runFlow(flowPorts, data.flow, data.state, data.event, { interpolation });
+  if (result.warnings.length > 0) {
+    console.warn(
+      `[worker] flow ${data.flow.id} -> contact ${ctx.contactId}: unknown variables rendered empty (${result.warnings.map((w) => w.path).join(", ")})`,
+    );
+  }
+  return result;
 }
