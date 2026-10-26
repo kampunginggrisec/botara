@@ -1,5 +1,5 @@
 import {
-  TelegramAdapter, WhatsAppAdapter, getAdapter,
+  TelegramAdapter, TikTokAdapter, WhatsAppAdapter, getAdapter,
   type ChannelAccountRef, type FetchLike, type MessageMedia,
 } from "@botara/channels";
 import { putObject } from "@botara/media";
@@ -125,6 +125,7 @@ export function createInboundMediaPort(deps: InboundMediaPortDeps = {}): Inbound
     account: DispatchAccount,
     channel: string,
     media: MessageMedia,
+    context: { messageExternalId: string; conversationExternalId?: string },
   ): Promise<FetchedBytes | null> {
     if (channel === "whatsapp") {
       if (!media.id) return null;
@@ -142,7 +143,24 @@ export function createInboundMediaPort(deps: InboundMediaPortDeps = {}): Inbound
       if (result.fileSize !== undefined && result.fileSize > maxBytes) return null;
       return { data: new Uint8Array(result.data), mimeType: media.mimeType };
     }
-    if (channel === "messenger" || channel === "instagram") {
+    if (channel === "tiktok" && media.id) {
+      // Id-based media (IMAGE / VIDEO): the adapter resolves a 24h
+      // download_url and fetches it with the x-user token header.
+      // URL-carrying media (sticker / emoji) falls through to the plain
+      // URL fetch below, like Meta CDN attachments.
+      if (!context.conversationExternalId) return null;
+      if (media.type !== "image" && media.type !== "video") return null;
+      const adapter = getAdapterFn(channel);
+      if (!(adapter instanceof TikTokAdapter)) return null;
+      const result = await withTimeout(adapter.downloadMedia(toAccountRef(account), {
+        conversationId: context.conversationExternalId,
+        messageId: context.messageExternalId,
+        mediaId: media.id,
+        mediaType: media.type === "video" ? "VIDEO" : "IMAGE",
+      }), timeoutMs);
+      return { data: new Uint8Array(result.data), mimeType: result.mimeType ?? media.mimeType };
+    }
+    if (channel === "messenger" || channel === "instagram" || channel === "tiktok") {
       // Webhook attachment URLs are self-signed CDN links: no auth
       // header (the adapters hold Page/IG tokens for the Graph API,
       // which these URLs neither need nor accept).
@@ -160,7 +178,10 @@ export function createInboundMediaPort(deps: InboundMediaPortDeps = {}): Inbound
   return {
     async fetchAndStore(input): Promise<StoredInboundMedia | null> {
       try {
-        const fetched = await fetchBytes(input.account, input.channel, input.media);
+        const fetched = await fetchBytes(input.account, input.channel, input.media, {
+          messageExternalId: input.messageExternalId,
+          conversationExternalId: input.conversationExternalId,
+        });
         if (!fetched) return null;
         if (fetched.data.byteLength === 0 || fetched.data.byteLength > maxBytes) return null;
         const mimeType = fetched.mimeType;

@@ -525,3 +525,74 @@ describe("inbound media pipeline", () => {
     expect(calls).toHaveLength(0);
   });
 });
+
+describe("tiktok dispatch", () => {
+  function ttSetup() {
+    const store = new InMemoryDispatchStore();
+    store.accounts.push({
+      id: "acc-tt", workspaceId: "ws-1", channel: "tiktok", externalId: "open-123", status: "connected",
+    });
+    const flowRuns: FlowRunJobPayload[] = [];
+    const commentActions: CommentActionJobPayload[] = [];
+    const dispatcher = createFlowDispatcher({
+      store,
+      flowEnqueuer: { async enqueueFlowRun(job) { flowRuns.push(job); } },
+      commentEnqueuer: { async enqueueCommentAction(job) { commentActions.push(job); } },
+    });
+    return { store, dispatcher, flowRuns, commentActions };
+  }
+
+  const ttMessage = (text: string, conversationExternalId?: string): InboundEvent => ({
+    type: "message.received", channel: "tiktok", accountExternalId: "open-123",
+    contactExternalId: "uniq-1", messageExternalId: `tm-${Math.random()}`,
+    text, ...(conversationExternalId ? { conversationExternalId } : {}),
+    receivedAt: new Date().toISOString(),
+  });
+
+  test("a DM persists, records the provider conversation id, and matches keyword flows", async () => {
+    const { store, dispatcher, flowRuns } = ttSetup();
+    store.flows.push({ id: "f-price", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "price" } } });
+    await dispatcher.dispatch([ttMessage("what is the price?", "conv-tt-1")]);
+    expect(flowRuns).toHaveLength(1);
+    expect(store.messages).toHaveLength(1);
+    const conversation = [...store.conversations.values()][0]!;
+    expect(conversation.externalId).toBe("conv-tt-1");
+  });
+
+  test("a later DM backfills the conversation id on a conversation a comment opened", async () => {
+    const { store, dispatcher } = ttSetup();
+    // First DM arrives without a known conversation id (defensive parse
+    // gap / comment-opened thread): the conversation exists id-less.
+    await dispatcher.dispatch([ttMessage("halo")]);
+    const conversation = [...store.conversations.values()][0]!;
+    expect(conversation.externalId).toBeUndefined();
+    // The next DM carries the id: backfilled, never overwritten after.
+    await dispatcher.dispatch([ttMessage("halo lagi", "conv-tt-9")]);
+    expect(conversation.externalId).toBe("conv-tt-9");
+    await dispatcher.dispatch([ttMessage("lagi", "conv-OTHER")]);
+    expect(conversation.externalId).toBe("conv-tt-9");
+    expect(store.conversations.size).toBe(1);
+  });
+
+  test("a high-intent comment enqueues ONE comment-action for a matching comment flow", async () => {
+    const { store, dispatcher, commentActions, flowRuns } = ttSetup();
+    store.flows.push({
+      id: "f-comment-tt", workspaceId: "ws-1",
+      trigger: {
+        type: "comment_keyword",
+        config: { keyword: "price", publicReplyText: "Check your DM!", autoHide: true, privateText: "Here is the price list" },
+      },
+    });
+    await dispatcher.dispatch([{
+      type: "comment.received", channel: "tiktok", accountExternalId: "open-123",
+      postExternalId: "video-1", commentExternalId: "comment-1", text: "PRICE please",
+      authorExternalId: "uniq-7", receivedAt: new Date().toISOString(),
+    }]);
+    expect(commentActions).toHaveLength(1);
+    expect(commentActions[0]).toMatchObject({
+      flowId: "f-comment-tt", channel: "tiktok", channelAccountId: "acc-tt",
+      commentExternalId: "comment-1", authorExternalId: "uniq-7",
+    });
+    expect(flowRuns).toHaveLength(0);
+  });
+});

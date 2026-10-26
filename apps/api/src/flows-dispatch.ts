@@ -3,7 +3,8 @@ import {
   findChannelAccountByExternal, findMessageByExternalId, findOpenConversation,
   getContactByExternal, getGrowthLinkBySlug, incrementGrowthLinkConversions,
   isCommentProcessed, listActiveFlows, listConnectedAccountsByChannel,
-  listGrowthLinksByAccount, touchConversationLastUserMessage, upsertContactByExternal, type Database,
+  listGrowthLinksByAccount, touchConversationLastUserMessage, updateConversationExternalId,
+  upsertContactByExternal, type Database,
 } from "@botara/db";
 import {
   commentTriggerConfig, flowTriggerMatches, type FlowTrigger,
@@ -146,6 +147,8 @@ export interface InboundMediaPort {
     channel: string;
     media: MessageMedia;
     messageExternalId: string;
+    /** Provider conversation id (TikTok media download needs it). */
+    conversationExternalId?: string;
   }): Promise<StoredInboundMedia | null>;
 }
 
@@ -182,8 +185,17 @@ export interface DispatchStore {
   createContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }): Promise<DispatchContact>;
   /** Insert-or-update one contact from a coexistence state sync (name refresh). */
   upsertSyncedContact(input: { workspaceId: string; channel: string; externalId: string; displayName?: string }): Promise<void>;
-  findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string } | null>;
-  createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string }>;
+  findOpenConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }): Promise<{ id: string; externalId?: string | null } | null>;
+  createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }): Promise<{ id: string; externalId?: string | null }>;
+  /**
+   * Backfill a conversation's provider id (TikTok conversation_id) when
+   * an inbound event carries one the stored conversation does not have
+   * yet - e.g. the conversation was opened by a comment-to-DM and the
+   * customer has now sent their first real DM. Optional: stores that
+   * cannot backfill simply never resolve TikTok sends for such
+   * conversations (the send path fails typed, never guesses).
+   */
+  setConversationExternalId?(conversationId: string, externalId: string): Promise<void>;
   findMessageByExternalId(conversationId: string, externalId: string): Promise<{ id: string } | null>;
   createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }): Promise<{ id: string }>;
   touchConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
@@ -226,11 +238,14 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
     },
     async findOpenConversation(input) {
       const row = await findOpenConversation(getDatabase(), input);
-      return row ? { id: row.id } : null;
+      return row ? { id: row.id, externalId: row.externalId } : null;
     },
     async createConversation(input) {
       const row = await createConversation(getDatabase(), input);
-      return { id: row.id };
+      return { id: row.id, externalId: row.externalId };
+    },
+    async setConversationExternalId(conversationId, externalId) {
+      await updateConversationExternalId(getDatabase(), conversationId, externalId);
     },
     async findMessageByExternalId(conversationId, externalId) {
       const row = await findMessageByExternalId(getDatabase(), conversationId, externalId);
@@ -279,7 +294,7 @@ export function createDbDispatchStore(getDatabase: () => Database): DispatchStor
 export class InMemoryDispatchStore implements DispatchStore {
   readonly accounts: DispatchAccount[] = [];
   readonly contacts = new Map<string, DispatchContact & { workspaceId: string; channel: string; externalId: string }>();
-  readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; lastUserMessageAt?: string }>();
+  readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; externalId?: string | null; lastUserMessageAt?: string }>();
   readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
@@ -326,10 +341,15 @@ export class InMemoryDispatchStore implements DispatchStore {
     ) ?? null;
   }
 
-  async createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string }) {
+  async createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }) {
     const conversation = { id: crypto.randomUUID(), ...input };
     this.conversations.set(conversation.id, conversation);
     return conversation;
+  }
+
+  async setConversationExternalId(conversationId: string, externalId: string) {
+    const conversation = this.conversations.get(conversationId);
+    if (conversation && !conversation.externalId) conversation.externalId = externalId;
   }
 
   async findMessageByExternalId(conversationId: string, externalId: string) {
@@ -388,9 +408,16 @@ export class InMemoryDispatchStore implements DispatchStore {
 // --------------------------------------------------------------- dispatcher
 
 /** Channels whose inbound messages persist + trigger flows by default. */
-const DISPATCH_CHANNELS = new Set(["whatsapp", "telegram", "instagram", "messenger", "threads"]);
-/** Channels with a comment surface the dispatcher automates. */
-const COMMENT_CHANNELS = new Set(["instagram", "messenger"]);
+const DISPATCH_CHANNELS = new Set(["whatsapp", "telegram", "instagram", "messenger", "threads", "tiktok"]);
+/**
+ * Channels with a comment surface the dispatcher automates. TikTok's
+ * events are pre-filtered by TikTok itself to high-intent comments (the
+ * keyword match still runs Botara-side, exactly like IG/Messenger);
+ * TikTok's public reply/hide do not exist in the Business Messaging API,
+ * so the worker's comment-action skips those steps by capability and the
+ * private reply (direct_reply) is the effective action.
+ */
+const COMMENT_CHANNELS = new Set(["instagram", "messenger", "tiktok"]);
 
 export interface FlowDispatcherDeps {
   store: DispatchStore;
@@ -438,10 +465,26 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     return contact;
   }
 
-  async function findOrCreateConversation(workspaceId: string, accountId: string, contactId: string): Promise<{ id: string }> {
+  async function findOrCreateConversation(
+    workspaceId: string,
+    accountId: string,
+    contactId: string,
+    conversationExternalId?: string,
+  ): Promise<{ id: string }> {
     const existing = await deps.store.findOpenConversation({ workspaceId, channelAccountId: accountId, contactId });
-    if (existing) return existing;
-    return deps.store.createConversation({ workspaceId, channelAccountId: accountId, contactId });
+    if (existing) {
+      // Backfill the provider conversation id when this event carries one
+      // the stored conversation lacks (TikTok: a comment opened the
+      // conversation; the first real DM teaches us its address).
+      if (conversationExternalId && !existing.externalId && deps.store.setConversationExternalId) {
+        await deps.store.setConversationExternalId(existing.id, conversationExternalId).catch(() => undefined);
+      }
+      return existing;
+    }
+    return deps.store.createConversation({
+      workspaceId, channelAccountId: accountId, contactId,
+      ...(conversationExternalId ? { externalId: conversationExternalId } : {}),
+    });
   }
 
   /**
@@ -457,12 +500,14 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     channel: string,
     media: MessageMedia | undefined,
     messageExternalId: string,
+    conversationExternalId?: string,
   ): Promise<{ mediaUrls: string[]; mediaKeys: string[] }> {
     const empty = { mediaUrls: [] as string[], mediaKeys: [] as string[] };
     if (!media || !deps.mediaPort) return empty;
     try {
       const stored = await deps.mediaPort.fetchAndStore({
         workspaceId: account.workspaceId, account, channel, media, messageExternalId,
+        ...(conversationExternalId ? { conversationExternalId } : {}),
       });
       return stored ? { mediaUrls: stored.urls, mediaKeys: stored.keys } : empty;
     } catch (err) {
@@ -470,6 +515,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
       return empty;
     }
   }
+
 
   /**
    * Growth attribution for one event: resolve the link (when any), tag
@@ -524,12 +570,17 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
 
     const contact = await findOrCreateContact(workspaceId, event.channel, event.contactExternalId);
     if (!contact) return;
-    const conversation = await findOrCreateConversation(workspaceId, account.id, contact.id);
+    const conversation = await findOrCreateConversation(
+      workspaceId, account.id, contact.id,
+      event.type === "message.received" ? event.conversationExternalId : undefined,
+    );
 
     if (event.type === "message.received") {
       const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
       if (!existing) {
-        const { mediaUrls, mediaKeys } = await resolveMedia(account, event.channel, event.media, event.messageExternalId);
+        const { mediaUrls, mediaKeys } = await resolveMedia(
+          account, event.channel, event.media, event.messageExternalId, event.conversationExternalId,
+        );
         const created = await deps.store.createMessage({
           conversationId: conversation.id,
           direction: "in",
@@ -667,11 +718,15 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
 
     const contact = await findOrCreateContact(workspaceId, event.channel, event.contactExternalId);
     if (!contact) return;
-    const conversation = await findOrCreateConversation(workspaceId, account.id, contact.id);
+    const conversation = await findOrCreateConversation(
+      workspaceId, account.id, contact.id, event.conversationExternalId,
+    );
 
     const existing = await deps.store.findMessageByExternalId(conversation.id, event.messageExternalId);
     if (existing) return;
-    const { mediaUrls, mediaKeys } = await resolveMedia(account, event.channel, event.media, event.messageExternalId);
+    const { mediaUrls, mediaKeys } = await resolveMedia(
+      account, event.channel, event.media, event.messageExternalId, event.conversationExternalId,
+    );
     const created = await deps.store.createMessage({
       conversationId: conversation.id,
       direction: "out",

@@ -1,8 +1,8 @@
-import { createTokenVault, getDb } from "@botara/db";
+import { createTokenVault, getChannelAccountById, getDb, updateChannelAccountToken } from "@botara/db";
 import {
-  VaultCredentialProvider, configureAdapterCredentials,
+  VaultCredentialProvider, configureAdapterCredentials, configureTikTokTokenPersistence,
   envEmailCredentials, envInstagramCredentials, envMessengerCredentials,
-  envTelegramCredentials, envThreadsCredentials, envWhatsAppCredentials,
+  envTelegramCredentials, envThreadsCredentials, envTikTokCredentials, envWhatsAppCredentials,
   type ChannelKey, type CredentialProvider,
 } from "@botara/channels";
 import { assertProductionEnv } from "@botara/config";
@@ -55,17 +55,34 @@ const envCredentials: Record<string, () => CredentialProvider> = {
   messenger: envMessengerCredentials,
   threads: envThreadsCredentials,
   email: envEmailCredentials,
+  tiktok: envTikTokCredentials,
   webchat: envWhatsAppCredentials, // unused - webchat resolves no secrets
 };
 
 if (process.env.DATABASE_URL && process.env.TOKEN_VAULT_KEY) {
   try {
-    const vault = createTokenVault(getDb(process.env.DATABASE_URL), process.env);
+    const db = getDb(process.env.DATABASE_URL);
+    const vault = createTokenVault(db, process.env);
     configureAdapterCredentials((key: ChannelKey) =>
       new VaultCredentialProvider(
         { getSecret: (ref) => vault.get(ref) },
         envCredentials[key]?.(),
       ));
+    // TikTok rotates its OAuth pair on refresh (incl. refresh-on-401):
+    // persist every rotation back into the vault + account row.
+    configureTikTokTokenPersistence(async ({ account, pair, serialized }) => {
+      const row = await getChannelAccountById(db, account.id);
+      if (!row) return;
+      const ref = await vault.put({
+        workspaceId: row.workspaceId, kind: "tiktok",
+        label: row.displayName ?? "TikTok", secret: serialized,
+      });
+      await updateChannelAccountToken(db, row.id, {
+        tokenVaultRef: ref,
+        tokenExpiresAt: pair.expiresAt ? new Date(pair.expiresAt) : undefined,
+        status: "connected",
+      });
+    });
     console.log("[api] channel credentials: token vault (env fallback per channel)");
   } catch (err) {
     console.error(`[api] token vault wiring failed: ${err instanceof Error ? err.message : String(err)}`);

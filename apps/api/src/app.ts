@@ -4,7 +4,10 @@ import type { Context, Next } from "hono";
 import { deleteCookie, getCookie, setCookie } from "hono/cookie";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
-import { AppError, evaluateReplyWindow, MessagingWindowClosedError } from "@botara/shared";
+import {
+  AppError, ChannelInitiationError, ConsecutiveSendCapError, countConsecutiveOutbound,
+  evaluateReplyWindow, MessagingWindowClosedError,
+} from "@botara/shared";
 import {
   getDb, listContacts, createContact, updateContact, segmentCounts,
   listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
@@ -37,9 +40,11 @@ import {
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
   WebchatAdapter, CHANNEL_CAPABILITIES,
-  TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter,
+  TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter, TikTokAdapter,
   StaticCredentialProvider, buildInstagramAuthorizeUrl, buildThreadsAuthorizeUrl,
-  buildMessengerAuthorizeUrl, richBlockSchema, richBlockText, richToPlainText,
+  buildMessengerAuthorizeUrl, buildTikTokAuthorizeUrl, serializeTikTokTokenPair,
+  verifyTikTokWebhookSignature,
+  richBlockSchema, richBlockText, richToPlainText,
   VaultCredentialProvider, envWhatsAppCredentials,
   type ChannelKey, type InboundEvent, type FetchLike, type InstagramAuthMode,
 } from "@botara/channels";
@@ -1243,6 +1248,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     whatsappEmbeddedConfigId: deps.env.WHATSAPP_EMBEDDED_CONFIG_ID ?? null,
     instagramAppId: deps.env.INSTAGRAM_APP_ID ?? null,
     threadsAppId: deps.env.THREADS_APP_ID ?? null,
+    tiktokAppId: deps.env.TIKTOK_APP_ID ?? null,
     publicWebhookBaseUrl: deps.env.PUBLIC_WEBHOOK_BASE_URL ?? deps.env.APP_PUBLIC_URL ?? null,
   }));
 
@@ -1373,6 +1379,32 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
     }
     const events = await getAdapter("threads").parseWebhook(payload);
+    await deps.eventSink.handle(events);
+    await deps.flowDispatcher.dispatch(events);
+    return c.json({ received: true, events: events.length });
+  });
+
+  app.post("/webhooks/tiktok", async (c) => {
+    const raw = await c.req.text();
+    // Signature verification is a PLACEHOLDER (HMAC-SHA256 of the raw
+    // body with the app secret): TikTok's real Business Messaging scheme
+    // is in partner-gated docs and could not be sourced - see
+    // verifyTikTokWebhookSignature in @botara/channels and
+    // docs/tiktok.md. Enforced only when TIKTOK_APP_SECRET is set, the
+    // same pattern as the Meta webhooks above.
+    const appSecret = deps.env.TIKTOK_APP_SECRET;
+    if (appSecret && !verifyTikTokWebhookSignature(
+      raw,
+      c.req.header("x-tiktok-signature") ?? c.req.header("x-signature"),
+      appSecret,
+    )) {
+      throw new AppError("UNAUTHORIZED", "Invalid TikTok webhook signature (placeholder scheme).", { status: 401 });
+    }
+    let payload: unknown;
+    try { payload = JSON.parse(raw); } catch {
+      throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
+    }
+    const events = await getAdapter("tiktok").parseWebhook(payload);
     await deps.eventSink.handle(events);
     await deps.flowDispatcher.dispatch(events);
     return c.json({ received: true, events: events.length });
@@ -1716,6 +1748,50 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     } catch (err) {
       console.error(`[api] messenger oauth callback failed: ${err instanceof Error ? err.message : String(err)}`);
       return oauthFail(c, "messenger", "oauth_failed");
+    }
+  });
+
+  app.get("/channels/tiktok/oauth/callback", async (c) => {
+    // TikTok denial arrives as ?error=... (no code): surface it honestly.
+    if (c.req.query("error")) return oauthFail(c, "tiktok", "oauth_failed");
+    const code = c.req.query("code");
+    const stateParam = c.req.query("state");
+    const appId = deps.env.TIKTOK_APP_ID;
+    const appSecret = deps.env.TIKTOK_APP_SECRET;
+    if (!code || !stateParam || !appId || !appSecret) return oauthFail(c, "tiktok", "oauth_config");
+    let state: OAuthStatePayload | null = null;
+    try { state = verifyOAuthState(oauthSecret(deps), stateParam); } catch { state = null; }
+    if (!state || state.ch !== "tiktok") return oauthFail(c, "tiktok", "invalid_state");
+    try {
+      const adapter = new TikTokAdapter({
+        credentials: new StaticCredentialProvider({}),
+        fetchFn: deps.providerFetch,
+      });
+      const redirectUri = oauthRedirectUri(deps, c, "tiktok");
+      const pair = await adapter.exchangeCode({ appId, appSecret, code, redirectUri });
+      if (!pair.openId) return oauthFail(c, "tiktok", "oauth_failed");
+      let displayName: string | undefined;
+      try {
+        displayName = (await adapter.fetchUserProfile(pair.accessToken)).displayName;
+      } catch { /* display name is best-effort only */ }
+      // The vault secret is the whole token pair as one JSON string: the
+      // access token alone is useless in 24h without its refresh token.
+      const ref = await deps.vault.store({
+        channel: "tiktok", workspaceId: state.w,
+        label: displayName ?? pair.openId, secret: serializeTikTokTokenPair(pair),
+      });
+      await persistConnectedAccount({
+        workspaceId: state.w, channel: "tiktok", externalId: pair.openId,
+        displayName: displayName ?? pair.openId, authMode: "oauth",
+        tokenVaultRef: ref,
+        tokenExpiresAt: pair.expiresAt ? new Date(pair.expiresAt) : undefined,
+      });
+      await deps.authStore.audit({ workspaceId: state.w, userId: state.u, action: "channel.connected", details: { channel: "tiktok" } })
+        .catch(() => undefined);
+      return c.redirect(spaChannelsUrl(deps, c, { connected: "tiktok" }), 302);
+    } catch (err) {
+      console.error(`[api] tiktok oauth callback failed: ${err instanceof Error ? err.message : String(err)}`);
+      return oauthFail(c, "tiktok", "oauth_failed");
     }
   });
 
@@ -2166,8 +2242,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const account = await getChannelAccount(db, ws, conversation.channelAccountId);
     if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
 
-    // 24h window enforcement (fail closed): free-form replies outside the
-    // window are rejected; template replies stay allowed.
+    // Window enforcement (fail closed): free-form replies outside the
+    // window are rejected; template replies stay allowed. The window
+    // length is per-channel (Meta 24h, TikTok 48h - see @botara/shared).
     const decision = evaluateReplyWindow({
       channel: conversation.channel,
       kind: body.kind,
@@ -2175,6 +2252,19 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       now: new Date(),
     });
     if (!decision.allowed) throw new MessagingWindowClosedError(conversation.channel);
+
+    // Consecutive-outbound cap (TikTok: max 10 business messages since
+    // the customer's last message). Counted from the persisted rows -
+    // the same counter the worker's send processor uses, so the rule
+    // cannot drift between the inbox and automation sends.
+    const caps = CHANNEL_CAPABILITIES[conversation.channel as ChannelKey];
+    if (caps?.maxConsecutiveOutbound) {
+      const rows = await listMessages(db, conversation.id);
+      const consecutive = countConsecutiveOutbound(rows);
+      if (consecutive >= caps.maxConsecutiveOutbound) {
+        throw new ConsecutiveSendCapError(conversation.channel, caps.maxConsecutiveOutbound, consecutive);
+      }
+    }
 
     let templateInput: { name: string; language: string; latestCategory: string } | undefined;
     if (body.kind === "template") {
@@ -2226,6 +2316,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         text: body.kind === "free_form" ? (body.text ?? (body.rich ? richBlockText(body.rich) : undefined)) : undefined,
         rich: body.kind === "free_form" ? body.rich : undefined,
         template: templateInput,
+        // Conversation-addressed channels (TikTok) send to the provider
+        // conversation id learned from inbound events; the adapter
+        // refuses typed when it is missing rather than guessing.
+        conversationExternalId: conversation.externalId ?? undefined,
         idempotencyKey,
       });
       await updateMessageStatus(db, message.id, "sent", result.externalMessageId);
@@ -2751,6 +2845,14 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const account = await getChannelAccount(db, ws, body.channelAccountId);
     if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
 
+    // Reactive-only channels (TikTok) can never broadcast: the provider
+    // forbids business-initiated messages entirely. Capability-driven -
+    // the worker fan-out enforces the same rule as a backstop.
+    const broadcastCaps = CHANNEL_CAPABILITIES[account.channel as ChannelKey];
+    if (broadcastCaps && !broadcastCaps.canBroadcast) {
+      throw new ChannelInitiationError(account.channel, "Broadcasts");
+    }
+
     let category: WhatsAppCategory = "utility";
     if (body.templateId) {
       const template = await getTemplate(db, ws, body.templateId);
@@ -3080,13 +3182,21 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
 
   // OAuth start: 302 to the provider authorize URL with a signed state.
-  const oauthStart = (channel: "instagram" | "threads" | "messenger") =>
+  const oauthStart = (channel: "instagram" | "threads" | "messenger" | "tiktok") =>
     async (c: Ctx) => {
       const auth = authContext(c);
       const wsId = workspaceId(c);
       const secret = oauthSecret(deps);
       const redirectUri = oauthRedirectUri(deps, c, channel);
       const exp = Math.floor(Date.now() / 1000) + 600;
+      if (channel === "tiktok") {
+        const appId = deps.env.TIKTOK_APP_ID;
+        if (!appId) {
+          throw new AppError("CONFIGURATION", "TIKTOK_APP_ID is not configured on this server; TikTok connect is unavailable.", { status: 503 });
+        }
+        const state = signOAuthState(secret, { w: wsId, u: auth.user.id, ch: "tiktok", exp });
+        return c.redirect(buildTikTokAuthorizeUrl({ appId, redirectUri, state }), 302);
+      }
       if (channel === "threads") {
         const appId = deps.env.THREADS_APP_ID;
         if (!appId) {
@@ -3116,6 +3226,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   app.get("/channels/instagram/oauth/start", oauthStart("instagram"));
   app.get("/channels/threads/oauth/start", oauthStart("threads"));
   app.get("/channels/messenger/oauth/start", oauthStart("messenger"));
+  app.get("/channels/tiktok/oauth/start", oauthStart("tiktok"));
 
   // Messenger multi-Page picker: list (from the signed pending cookie) and
   // confirm. Tokens never leave the server except into the vault.
@@ -3681,6 +3792,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const body = c.req.valid("json");
     const account = await getChannelAccount(db, ws, body.channelAccountId);
     if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    // A sequence initiates contact on a schedule - impossible on
+    // reactive-only channels (TikTok). The worker advance processor
+    // enforces the same capability rule for pre-existing rows.
+    const sequenceCaps = CHANNEL_CAPABILITIES[account.channel as ChannelKey];
+    if (sequenceCaps && sequenceCaps.canInitiate === false) {
+      throw new ChannelInitiationError(account.channel, "Sequences");
+    }
     const row = await createSequence(db, {
       workspaceId: ws,
       channelAccountId: body.channelAccountId,

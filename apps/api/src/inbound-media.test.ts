@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
-  StaticCredentialProvider, TelegramAdapter, WhatsAppAdapter, type FetchLike,
+  StaticCredentialProvider, TelegramAdapter, TikTokAdapter, WhatsAppAdapter,
+  serializeTikTokTokenPair, type FetchLike,
 } from "@botara/channels";
 import { createInboundMediaPort } from "./inbound-media";
 import type { DispatchAccount } from "./flows-dispatch";
@@ -24,6 +25,35 @@ const MSG_ACCOUNT: DispatchAccount = {
   id: "acc-msg", workspaceId: "ws-1", channel: "messenger", externalId: "page-1",
   status: "connected", tokenVaultRef: "vault:msg-1",
 };
+const TT_ACCOUNT: DispatchAccount = {
+  id: "acc-tt", workspaceId: "ws-1", channel: "tiktok", externalId: "open-123",
+  status: "connected", tokenVaultRef: "vault:tt-1",
+};
+
+/** TikTok: download endpoint returns a download_url; the URL returns bytes (x-user header checked). */
+function tiktokAdapter(payload: Uint8Array) {
+  const fetchFn: FetchLike = async (input, init) => {
+    const url = String(input);
+    if (url.includes("/business/message/media/download/")) {
+      return new Response(JSON.stringify({
+        code: 0, message: "OK",
+        data: { download_url: "https://cdn.tiktok.example/dl/xyz" },
+      }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url === "https://cdn.tiktok.example/dl/xyz") {
+      const headers = (init?.headers ?? {}) as Record<string, string>;
+      if (headers["x-user"] !== "tt-access") return new Response("forbidden", { status: 403 });
+      return new Response(payload, { status: 200, headers: { "Content-Type": "image/jpeg" } });
+    }
+    return new Response("not found", { status: 404 });
+  };
+  return new TikTokAdapter({
+    credentials: new StaticCredentialProvider({
+      accessToken: serializeTikTokTokenPair({ accessToken: "tt-access", refreshToken: "tt-refresh", openId: "open-123" }),
+    }),
+    fetchFn,
+  });
+}
 
 interface StoredCall { key: string; data: Uint8Array; contentType: string }
 
@@ -213,6 +243,37 @@ describe("inbound media port", () => {
     await expect(port.fetchAndStore({
       workspaceId: "ws-1", account: WA_ACCOUNT, channel: "whatsapp",
       media: { type: "image" }, messageExternalId: "wamid.NOREF",
+    })).resolves.toBeNull();
+    expect(store.calls).toHaveLength(0);
+  });
+
+  test("tiktok: media id + conversation id -> adapter download -> stored", async () => {
+    const bytes = new Uint8Array([5, 6, 7]);
+    const store = fakeStore();
+    const port = createInboundMediaPort({
+      getAdapterFn: () => tiktokAdapter(bytes),
+      putObjectFn: store.putObjectFn,
+    });
+    const result = await port.fetchAndStore({
+      workspaceId: "ws-1", account: TT_ACCOUNT, channel: "tiktok",
+      media: { type: "image", id: "media-1" },
+      messageExternalId: "tm-1", conversationExternalId: "conv-1",
+    });
+    expect(store.calls).toHaveLength(1);
+    expect(store.calls[0]!.data).toEqual(bytes);
+    expect(result?.keys).toEqual(["workspaces/ws-1/inbound/tm-1/image.jpg"]);
+  });
+
+  test("tiktok: without the conversation id the download cannot be addressed -> null (caption-only)", async () => {
+    const store = fakeStore();
+    const port = createInboundMediaPort({
+      getAdapterFn: () => tiktokAdapter(new Uint8Array([1])),
+      putObjectFn: store.putObjectFn,
+    });
+    await expect(port.fetchAndStore({
+      workspaceId: "ws-1", account: TT_ACCOUNT, channel: "tiktok",
+      media: { type: "image", id: "media-1" },
+      messageExternalId: "tm-2",
     })).resolves.toBeNull();
     expect(store.calls).toHaveLength(0);
   });
