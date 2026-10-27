@@ -7438,9 +7438,12 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: () => void }) {
 }
 
 // ------------------------------------------------------------- legal pages
-// TEMPLATE legal text - the business owner must have these reviewed by
-// their own legal counsel before production use (see docs/app-review).
-// Body copy follows the selected UI language (EN default / ID).
+// Published policy copy for the hosted Botara service (filled in
+// 2026-10-28 for Meta App Review - operator, contact, dates and
+// retention terms are real, not placeholders). Self-hosters MUST adapt
+// the operator identity and contact in the i18n strings to their own
+// business before production use. Body copy follows the selected UI
+// language (EN default / ID).
 
 function LegalShell({ title, children }: { title: string; children: React.ReactNode }) {
   const { t } = useI18n();
@@ -7455,9 +7458,6 @@ function LegalShell({ title, children }: { title: string; children: React.ReactN
           </div>
         </div>
         <h1 className="text-3xl font-bold mt-4">{title}</h1>
-        <div className="mt-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
-          <strong>TEMPLATE.</strong> {t("legal.templateBanner")}
-        </div>
         <div className="mt-6 space-y-4 text-sm leading-6 text-slate-700 dark:text-slate-300">{children}</div>
       </div>
     </div>
@@ -7484,6 +7484,8 @@ function PrivacyPage() {
       <LegalSection heading={t("legal.privacy.s4h")}>{t("legal.privacy.s4")}</LegalSection>
       <LegalSection heading={t("legal.privacy.s5h")}>{t("legal.privacy.s5")}</LegalSection>
       <LegalSection heading={t("legal.privacy.s6h")}>{t("legal.privacy.s6")}</LegalSection>
+      <LegalSection heading={t("legal.privacy.s7h")}>{t("legal.privacy.s7")}</LegalSection>
+      <LegalSection heading={t("legal.privacy.s8h")}>{t("legal.privacy.s8")}</LegalSection>
     </LegalShell>
   );
 }
@@ -7498,6 +7500,7 @@ function TermsPage() {
       <LegalSection heading={t("legal.terms.s3h")}>{t("legal.terms.s3")}</LegalSection>
       <LegalSection heading={t("legal.terms.s4h")}>{t("legal.terms.s4")}</LegalSection>
       <LegalSection heading={t("legal.terms.s5h")}>{t("legal.terms.s5")}</LegalSection>
+      <LegalSection heading={t("legal.terms.s6h")}>{t("legal.terms.s6")}</LegalSection>
     </LegalShell>
   );
 }
