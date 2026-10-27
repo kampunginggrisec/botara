@@ -31,8 +31,13 @@ function graphDouble(input: { wabaId?: string; appIds?: string[]; subscribedErro
       if (input.subscribedError) {
         return new Response(JSON.stringify({ error: { message: input.subscribedError } }), { status: 400 });
       }
+      // Meta's REAL shape (official Postman collection): the app id is
+      // nested under whatsapp_business_api_data - a flat app_id key made
+      // every live account report "not subscribed" until 2026-10-28.
       return new Response(JSON.stringify({
-        data: (input.appIds ?? []).map((appId) => ({ waba_id: input.wabaId ?? "waba-1", app_id: appId })),
+        data: (input.appIds ?? []).map((appId) => ({
+          whatsapp_business_api_data: { id: appId, name: "Test App", link: `https://www.facebook.com/games/?app_id=${appId}` },
+        })),
       }), { status: 200 });
     }
     return new Response(JSON.stringify({ error: { message: `unexpected ${url}` } }), { status: 404 });
@@ -133,6 +138,29 @@ describe("channel health port", () => {
     });
     expect(report.ok).toBe(true);
     expect(report.appSubscription).toEqual({ wabaId: "waba-stored", subscribed: true, appIds: ["app-1"] });
+  });
+
+  test("a token Meta rejects (190) is a problem, not 'healthy'", async () => {
+    // The 2026-10-28 live shape: the subscription answer stays "unknown"
+    // (tri-state honesty), but a credential Meta itself rejected must
+    // flip the headline verdict - the test-number account reported
+    // "healthy" with a dead token before this.
+    const fetchFn = fakeFetch((url) => {
+      if (url.includes("/subscribed_apps")) {
+        return new Response(JSON.stringify({
+          error: { message: "Error validating access token: Session has expired", code: 190, type: "OAuthException" },
+        }), { status: 401 });
+      }
+      return new Response(JSON.stringify({ error: { message: `unexpected ${url}` } }), { status: 404 });
+    });
+    const report = await port({ fetchFn }).check({
+      account: { ...account, capabilities: { wabaId: "waba-1" } },
+      channel: "whatsapp",
+    });
+    expect(report.ok).toBe(false);
+    expect(report.appSubscription?.subscribed).toBeNull();
+    expect(report.appSubscription?.tokenRejected).toBe(true);
+    expect(report.detail).toContain("rejected the access token");
   });
 
   test("a missing subscription is the failure this check exists for", async () => {

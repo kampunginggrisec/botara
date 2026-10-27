@@ -28,6 +28,12 @@ export interface AppSubscriptionReport {
   wabaId: string | null;
   /** true = our app is subscribed, false = it is not, null = unknown. */
   subscribed: boolean | null;
+  /**
+   * Meta rejected the account's access token itself (Graph 190: expired
+   * or invalid). Distinct from an ordinary "unknown": the credential is
+   * provably dead, so the overall verdict must not stay healthy.
+   */
+  tokenRejected?: boolean;
   /** App ids Meta reports as subscribed to the WABA (empty when unknown). */
   appIds: string[];
   /** Why the answer is null, when it is. */
@@ -37,7 +43,7 @@ export interface AppSubscriptionReport {
 export interface ChannelHealthReport {
   accountId: string;
   channel: string;
-  /** false when the credential is missing OR the app is provably unsubscribed. */
+  /** false when the credential is missing, Meta rejected the token, OR the app is provably unsubscribed. */
   ok: boolean;
   detail: string;
   checkedAt: string;
@@ -72,10 +78,15 @@ export interface ChannelHealthDeps {
 /**
  * Read `GET /{waba-id}/subscribed_apps`.
  *
- * Meta answers `{ data: [{ waba_id, app_id, ... }] }`. Only `app_id` is
- * kept: the rest of the row (link time, permissions) is not something the
- * dashboard shows, and copying unknown fields would make this parser
- * fragile against Meta's additions.
+ * Meta's real answer nests the app under `whatsapp_business_api_data`:
+ * `{ data: [{ whatsapp_business_api_data: { id, name, link } }] }` (shape
+ * taken from Meta's official WhatsApp Business Management Postman
+ * collection). This parser originally read a flat `app_id` key that the
+ * fixture invented - against real Meta it matched nothing, so EVERY
+ * account reported "app NOT subscribed" (false alarm, found live
+ * 2026-10-28). Flat `app_id`/`id` keys are still tolerated defensively.
+ * A Graph error is rethrown with its `code` attached (`graphCode`) so
+ * callers can tell a rejected token (190) from an ordinary failure.
  */
 export async function readSubscribedAppIds(
   deps: Pick<ChannelHealthDeps, "fetchFn" | "graphVersion" | "baseUrl">,
@@ -87,14 +98,23 @@ export async function readSubscribedAppIds(
     headers: { Authorization: `Bearer ${input.token}` },
   });
   const json = (await res.json().catch(() => ({}))) as {
-    data?: Array<{ app_id?: string | number }>;
-    error?: { message?: string };
+    data?: Array<{
+      whatsapp_business_api_data?: { id?: string | number };
+      app_id?: string | number;
+      id?: string | number;
+    }>;
+    error?: { message?: string; code?: number };
   };
   if (!res.ok || json.error) {
-    throw new Error(json.error?.message ?? `subscribed_apps answered HTTP ${res.status}`);
+    const err = new Error(
+      json.error?.message ?? `subscribed_apps answered HTTP ${res.status}`,
+    ) as Error & { graphCode?: number };
+    if (json.error?.code !== undefined) err.graphCode = json.error.code;
+    throw err;
   }
   return (json.data ?? [])
-    .map((row) => (row.app_id === undefined ? "" : String(row.app_id)))
+    .map((row) => row.whatsapp_business_api_data?.id ?? row.app_id ?? row.id)
+    .map((id) => (id === undefined || id === null ? "" : String(id)))
     .filter((id) => id.length > 0);
 }
 
@@ -124,14 +144,16 @@ export function createChannelHealthPort(deps: ChannelHealthDeps): ChannelHealthP
       }
 
       const appSubscription = await checkAppSubscription(deps, input.account);
-      const ok = base.ok && appSubscription.subscribed !== false;
+      const ok = base.ok && appSubscription.subscribed !== false && appSubscription.tokenRejected !== true;
       return {
         accountId: input.account.id,
         channel: input.channel,
         ok,
-        detail: appSubscription.subscribed === false
-          ? `${base.detail}; the app is NOT subscribed to WABA ${appSubscription.wabaId} - inbound messages will not arrive`
-          : base.detail,
+        detail: appSubscription.tokenRejected
+          ? `${base.detail}; Meta rejected the access token (expired or invalid) - reconnect this account`
+          : appSubscription.subscribed === false
+            ? `${base.detail}; the app is NOT subscribed to WABA ${appSubscription.wabaId} - inbound messages will not arrive`
+            : base.detail,
         checkedAt,
         appSubscription,
       };
@@ -169,7 +191,13 @@ async function checkAppSubscription(
   try {
     appIds = await readSubscribedAppIds(deps, { token, wabaId });
   } catch (err) {
-    return unknown(err instanceof Error ? err.message : String(err), wabaId);
+    // Graph 190 means Meta rejected the token itself (expired/invalid) -
+    // that is a proven-dead credential, not an ordinary "unknown".
+    const tokenRejected = (err as { graphCode?: number })?.graphCode === 190;
+    return {
+      ...unknown(err instanceof Error ? err.message : String(err), wabaId),
+      ...(tokenRejected ? { tokenRejected: true } : {}),
+    };
   }
 
   if (!deps.appId) {
