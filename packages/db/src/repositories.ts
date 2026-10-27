@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, or, sql } from "drizzle-orm";
 import type { Database } from "./client";
 import {
   apiTokens, auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger,
@@ -2177,6 +2177,27 @@ export type AcceptWorkspaceInviteOutcome =
   | { status: "missing" };
 
 /**
+ * The conditional-UPDATE guard that spends one invite use: not revoked,
+ * not expired, uses remaining. Built ONLY from column-typed operators
+ * (gt/lt) on purpose: interpolating a raw JS Date into a sql`` fragment
+ * hands postgres-js a Date where it expects a string, and every accept
+ * against real Postgres died with ERR_INVALID_ARG_TYPE (found live
+ * 2026-10-27 during the #9 browser verification — the InMemory store
+ * used in tests cannot reproduce driver serialization). The codebase
+ * convention for raw-sql dates is `${date.toISOString()}::timestamptz`;
+ * typed operators are safer still because drizzle maps the value
+ * through the column's own encoder.
+ */
+export function inviteConsumableWhere(inviteId: string, now: Date) {
+  return and(
+    eq(workspaceInvites.id, inviteId),
+    isNull(workspaceInvites.revokedAt),
+    or(isNull(workspaceInvites.expiresAt), gt(workspaceInvites.expiresAt, now)),
+    or(isNull(workspaceInvites.maxUses), lt(workspaceInvites.usesCount, workspaceInvites.maxUses)),
+  );
+}
+
+/**
  * Consume one use of an invite and add the member - atomically. The
  * membership check, the use consumption and the member insert all run
  * in ONE transaction, and the consumption is a single conditional
@@ -2199,12 +2220,7 @@ export async function acceptWorkspaceInvite(
     const consumed = await tx
       .update(workspaceInvites)
       .set({ usesCount: sql`${workspaceInvites.usesCount} + 1` })
-      .where(and(
-        eq(workspaceInvites.id, invite.id),
-        isNull(workspaceInvites.revokedAt),
-        or(isNull(workspaceInvites.expiresAt), sql`${workspaceInvites.expiresAt} > ${now}`),
-        or(isNull(workspaceInvites.maxUses), lt(workspaceInvites.usesCount, workspaceInvites.maxUses)),
-      ))
+      .where(inviteConsumableWhere(invite.id, now))
       .returning();
     if (consumed.length === 0) {
       // Nothing consumed: classify the current state for the typed error.
@@ -2408,8 +2424,10 @@ export async function countServiceUnitsInRange(
       and(
         eq(costLedger.channelAccountId, channelAccountId),
         eq(costLedger.category, "service"),
-        sql`${costLedger.createdAt} >= ${from}`,
-        sql`${costLedger.createdAt} < ${to}`,
+        // Column-typed operators, never raw Dates in sql`` fragments —
+        // same postgres-js serialization hazard as inviteConsumableWhere.
+        gte(costLedger.createdAt, from),
+        lt(costLedger.createdAt, to),
       ),
     );
   // AI rows (category "ai") can carry NULL units and never match the
