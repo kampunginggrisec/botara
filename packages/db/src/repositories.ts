@@ -1449,6 +1449,18 @@ export async function updateChannelAccountAvatar(
     .where(eq(channelAccounts.id, accountId));
 }
 
+/** Replace an account's capabilities bag (e.g. the WABA id re-stamped on reconnect). */
+export async function updateChannelAccountCapabilities(
+  db: Database,
+  accountId: string,
+  capabilities: Record<string, unknown>,
+): Promise<void> {
+  await db
+    .update(channelAccounts)
+    .set({ capabilities })
+    .where(eq(channelAccounts.id, accountId));
+}
+
 /** Persist the outcome of a token refresh (new expiry and/or vault ref, status). */
 export async function updateChannelAccountToken(
   db: Database,

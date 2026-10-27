@@ -1,5 +1,5 @@
 import type { ChannelAccountRef, ChannelAdapter, ChannelKey, FetchLike } from "@botara/channels";
-import { resolveWabaIdForNumber } from "./template-sync";
+import { resolveWabaIdForNumber, storedWabaIdForAccount } from "./template-sync";
 
 /**
  * Per-account channel health (P2-2).
@@ -154,10 +154,15 @@ async function checkAppSubscription(
   if (!token) return unknown("No access token is resolvable for this account, so the subscription cannot be checked.");
 
   let wabaId: string;
-  try {
-    wabaId = await resolveWabaIdForNumber(deps, { token, phoneNumberId: account.externalId });
-  } catch (err) {
-    return unknown(err instanceof Error ? err.message : String(err));
+  const storedWabaId = storedWabaIdForAccount(account);
+  if (storedWabaId) {
+    wabaId = storedWabaId;
+  } else {
+    try {
+      wabaId = await resolveWabaIdForNumber(deps, { token, phoneNumberId: account.externalId });
+    } catch (err) {
+      return unknown(err instanceof Error ? err.message : String(err));
+    }
   }
 
   let appIds: string[];

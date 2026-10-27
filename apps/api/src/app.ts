@@ -5901,6 +5901,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         externalId: account.externalId,
         ...(account.authMode ? { authMode: account.authMode } : {}),
         ...(account.tokenVaultRef ? { tokenVaultRef: account.tokenVaultRef } : {}),
+        ...(account.capabilities ? { capabilities: account.capabilities as Record<string, unknown> } : {}),
       },
     });
     return c.json(report);

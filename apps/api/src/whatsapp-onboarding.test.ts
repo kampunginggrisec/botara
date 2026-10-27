@@ -88,6 +88,9 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
     expect(result.accounts[0]).toMatchObject({ phoneNumberId: "pn-1", verifiedName: "Toko Berkah", channelAccountId: "db-acc-1" });
     expect(persisted).toHaveLength(2);
     expect(persisted[0]).toMatchObject({ channel: "whatsapp", externalId: "pn-1", apiVersion: "v26.0", isCoexistence: true });
+    // The WABA id rides in capabilities: template ops + health checks
+    // cannot re-derive it from the phone-number node on Graph v26.
+    expect(persisted[0]!.capabilities).toMatchObject({ wabaId: "waba-1" });
     // The persisted rows carry ONLY the vault ref; the vault holds the token.
     const ref = persisted[0]!.tokenVaultRef;
     expect(ref).toStartWith("vault:memory:");

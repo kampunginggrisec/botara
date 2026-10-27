@@ -115,6 +115,26 @@ describe("channel health port", () => {
     });
   });
 
+  test("uses the WABA stored on the account instead of the discovery lookup", async () => {
+    // Discovery is dead on Graph v26 ((#100) nonexisting field); a stored
+    // wabaId must carry the check without ever attempting it.
+    const fetchFn = fakeFetch((url) => {
+      if (url.includes("fields=whatsapp_business_account")) {
+        return new Response(JSON.stringify({ error: { message: "(#100) Tried accessing nonexisting field (whatsapp_business_account)" } }), { status: 400 });
+      }
+      if (url.includes("/waba-stored/subscribed_apps")) {
+        return new Response(JSON.stringify({ data: [{ waba_id: "waba-stored", app_id: "app-1" }] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: { message: `unexpected ${url}` } }), { status: 404 });
+    });
+    const report = await port({ fetchFn }).check({
+      account: { ...account, capabilities: { wabaId: "waba-stored" } },
+      channel: "whatsapp",
+    });
+    expect(report.ok).toBe(true);
+    expect(report.appSubscription).toEqual({ wabaId: "waba-stored", subscribed: true, appIds: ["app-1"] });
+  });
+
   test("a missing subscription is the failure this check exists for", async () => {
     const report = await port({ fetchFn: graphDouble({ appIds: ["some-other-app"] }) })
       .check({ account, channel: "whatsapp" });

@@ -104,6 +104,30 @@ describe("template sync service", () => {
     expect(calls[2]!.url).toContain("after=cursor-1");
   });
 
+  test("prefers the WABA stored on the account and never calls discovery", async () => {
+    // Graph v26 has no whatsapp_business_account field on the phone node
+    // (Meta answers (#100) "nonexisting field"), so the discovery URL is
+    // intentionally unserved here: any discovery attempt throws.
+    const calls: RecordedCall[] = [];
+    const fetchFn = async (input: string | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method ?? "GET" });
+      if (url.includes("/waba-stored/message_templates")) {
+        return jsonResponse({ data: [template()], paging: { cursors: { after: null } } });
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+    const { rows, store } = memoryStore();
+    const result = await syncWhatsAppTemplates(
+      { fetchFn, resolveAccessToken: async () => "tok", store },
+      { workspaceId: "ws-1", account: { ...ACCOUNT, capabilities: { wabaId: "waba-stored" } } },
+    );
+    expect(result.wabaId).toBe("waba-stored");
+    expect(result.templates).toBe(1);
+    expect(rows[0]!.messagingAccountId).toBe("waba-stored");
+    expect(calls.some((c) => c.url.includes("fields=whatsapp_business_account"))).toBe(false);
+  });
+
   test("re-syncing the same templates updates instead of duplicating", async () => {
     const { fetchFn } = mockGraph([{ data: [template()] }]);
     const { rows, store } = memoryStore();

@@ -1,7 +1,7 @@
 import { AppError } from "@botara/shared";
 import { CHANNEL_CAPABILITIES, type FetchLike } from "@botara/channels";
 import {
-  createChannelAccount, listChannelAccounts, updateChannelAccountAvatar, updateChannelAccountToken,
+  createChannelAccount, listChannelAccounts, updateChannelAccountAvatar, updateChannelAccountCapabilities, updateChannelAccountToken,
   type Database,
 } from "@botara/db";
 
@@ -159,6 +159,9 @@ export function createDbWhatsAppAccountPersister(
         // Item G: reconnecting cancels the retention countdown.
         disconnectedAt: null,
       });
+      // Re-stamp capabilities (incl. the WABA id) so rows created before
+      // wabaId capture shipped heal themselves on their next reconnect.
+      await updateChannelAccountCapabilities(db, existing.id, input.capabilities);
       if (input.avatarUrl) {
         await updateChannelAccountAvatar(db, existing.id, input.avatarUrl);
       }
@@ -296,7 +299,14 @@ export async function exchangeEmbeddedSignup(
       displayName: number.verified_name ?? number.display_phone_number,
       avatarUrl: await fetchProfilePictureUrl(number.id),
       apiVersion: version,
-      capabilities: CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>,
+      // The WABA id is stamped into capabilities: template operations and
+      // the health check cannot re-derive it from the phone-number node
+      // on Graph v26 (the discovery field no longer exists), so onboarding
+      // is the one moment it is known for free.
+      capabilities: {
+        ...(CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>),
+        wabaId,
+      },
       isCoexistence,
       tokenVaultRef,
       status: "connected",

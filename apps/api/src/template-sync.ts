@@ -12,8 +12,8 @@ import { WhatsAppAdapter, type FetchLike } from "@botara/channels";
  *
  * The sync:
  *   1. resolves the account's access token (vault, env fallback),
- *   2. discovers the WABA from the phone-number id
- *      (`GET /{phone-number-id}?fields=whatsapp_business_account`),
+ *   2. resolves the owning WABA - the id captured at onboarding
+ *      (`capabilities.wabaId`) when present, else a discovery lookup,
  *   3. pages `GET /{waba-id}/message_templates` (bounded - 10 pages),
  *   4. upserts every template into the local table keyed by
  *      (workspace, account, name, language) - the identity Meta uses.
@@ -27,6 +27,33 @@ export interface TemplateSyncAccountRef {
   id: string;
   externalId: string;
   tokenVaultRef?: string | null;
+  /** WABA id captured at onboarding; skips the discovery lookup when set. */
+  wabaId?: string | null;
+  /** The account row's capabilities bag (jsonb, untyped); may carry `wabaId`. */
+  capabilities?: unknown;
+}
+
+/**
+ * The WABA id stored on the account, if any. Embedded Signup knows the
+ * WABA at exchange time and the persister stamps it into
+ * `capabilities.wabaId`; template operations and the health check must
+ * prefer it, because the discovery field used before
+ * (`?fields=whatsapp_business_account` on the phone-number node) does not
+ * exist in Graph v26 - Meta answers (#100) "nonexisting field" (verified
+ * live 2026-10-28, when Sync from Meta returned 502 for a healthy
+ * account). An explicit `wabaId` field wins over the capabilities bag.
+ */
+export function storedWabaIdForAccount(account: {
+  wabaId?: string | null;
+  capabilities?: unknown;
+}): string | undefined {
+  if (account.wabaId) return account.wabaId;
+  const capabilities = account.capabilities;
+  if (capabilities && typeof capabilities === "object") {
+    const fromCapabilities = (capabilities as Record<string, unknown>).wabaId;
+    if (typeof fromCapabilities === "string" && fromCapabilities) return fromCapabilities;
+  }
+  return undefined;
 }
 
 /** Everything needed to talk Graph for a template operation. */
@@ -106,7 +133,8 @@ export async function connectTemplateGraph(
     baseUrl: base,
   });
 
-  if (options.knownWabaId) return { token, wabaId: options.knownWabaId, adapter };
+  const knownWabaId = options.knownWabaId ?? storedWabaIdForAccount(account);
+  if (knownWabaId) return { token, wabaId: knownWabaId, adapter };
 
   const wabaId = await resolveWabaIdForNumber(deps, { token, phoneNumberId: account.externalId });
   return { token, wabaId, adapter };

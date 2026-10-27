@@ -199,6 +199,14 @@ export interface ChannelAccountRef {
   /** Opaque pointer into the credential vault (channel_accounts.token_vault_ref). */
   tokenVaultRef?: string;
   /**
+   * Free-form per-account metadata mirrored from
+   * channel_accounts.capabilities - for WhatsApp this carries the WABA id
+   * captured at onboarding (`wabaId`), which template operations and the
+   * health check need because the WABA cannot be re-derived from the
+   * phone-number node on current Graph versions.
+   */
+  capabilities?: Record<string, unknown>;
+  /**
    * When the current access token expires (ISO string), mirrored from
    * channel_accounts.token_expires_at. Token-refresh logic (Threads 24h-60d
    * window, Instagram long-lived tokens) decides from this value.
