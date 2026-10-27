@@ -1281,6 +1281,8 @@ export async function channelAccountHasReferences(db: Database, accountId: strin
     db.select().from(catalogProducts).where(eq(catalogProducts.channelAccountId, accountId)).limit(1),
     db.select().from(costLedger).where(eq(costLedger.channelAccountId, accountId)).limit(1),
     db.select().from(workspaceDomains).where(eq(workspaceDomains.channelAccountId, accountId)).limit(1),
+    db.select().from(flowWaits).where(eq(flowWaits.channelAccountId, accountId)).limit(1),
+    db.select().from(webhookReceipts).where(eq(webhookReceipts.channelAccountId, accountId)).limit(1),
   ]);
   return probes.some((rows) => rows.length > 0);
 }
@@ -1385,6 +1387,18 @@ export async function purgeChannelAccount(
     const txDb = tx as unknown as Database;
     const existing = await getChannelAccount(txDb, workspaceId, id);
     if (!existing) return null;
+
+    // flow_waits reference BOTH the conversation and the account, so
+    // they go before either parent. webhook_receipts (migration 0018)
+    // and flow_waits were added after this purge was written and were
+    // never added to it: leaving either behind makes the final delete
+    // die on a 23503 FK violation - proven live 2026-10-28, when a
+    // test account carrying webhook-log receipts could not be purged
+    // at all (the API purge 500s the same way, and the retention
+    // sweeper inherits the failure). Receipts are 7-day diagnostics
+    // and die with the account; waits belong to the account's runs.
+    await txDb.delete(flowWaits).where(eq(flowWaits.channelAccountId, id));
+    await txDb.delete(webhookReceipts).where(eq(webhookReceipts.channelAccountId, id));
 
     const convs = await txDb.select().from(conversations).where(eq(conversations.channelAccountId, id));
     for (const conv of convs) {

@@ -232,6 +232,40 @@ describe("DELETE /channels/accounts/{id}?purge=true", () => {
     expect(domain!.channelAccountId).toBeNull();
   });
 
+  test("purge removes webhook receipts and flow waits that reference the account", async () => {
+    // Regression (live failure 2026-10-28): webhook_receipts (migration
+    // 0018) and flow_waits were added after purgeChannelAccount was
+    // written and never joined its cleanup list, so purging an account
+    // that had ever received a webhook died on a real-Postgres 23503
+    // FK violation. The fake DB enforces no FKs, so this test pins the
+    // behavioral contract instead: purge must delete those rows too.
+    const account = await seedAccount(owner.workspaceId, "15559999");
+    const conversation = await seedConversation(owner.workspaceId, account.id, "receipts");
+    fake.seed("webhookReceipts", {
+      channel: "whatsapp", eventType: "message.received", outcome: "processed",
+      httpStatus: 200, workspaceId: owner.workspaceId, channelAccountId: account.id,
+      payloadSummary: "{}",
+    });
+    fake.seed("flowWaits", {
+      workspaceId: owner.workspaceId, conversationId: conversation.id,
+      contactId: conversation.contactId, channelAccountId: account.id,
+      flowId: "00000000-0000-4000-8000-0000000000aa", nodeId: "ask-1",
+      variable: "answer", resumeState: {},
+    });
+
+    const soft = await disconnect(account.id, owner.headers);
+    expect(soft.status).toBe(200);
+    expect(await soft.json()).toEqual({ mode: "disconnected" });
+
+    const res = await disconnect(account.id, owner.headers, true);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ mode: "purged" });
+
+    expect(await getChannelAccount(fake.db, owner.workspaceId, account.id)).toBeNull();
+    expect(fake.rows.webhookReceipts.some((r) => r.channelAccountId === account.id)).toBe(false);
+    expect(fake.rows.flowWaits.some((r) => r.channelAccountId === account.id)).toBe(false);
+  });
+
   test("purge on a still-connected account is refused 409 and nothing is touched", async () => {
     const account = await seedAccount(owner.workspaceId, "15558888");
     const conversation = await seedConversation(owner.workspaceId, account.id, "refuse");

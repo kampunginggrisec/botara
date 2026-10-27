@@ -2,7 +2,7 @@ import {
   auditLog, broadcastRecipients, broadcasts, catalogProducts, channelAccounts, contacts, conversations, costLedger, deals, flows, flowWaits, growthLinks,
   kbChunks, kbDocuments,
   messages, pipelines, pipelineStages, processedComments, savedReplies, scheduledPosts, sequenceEnrollments, sequences, templates, webchatSessions,
-  webhookDeliveries, webhookEndpoints,
+  webhookDeliveries, webhookEndpoints, webhookReceipts,
   workspaceDomains, workspaces,
   type Database,
 } from "@botara/db";
@@ -370,6 +370,7 @@ export interface FakeDatabase {
     kbChunks: Row[];
     savedReplies: Row[];
     flowWaits: Row[];
+    webhookReceipts: Row[];
     flows: Row[];
     workspaces: Row[];
     pipelines: Row[];
@@ -404,6 +405,7 @@ export function createFakeDatabase(): FakeDatabase {
     kbChunks: [] as Row[],
     savedReplies: [] as Row[],
     flowWaits: [] as Row[],
+    webhookReceipts: [] as Row[],
     flows: [] as Row[],
     workspaces: [] as Row[],
     pipelines: [] as Row[],
@@ -434,6 +436,7 @@ export function createFakeDatabase(): FakeDatabase {
   core.register(kbChunks, store.kbChunks);
   core.register(savedReplies, store.savedReplies);
   core.register(flowWaits, store.flowWaits);
+  core.register(webhookReceipts, store.webhookReceipts);
   core.register(flows, store.flows);
   core.register(workspaces, store.workspaces);
   core.register(pipelines, store.pipelines);
