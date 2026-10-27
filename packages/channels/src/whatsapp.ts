@@ -605,6 +605,35 @@ export class WhatsAppAdapter implements ChannelAdapter {
             : undefined;
           if (msg.type === "text") {
             events.push({ type: "message.received", ...base, text: msg.text?.body, ...(referral ? { referral } : {}) });
+          } else if (msg.type === "button" || msg.type === "interactive") {
+            // Button taps are postbacks, not text messages (WA-1): a
+            // template quick-reply tap arrives as type "button" carrying
+            // button{text, payload}; a tap on an interactive reply button
+            // (the buttons sendRich itself sends) arrives as type
+            // "interactive" carrying button_reply / list_reply {id,
+            // title}. Both normalize to the same postback.received shape
+            // Messenger produces, so the dispatcher matches them against
+            // postback triggers by payload and keyword triggers by title
+            // — and, exactly like a Messenger postback, no inbox message
+            // row is persisted for a tap. Other interactive payloads
+            // (e.g. nfm_reply flow completions) have no reply object and
+            // keep the bare message.received fall-through below.
+            const reply = msg.type === "button"
+              ? { id: msg.button?.payload, title: msg.button?.text }
+              : (msg.interactive?.button_reply ?? msg.interactive?.list_reply);
+            if (reply && (reply.id !== undefined || reply.title !== undefined)) {
+              events.push({
+                type: "postback.received",
+                channel: "whatsapp",
+                accountExternalId,
+                contactExternalId: base.contactExternalId,
+                payload: reply.id !== undefined ? String(reply.id) : "",
+                ...(typeof reply.title === "string" ? { title: reply.title } : {}),
+                receivedAt: base.receivedAt,
+              });
+            } else {
+              events.push({ type: "message.received", ...base, ...(referral ? { referral } : {}) });
+            }
           } else if (["image", "video", "document", "audio", "sticker"].includes(msg.type)) {
             const m = (msg[msg.type] ?? {}) as Record<string, any>;
             const media: MessageMedia = {

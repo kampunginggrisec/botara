@@ -974,9 +974,24 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
     const flows = await deps.store.listActiveFlows(workspaceId);
     for (const flow of flows) {
       const trigger = flow.trigger as FlowTrigger;
-      const matched = event.type === "message.received"
-        ? flowTriggerMatches(trigger, { text: event.text })
-        : flowTriggerMatches(trigger, { payload: event.payload });
+      let matched = false;
+      let triggerText: string | undefined;
+      if (event.type === "message.received") {
+        matched = flowTriggerMatches(trigger, { text: event.text });
+        triggerText = event.text;
+      } else {
+        // postback.received: mirror the webchat-click semantics — a tap
+        // is tested against postback triggers by its payload AND keyword
+        // triggers by its title text (a flow has a single trigger type,
+        // so at most one of the two tests can fire for it).
+        if (flowTriggerMatches(trigger, { payload: event.payload })) {
+          matched = true;
+          triggerText = event.payload;
+        } else if (event.title && flowTriggerMatches(trigger, { text: event.title })) {
+          matched = true;
+          triggerText = event.title;
+        }
+      }
       if (!matched) continue;
       try {
         await deps.flowEnqueuer.enqueueFlowRun({
@@ -985,7 +1000,7 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           contactId: contact.id,
           conversationId: conversation.id,
           channelAccountId: account.id,
-          triggerText: event.type === "message.received" ? event.text : event.payload,
+          triggerText,
         });
       } catch (err) {
         log({ event: "flow_run_enqueue_failed", flowId: flow.id, workspaceId, error: String(err) });

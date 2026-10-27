@@ -361,6 +361,40 @@ describe("persisted webchat dispatch (clickable buttons)", () => {
   });
 });
 
+describe("whatsapp postback dispatch (WA-1)", () => {
+  const waPostback = (payload: string, title?: string): InboundEvent => ({
+    type: "postback.received", channel: "whatsapp", accountExternalId: "10987",
+    contactExternalId: "62812", payload, title,
+    receivedAt: new Date().toISOString(),
+  });
+
+  test("a quick-reply tap matches the postback trigger by payload and persists no message row", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "No-Button-Payload" } } });
+    await dispatcher.dispatch([waPostback("No-Button-Payload", "No")]);
+    expect(flowRuns.map((r) => r.flowId)).toEqual(["f-pb"]);
+    expect(flowRuns[0]!.triggerText).toBe("No-Button-Payload");
+    // Postbacks persist no inbox message (Messenger parity).
+    expect(store.messages).toHaveLength(0);
+  });
+
+  test("a button tap ALSO matches keyword triggers against its title (webchat-click semantics)", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-kw-title", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "harga" } } });
+    await dispatcher.dispatch([waPostback("BTN_HARGA", "Lihat Harga")]);
+    expect(flowRuns.map((r) => r.flowId)).toEqual(["f-kw-title"]);
+    expect(flowRuns[0]!.triggerText).toBe("Lihat Harga");
+  });
+
+  test("a tap matching neither payload nor title enqueues nothing", async () => {
+    const { store, dispatcher, flowRuns } = setup();
+    store.flows.push({ id: "f-pb", workspaceId: "ws-1", trigger: { type: "postback", config: { payload: "HARGA" } } });
+    store.flows.push({ id: "f-kw", workspaceId: "ws-1", trigger: { type: "keyword", config: { keyword: "jadwal" } } });
+    await dispatcher.dispatch([waPostback("LAINNYA", "Promo")]);
+    expect(flowRuns).toHaveLength(0);
+  });
+});
+
 describe("whatsapp coexistence dispatch", () => {
   function waSetup() {
     const store = new InMemoryDispatchStore();

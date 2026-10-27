@@ -157,6 +157,97 @@ describe("whatsapp webhook parsing", () => {
     });
   });
 
+  test("template quick-reply tap (type button) -> postback.received with payload + title", async () => {
+    // Verbatim payload from Meta's official Postman collection
+    // (WhatsApp Cloud API -> Webhook Payload Reference -> "Received
+    // Callback from a Quick Reply Button Click").
+    const events = await wa.parseWebhook({
+      object: "whatsapp_business_account",
+      entry: [{
+        id: "8856996819413533",
+        changes: [{
+          field: "messages",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: { display_phone_number: "16505553333", phone_number_id: "27681414235104944" },
+            contacts: [{ profile: { name: "Kerry Fisher" }, wa_id: "16315551234" }],
+            messages: [{
+              context: { from: "16505553333", id: "wamid.gBGGFlCGg0cvAgkLFm4e9tICiTI" },
+              from: "16315551234",
+              id: "wamid.ABGGFlCGg0cvAgo-sHWxBA2VFD_S",
+              timestamp: "1603087229",
+              type: "button",
+              button: { text: "No", payload: "No-Button-Payload" },
+            }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "postback.received", channel: "whatsapp",
+      accountExternalId: "27681414235104944", contactExternalId: "16315551234",
+      payload: "No-Button-Payload", title: "No",
+    });
+  });
+
+  test("interactive button_reply tap -> postback.received with reply id + title", async () => {
+    // Documented interactive-reply shape (the collection carries no
+    // interactive-reply example; shape per Meta's webhook reference and
+    // the WA-1 audit's code inspection).
+    const events = await wa.parseWebhook({
+      object: "whatsapp_business_account",
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "messages",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: { phone_number_id: "1234567890" },
+            messages: [{
+              from: "62812", id: "wamid.BTN1", timestamp: "1760000000", type: "interactive",
+              interactive: { type: "button_reply", button_reply: { id: "BTN_HARGA", title: "Lihat Harga" } },
+            }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "postback.received", channel: "whatsapp",
+      accountExternalId: "1234567890", contactExternalId: "62812",
+      payload: "BTN_HARGA", title: "Lihat Harga",
+    });
+  });
+
+  test("interactive list_reply tap -> postback.received with row id + title", async () => {
+    const events = await wa.parseWebhook({
+      object: "whatsapp_business_account",
+      entry: [{
+        id: "waba-1",
+        changes: [{
+          field: "messages",
+          value: {
+            messaging_product: "whatsapp",
+            metadata: { phone_number_id: "1234567890" },
+            messages: [{
+              from: "62812", id: "wamid.LST1", timestamp: "1760000000", type: "interactive",
+              interactive: {
+                type: "list_reply",
+                list_reply: { id: "ROW_JADWAL", title: "Jadwal Kelas", description: "Kelas sore & malam" },
+              },
+            }],
+          },
+        }],
+      }],
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "postback.received", channel: "whatsapp",
+      payload: "ROW_JADWAL", title: "Jadwal Kelas",
+    });
+  });
+
   test("statuses -> message.status with errors", async () => {
     const events = await wa.parseWebhook({
       entry: [{
