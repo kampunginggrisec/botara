@@ -97,6 +97,36 @@ describe("api.listMessages quoted-reply fields (migration 0019)", () => {
   });
 });
 
+describe("api.reply quote payload (outbound quotes)", () => {
+  let lastBody: Record<string, unknown> | null;
+
+  function stubFetchCapture(): void {
+    lastBody = null;
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      lastUrl = String(input);
+      lastBody = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
+      return new Response(JSON.stringify({ message: { id: "m-out" }, delivery: "sent" }), {
+        status: 200, headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+  }
+
+  test("includes replyToMessageId when a quote is pending", async () => {
+    stubFetchCapture();
+    await api.reply("conv-1", { kind: "free_form", text: "Masih ada kak", replyToMessageId: "m-in" });
+    expect(lastUrl.endsWith("/conversations/conv-1/reply")).toBe(true);
+    expect(lastBody?.replyToMessageId).toBe("m-in");
+    expect(lastBody?.text).toBe("Masih ada kak");
+  });
+
+  test("omits replyToMessageId entirely when no quote is pending", async () => {
+    stubFetchCapture();
+    await api.reply("conv-1", { kind: "free_form", text: "tanpa kutipan" });
+    expect(lastBody).not.toBeNull();
+    expect("replyToMessageId" in (lastBody ?? {})).toBe(false);
+  });
+});
+
 describe("api.listContacts envelope (ContactsPage add-contact reload path)", () => {
   test("returns data.contacts from the { contacts } envelope", async () => {
     stubFetchJson({

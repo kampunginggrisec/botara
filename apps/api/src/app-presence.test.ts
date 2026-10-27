@@ -9,8 +9,11 @@ import { registerUser, testDeps, type Registered } from "./test-helpers";
  * The webchat channel is the harness here on purpose: it has NO presence
  * surface, which is exactly the "unsupported_channel" branch every route
  * must answer honestly instead of faking a call. Quoted replies are
- * resolved server-side, so the validation rules (same conversation,
- * provider id present) are channel-independent and testable here.
+ * resolved server-side, so the thread-validation rules (same conversation,
+ * provider id present) are channel-independent and testable here; webchat
+ * itself has NO native quote surface, so an otherwise-valid quote target
+ * is rejected by the quote-surface guard (acceptance on a quote-native
+ * channel lives in app-outbound-quotes.test.ts).
  */
 
 let fake: FakeDatabase;
@@ -72,13 +75,15 @@ beforeAll(async () => {
 });
 
 describe("quoted replies (WA-2)", () => {
-  test("quoting a message of the same thread is accepted", async () => {
+  test("webchat has no native quote surface: a valid same-thread quote target is a typed 400", async () => {
     const res = await app.request("/conversations/conv-1/reply", {
       method: "POST",
       headers: jsonHeaders(owner),
       body: JSON.stringify({ kind: "free_form", text: "Masih ada kak", replyToMessageId: "msg-in" }),
     });
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(400);
+    const body = await res.json() as { error: { code: string } };
+    expect(body.error.code).toBe("VALIDATION");
   });
 
   test("quoting a message from ANOTHER conversation is a typed 404", async () => {

@@ -1260,6 +1260,15 @@ const messengerSelectPageBodySchema = z.object({ pageId: z.string().min(1) }).op
 
 const MESSENGER_PENDING_COOKIE = "botara_msgr_pending";
 
+/**
+ * Channels whose adapter send() renders a provider-NATIVE quote for the
+ * customer (WhatsApp `context.message_id`, Messenger/Instagram
+ * `reply_to.mid`). The inbox reply route rejects quote targets on every
+ * other channel: the reference would be dropped provider-side while our
+ * thread renders a quote block the customer never saw.
+ */
+const QUOTE_NATIVE_CHANNELS: ReadonlySet<string> = new Set(["whatsapp", "messenger", "instagram"]);
+
 interface MessengerPendingPayload {
   w: string;
   pages: Array<{ id: string; name: string; t: string }>;
@@ -3613,10 +3622,28 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       replyToExternalId = quoted.externalId;
     }
 
+    // Quote surface guard (outbound quotes): only channels whose adapter
+    // renders a NATIVE quote for the customer may carry one - WhatsApp
+    // (context.message_id) and Messenger/Instagram (reply_to.mid). On any
+    // other channel the adapter would silently drop the reference while
+    // our own thread renders a quote block - a quote the customer never
+    // saw. Reject with a typed 400 instead of persisting a phantom quote.
+    if (replyToExternalId && !QUOTE_NATIVE_CHANNELS.has(conversation.channel)) {
+      throw new AppError(
+        "VALIDATION",
+        `Quoted replies are not supported on ${conversation.channel} (the customer would not see the quote).`,
+        { status: 400 },
+      );
+    }
+
     const idempotencyKey = `reply:${id}:${crypto.randomUUID()}`;    const message = await createMessage(db, {
       conversationId: id,
       direction: "out",
       type: body.kind === "template" ? "template" : body.rich ? "rich" : "text",
+      // Persist the quote reference on the outbound row so the thread
+      // renders the quote block on OUR bubble too (the serializer resolves
+      // it exactly like an inbound quote).
+      replyToExternalId,
       // Rich messages persist as their formatted plain-text rendering so
       // the thread stays readable on every surface; the block itself
       // rides in `payload` (the webchat widget renders clickable
