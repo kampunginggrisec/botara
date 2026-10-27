@@ -292,6 +292,12 @@ dilaporkan, tidak menggagalkan provisioning). **Idempoten**: jalankan
 ulang dengan token baru untuk memutar token yang kedaluwarsa setelah
 24 jam.
 
+Bila webhook nomor uji tetap tidak tiba di Botara (mis. callback
+level-app belum menunjuk ke Botara), kunci pengiriman khusus WABA uji
+dengan override callback — jalankan `bun run scripts/set-wa-test-callback-override.ts`
+di server (token dibaca dari vault; butuh `PUBLIC_WEBHOOK_BASE_URL` +
+`WHATSAPP_VERIFY_TOKEN` di env).
+
 Batasan WABA uji dari sisi Meta: nomor uji hanya bisa **mengirim** ke
 maksimal **5 nomor penerima yang terverifikasi**. Tambahkan nomor
 pribadi Anda di daftar penerima pada halaman API Setup dan verifikasi

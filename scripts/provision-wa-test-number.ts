@@ -19,11 +19,13 @@
  *     resolve the token from token_vault_ref through VaultCredentialProvider)
  *     pick the account up with no special-casing.
  *
- * Differences from a real signup, deliberately: Embedded Signup itself
- * subscribes the app to the WABA during the flow, so onboarding has no
- * explicit call; a hand-provisioned test number never went through that
- * flow, so this script attempts POST /{wabaId}/subscribed_apps with the
- * temp token (best-effort - a failure is reported, never fatal).
+ * The subscription call: onboarding now makes it too (step 6 of the
+ * exchange, ES-1 fix), and this script attempts the same
+ * POST /{wabaId}/subscribed_apps with the temp token because a
+ * hand-provisioned test number never went through that flow
+ * (best-effort - a failure is reported, never fatal). To additionally
+ * pin this WABA's deliveries to Botara regardless of the app-level
+ * webhook config, see scripts/set-wa-test-callback-override.ts.
  *
  * Idempotent: re-running for the same workspace + phone_number_id rotates
  * the stored token under the existing vault ref instead of duplicating the
