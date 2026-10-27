@@ -7330,7 +7330,7 @@ function AuthPage({ onAuthenticated }: { onAuthenticated: () => void }) {
           <ThemeToggle />
         </div>
         <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm p-6">
-          <div className="text-2xl font-bold tracking-tight">Botara</div>
+          <img src="/logo-full.png" alt="Botara" className="h-28 w-28" />
           <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">
             {mode === "login" ? t("auth.loginSubtitle") : t("auth.registerSubtitle")}
           </div>
@@ -7577,7 +7577,7 @@ function InvitePage({ token }: { token: string }) {
           <ThemeToggle />
         </div>
         <div className="rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-sm p-6">
-          <div className="text-2xl font-bold tracking-tight">Botara</div>
+          <img src="/logo-full.png" alt="Botara" className="h-28 w-28" />
           <div className="text-sm text-slate-500 dark:text-slate-400 mt-1">{t("invite.title")}</div>
 
           {!preview && !previewError && (
@@ -7783,7 +7783,10 @@ function AuthedApp() {
       <Toasts />
       <aside className="w-60 shrink-0 bg-slate-900 text-slate-100 flex flex-col dark:border-r dark:border-slate-800">
         <div className="px-5 py-5 border-b border-slate-700">
-          <div className="text-xl font-bold tracking-tight">Botara</div>
+          <div className="flex items-center gap-2.5">
+            <img src="/logo-mark.png" alt="" className="h-[30px] w-[30px] shrink-0" />
+            <div className="text-xl font-bold tracking-tight">Botara</div>
+          </div>
           <div className="text-xs text-slate-400 mt-1">{t("app.tagline")}</div>
         </div>
         <nav className="flex-1 px-3 py-4 space-y-1">
