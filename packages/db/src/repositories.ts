@@ -322,6 +322,8 @@ export async function createMessage(
     mediaUrls?: string[];
     mediaKeys?: string[];
     externalId?: string;
+    /** Provider id of the message this one quotes (inbound context), when any. */
+    replyToExternalId?: string;
     status?: string;
     idempotencyKey?: string;
     /**
@@ -346,6 +348,7 @@ export async function createMessage(
       mediaUrls: input.mediaUrls ?? [],
       mediaKeys: input.mediaKeys ?? [],
       externalId: input.externalId,
+      replyToExternalId: input.replyToExternalId,
       status: input.status ?? "queued",
       idempotencyKey: input.idempotencyKey,
       ...(input.createdAt ? { createdAt: input.createdAt } : {}),

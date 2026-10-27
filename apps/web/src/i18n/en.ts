@@ -845,6 +845,7 @@ export const en = {
   "inbox.quoteActive": "Quoting a message",
   "inbox.quoteCancel": "Cancel quote",
   "inbox.quoteNoBody": "(attachment)",
+  "inbox.quotedEarlier": "Replying to an earlier message",
   "savedReplies.button": "Saved replies",
   "savedReplies.searchPlaceholder": "Search, or type /shortcut...",
   "savedReplies.new": "New saved reply",

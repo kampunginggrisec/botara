@@ -41,12 +41,10 @@ describe("drizzle migration journal", () => {
     }
   });
 
-  test("the newest migration (0018) creates webhook_receipts", () => {
+  test("the newest migration (0019) adds messages.reply_to_external_id", () => {
     const newest = sqlFiles[sqlFiles.length - 1]!;
-    expect(newest.startsWith("0018_")).toBe(true);
+    expect(newest.startsWith("0019_")).toBe(true);
     const sql = readFileSync(join(DRIZZLE_DIR, newest), "utf8");
-    expect(sql).toContain('CREATE TABLE "webhook_receipts"');
-    expect(sql).toContain('"payload_summary"');
-    expect(sql).toContain('"http_status"');
+    expect(sql).toContain('ALTER TABLE "messages" ADD COLUMN "reply_to_external_id" text');
   });
 });

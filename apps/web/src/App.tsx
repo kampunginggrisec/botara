@@ -246,6 +246,37 @@ function MessageStatusLine({ message }: { message: Message }) {
   );
 }
 
+/**
+ * Quoted-reply block (migration 0019): rendered at the top of a bubble
+ * whose message quotes an earlier one. The server resolves the quoted
+ * row within the same conversation when it can (quotedMessage) - the
+ * block then shows its body clamped to two lines, with the attachment
+ * placeholder standing in for a media-only original. When the
+ * reference cannot be resolved (the original predates Botara or was
+ * sent outside it), a slimmer generic block stands in, driven by
+ * replyToExternalId alone.
+ */
+function MessageQuoteBlock({ message }: { message: Message }) {
+  const { t } = useI18n();
+  const quoted = message.quotedMessage ?? null;
+  if (!quoted && !message.replyToExternalId) return null;
+  const tone = message.direction === "out"
+    ? "border-slate-400 bg-white/10 text-slate-300 dark:border-slate-500 dark:bg-black/10 dark:text-slate-500"
+    : "border-slate-400 bg-black/5 text-slate-500 dark:border-slate-500 dark:bg-white/10 dark:text-slate-400";
+  if (!quoted) {
+    return (
+      <div className={`mb-1.5 rounded border-l-2 px-2 py-1 text-xs italic ${tone}`}>
+        {t("inbox.quotedEarlier")}
+      </div>
+    );
+  }
+  return (
+    <div className={`mb-1.5 rounded border-l-2 px-2 py-1 text-xs ${tone}`}>
+      <span className="line-clamp-2">{quoted.body ?? t("inbox.quoteNoBody")}</span>
+    </div>
+  );
+}
+
 function MessageMediaList({ message }: { message: Message }) {
   const keys = message.mediaKeys ?? [];
   const urls = message.mediaUrls ?? [];
@@ -876,6 +907,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                       <div className={`rounded-lg px-3 py-2 text-sm ${m.direction === "out"
                         ? "bg-slate-900 text-white dark:bg-slate-100 dark:text-slate-900"
                         : "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-100"}`}>
+                        <MessageQuoteBlock message={m} />
                         <div>{m.body ?? <em>({m.type})</em>}</div>
                         <div className={`mt-1 flex items-center gap-1.5 text-[11px] ${m.direction === "out" ? "text-slate-300 dark:text-slate-500" : "text-slate-400"}`}>
                           {m.authorKind === "ai" && (

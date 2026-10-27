@@ -308,6 +308,25 @@ export interface Message {
    * sends, internal notes). The inbox uses it to decide what is quotable.
    */
   externalId?: string | null;
+  /**
+   * Quoted-reply reference (WhatsApp context.id): the provider id of
+   * the message THIS one quotes, when the channel reported one. Null
+   * when the message quotes nothing or the row predates the field.
+   */
+  replyToExternalId?: string | null;
+  /**
+   * Server-resolved preview of the quoted message, present only when
+   * the quoted row lives in the same conversation. Null when the
+   * reference cannot be resolved (the original predates Botara or was
+   * sent outside it) - the thread then falls back to a generic
+   * "earlier message" block driven by replyToExternalId alone.
+   */
+  quotedMessage?: {
+    externalId: string;
+    direction: "in" | "out";
+    /** Quoted body, server-truncated; null for media-only originals. */
+    body: string | null;
+  } | null;
   status: string;
   createdAt: string;
 }

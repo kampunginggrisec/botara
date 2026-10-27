@@ -435,6 +435,72 @@ describe("whatsapp webhook parsing", () => {
   });
 });
 
+describe("whatsapp quoted replies (context capture)", () => {
+  const wa = new WhatsAppAdapter({ credentials: creds, fetchFn: async () => new Response("{}") });
+
+  const payloadWith = (messages: Array<Record<string, unknown>>) => ({
+    object: "whatsapp_business_account",
+    entry: [{
+      id: "waba-1",
+      changes: [{
+        field: "messages",
+        value: {
+          messaging_product: "whatsapp",
+          metadata: { phone_number_id: "1234567890" },
+          messages,
+        },
+      }],
+    }],
+  });
+
+  test("a text message quoting another carries replyToExternalId from context.id", async () => {
+    const events = await wa.parseWebhook(payloadWith([{
+      from: "62812", id: "wamid.REPLY1", timestamp: "1760001000", type: "text",
+      text: { body: "Sama sami" },
+      context: { from: "1234567890", id: "wamid.ORIG1" },
+    }]));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "message.received", messageExternalId: "wamid.REPLY1",
+      text: "Sama sami", replyToExternalId: "wamid.ORIG1",
+    });
+  });
+
+  test("a media message quoting another carries replyToExternalId too", async () => {
+    const events = await wa.parseWebhook(payloadWith([{
+      from: "62812", id: "wamid.REPLY2", timestamp: "1760001001", type: "image",
+      image: { id: "media-q1", mime_type: "image/jpeg", caption: "ini buktinya" },
+      context: { from: "62812", id: "wamid.ORIG2" },
+    }]));
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "message.received", messageExternalId: "wamid.REPLY2",
+      replyToExternalId: "wamid.ORIG2",
+      media: { type: "image", id: "media-q1" },
+    });
+  });
+
+  test("a reaction target (reaction.message_id) is NOT a quote - even with a stray context", async () => {
+    const events = await wa.parseWebhook(payloadWith([{
+      from: "62812", id: "wamid.REACT1", timestamp: "1760001002", type: "reaction",
+      reaction: { message_id: "wamid.ORIG1", emoji: "👍" },
+      context: { from: "1234567890", id: "wamid.ORIG1" },
+    }]));
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("message.received");
+    expect(events[0]).not.toHaveProperty("replyToExternalId");
+  });
+
+  test("no context -> no replyToExternalId (shape unchanged)", async () => {
+    const events = await wa.parseWebhook(payloadWith([{
+      from: "62812", id: "wamid.PLAIN1", timestamp: "1760001003", type: "text",
+      text: { body: "pesan biasa" },
+    }]));
+    expect(events).toHaveLength(1);
+    expect(events[0]).not.toHaveProperty("replyToExternalId");
+  });
+});
+
 describe("whatsapp webhook security helpers", () => {
   test("signature verify accepts a valid HMAC and rejects tampering", () => {
     const raw = JSON.stringify({ entry: [] });

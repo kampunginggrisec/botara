@@ -843,6 +843,7 @@ export const id: Dictionary = {
   "inbox.quoteActive": "Mengutip pesan",
   "inbox.quoteCancel": "Batal mengutip",
   "inbox.quoteNoBody": "(lampiran)",
+  "inbox.quotedEarlier": "Membalas pesan sebelumnya",
   "savedReplies.button": "Balasan tersimpan",
   "savedReplies.searchPlaceholder": "Cari, atau ketik /shortcut...",
   "savedReplies.new": "Balasan tersimpan baru",

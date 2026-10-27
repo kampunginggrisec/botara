@@ -71,6 +71,32 @@ describe("api.getPipelineSummary envelope (#6 white-screen regression)", () => {
   });
 });
 
+describe("api.listMessages quoted-reply fields (migration 0019)", () => {
+  test("replyToExternalId + quotedMessage pass through the { messages } envelope intact", async () => {
+    // The exact wire shape of GET /conversations/:id/messages for a
+    // resolved quote and an unresolved one.
+    stubFetchJson({
+      messages: [{
+        id: "m1", direction: "in", type: "text", body: "Sama sami",
+        externalId: "wamid.REPLY", replyToExternalId: "wamid.ORIG",
+        quotedMessage: { externalId: "wamid.ORIG", direction: "out", body: "Siap. Terima kasih" },
+        status: "delivered", createdAt: "2026-10-27T00:00:00.000Z",
+      }, {
+        id: "m2", direction: "in", type: "text", body: "yang tadi mana?",
+        externalId: "wamid.REPLY2", replyToExternalId: "wamid.GONE", quotedMessage: null,
+        status: "delivered", createdAt: "2026-10-27T00:01:00.000Z",
+      }],
+    });
+    const data = await api.listMessages("conv-1");
+    expect(lastUrl.endsWith("/conversations/conv-1/messages")).toBe(true);
+    // What MessageQuoteBlock reads: a resolved preview vs a bare ref.
+    expect(data.messages[0]!.quotedMessage?.body).toBe("Siap. Terima kasih");
+    expect(data.messages[0]!.replyToExternalId).toBe("wamid.ORIG");
+    expect(data.messages[1]!.quotedMessage).toBeNull();
+    expect(data.messages[1]!.replyToExternalId).toBe("wamid.GONE");
+  });
+});
+
 describe("api.listContacts envelope (ContactsPage add-contact reload path)", () => {
   test("returns data.contacts from the { contacts } envelope", async () => {
     stubFetchJson({

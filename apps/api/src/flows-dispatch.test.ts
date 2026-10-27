@@ -917,3 +917,30 @@ describe("inbox message status advancement (package #8)", () => {
     expect(message.status).toBe("delivered");
   });
 });
+
+describe("quoted reply persistence (migration 0019)", () => {
+  test("a WhatsApp message.received stores its replyToExternalId on the row", async () => {
+    const { store, dispatcher } = setup();
+    await dispatcher.dispatch([{
+      type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.REPLY1",
+      text: "Sama sami", replyToExternalId: "wamid.ORIG1",
+      receivedAt: new Date().toISOString(),
+    }]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]).toMatchObject({
+      body: "Sama sami", externalId: "wamid.REPLY1", replyToExternalId: "wamid.ORIG1",
+    });
+  });
+
+  test("a message without a quote stores no reference", async () => {
+    const { store, dispatcher } = setup();
+    await dispatcher.dispatch([{
+      type: "message.received", channel: "whatsapp", accountExternalId: "10987",
+      contactExternalId: "62812", messageExternalId: "wamid.PLAIN1",
+      text: "halo", receivedAt: new Date().toISOString(),
+    }]);
+    expect(store.messages).toHaveLength(1);
+    expect(store.messages[0]!.replyToExternalId).toBeUndefined();
+  });
+});

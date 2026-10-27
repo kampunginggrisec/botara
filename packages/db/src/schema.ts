@@ -232,6 +232,15 @@ export const messages = pgTable("messages", {
   /** Storage object keys backing mediaUrls, kept for lifecycle management. */
   mediaKeys: jsonb("media_keys").notNull().default([]),
   externalId: varchar("external_id", { length: 200 }),
+  /**
+   * Quoted-reply reference: the provider id (e.g. wamid) of the message
+   * THIS row quotes, captured from the inbound payload's context field
+   * (WhatsApp). Null when the message quotes nothing. Resolution to the
+   * quoted row happens at read time within the same conversation - the
+   * original may predate Botara or have been sent outside it, in which
+   * case the reference simply never resolves.
+   */
+  replyToExternalId: text("reply_to_external_id"),
   status: varchar("status", { length: 40 }).notNull().default("queued"), // queued|sent|delivered|read|failed
   /** Idempotency key used on the provider send call; safe retries depend on it. */
   idempotencyKey: varchar("idempotency_key", { length: 256 }),

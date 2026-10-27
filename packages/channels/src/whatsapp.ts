@@ -778,8 +778,20 @@ export class WhatsAppAdapter implements ChannelAdapter {
                 sourceId: msg.referral.source_id !== undefined ? String(msg.referral.source_id) : undefined,
               }
             : undefined;
+          // Quoted reply: WhatsApp carries the quoted message's wamid in
+          // context.id on the replying message (any quotable type - text,
+          // media, location, contacts, interactive fall-through). A
+          // REACTION is not a quote: its target rides in
+          // reaction.message_id and never in context - the explicit type
+          // exclusion keeps that true even if Meta ever adds a context
+          // object to reaction payloads.
+          const replyToExternalId =
+            msg.type !== "reaction" && typeof msg.context?.id === "string" && msg.context.id !== ""
+              ? msg.context.id
+              : undefined;
+          const replyPart = replyToExternalId ? { replyToExternalId } : {};
           if (msg.type === "text") {
-            events.push({ type: "message.received", ...base, text: msg.text?.body, ...(referral ? { referral } : {}) });
+            events.push({ type: "message.received", ...base, text: msg.text?.body, ...replyPart, ...(referral ? { referral } : {}) });
           } else if (msg.type === "button" || msg.type === "interactive") {
             // Button taps are postbacks, not text messages (WA-1): a
             // template quick-reply tap arrives as type "button" carrying
@@ -807,7 +819,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
                 receivedAt: base.receivedAt,
               });
             } else {
-              events.push({ type: "message.received", ...base, ...(referral ? { referral } : {}) });
+              events.push({ type: "message.received", ...base, ...replyPart, ...(referral ? { referral } : {}) });
             }
           } else if (["image", "video", "document", "audio", "sticker"].includes(msg.type)) {
             const m = (msg[msg.type] ?? {}) as Record<string, any>;
@@ -818,9 +830,9 @@ export class WhatsAppAdapter implements ChannelAdapter {
               mimeType: m.mime_type,
               filename: m.filename,
             };
-            events.push({ type: "message.received", ...base, media, ...(m.caption ? { text: m.caption } : {}), ...(referral ? { referral } : {}) });
+            events.push({ type: "message.received", ...base, media, ...replyPart, ...(m.caption ? { text: m.caption } : {}), ...(referral ? { referral } : {}) });
           } else {
-            events.push({ type: "message.received", ...base, ...(referral ? { referral } : {}) });
+            events.push({ type: "message.received", ...base, ...replyPart, ...(referral ? { referral } : {}) });
           }
         }
 

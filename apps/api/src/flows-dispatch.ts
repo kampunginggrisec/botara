@@ -250,7 +250,7 @@ export interface DispatchStore {
    */
   setConversationExternalId?(conversationId: string, externalId: string): Promise<void>;
   findMessageByExternalId(conversationId: string, externalId: string): Promise<{ id: string } | null>;
-  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }): Promise<{ id: string }>;
+  createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; replyToExternalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }): Promise<{ id: string }>;
   touchConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
   /** Forward-only window anchor move, for backfilled inbound messages. */
   advanceConversationLastUserMessage(conversationId: string, at: Date): Promise<void>;
@@ -418,7 +418,7 @@ export class InMemoryDispatchStore implements DispatchStore {
   /** Collect-input waits in creation order (claim = oldest first). */
   readonly flowWaits: Array<ClaimedFlowWait & { conversationId: string }> = [];
   readonly conversations = new Map<string, { id: string; workspaceId: string; channelAccountId: string; contactId: string; externalId?: string | null; lastUserMessageAt?: string }>();
-  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; body?: string; direction: string; type: string; status?: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
+  readonly messages: Array<{ id?: string; conversationId: string; externalId?: string; replyToExternalId?: string; body?: string; direction: string; type: string; status?: string; createdAt?: string; mediaUrls?: string[]; mediaKeys?: string[] }> = [];
   readonly flows: Array<{ id: string; workspaceId: string; trigger: FlowTrigger }> = [];
   readonly growthLinks: DispatchGrowthLink[] = [];
   readonly conversions = new Map<string, number>();
@@ -480,7 +480,7 @@ export class InMemoryDispatchStore implements DispatchStore {
     return found ? { id: externalId } : null;
   }
 
-  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }) {
+  async createMessage(input: { conversationId: string; direction: "in" | "out"; type: string; body?: string; externalId?: string; replyToExternalId?: string; status: string; createdAt?: Date; mediaUrls?: string[]; mediaKeys?: string[] }) {
     const id = crypto.randomUUID();
     const { createdAt, ...rest } = input;
     this.messages.push({ id, ...rest, createdAt: (createdAt ?? new Date()).toISOString() });
@@ -860,6 +860,10 @@ export function createFlowDispatcher(deps: FlowDispatcherDeps): InboundFlowDispa
           type: event.media ? "media" : "text",
           body: event.text,
           externalId: event.messageExternalId,
+          // Quoted-reply reference (WhatsApp context.id), when the
+          // inbound payload carried one - the inbox resolves it against
+          // this conversation's rows at read time.
+          replyToExternalId: event.replyToExternalId,
           status: "delivered",
           mediaUrls,
           mediaKeys,

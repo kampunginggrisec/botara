@@ -181,7 +181,7 @@ export interface SyncedContact {
 
 /** Standardized inbound events every adapter must normalize webhooks into. */
 export type InboundEvent =
-  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral; conversationExternalId?: string }
+  | { type: "message.received"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; subject?: string; attachments?: MessageAttachment[]; recipients?: string[]; referral?: MessageReferral; conversationExternalId?: string; replyToExternalId?: string }
   | { type: "message.echo"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; text?: string; media?: MessageMedia; receivedAt: string; conversationExternalId?: string }
   | { type: "contacts.synced"; channel: ChannelKey; accountExternalId: string; contacts: SyncedContact[]; receivedAt: string }
   | { type: "message.history"; channel: ChannelKey; accountExternalId: string; contactExternalId: string; messageExternalId: string; direction: "in" | "out"; text?: string; media?: MessageMedia; receivedAt: string }

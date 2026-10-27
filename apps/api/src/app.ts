@@ -1046,6 +1046,18 @@ export function normalizeEmbeddedConfigId(
 // ------------------------------------------------------------------- types
 
 export type AppEnv = { Variables: { workspaceId?: string; auth?: AuthContext; requestId?: string; apiToken?: ApiTokenGrant } };
+
+/**
+ * Resolved preview of a quoted message (migration 0019): the quoted
+ * row's provider id, direction, and body (truncated; null for
+ * media-only originals). Attached to a serialized message only when
+ * the quoted row lives in the SAME conversation.
+ */
+export interface QuotedMessagePreview {
+  externalId: string;
+  direction: "in" | "out";
+  body: string | null;
+}
 type Ctx = Context<AppEnv>;
 
 
@@ -3266,6 +3278,37 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const members = await deps.authStore.listMembers(ws);
     return new Map(members.map((m) => [m.userId, { name: m.name, email: m.email }]));
   };
+  const QUOTED_PREVIEW_MAX = 120;
+
+  /**
+   * Batch-resolve quoted-message previews for a conversation's rows:
+   * one pass over the already-loaded rows keyed by provider id, so a
+   * list response costs no extra queries and never N+1s. A reference
+   * whose target is not among the rows (the original predates Botara,
+   * was sent outside it, or lives in another conversation) is absent
+   * from the map - the serializer then emits quotedMessage null while
+   * the raw replyToExternalId still travels.
+   */
+  const quotedPreviewsOf = (rows: MessageRow[]): Map<string, QuotedMessagePreview> => {
+    const byExternalId = new Map<string, MessageRow>();
+    for (const r of rows) if (r.externalId) byExternalId.set(r.externalId, r);
+    const previews = new Map<string, QuotedMessagePreview>();
+    for (const r of rows) {
+      const ref = r.replyToExternalId;
+      if (!ref || previews.has(ref)) continue;
+      const target = byExternalId.get(ref);
+      if (!target?.externalId) continue;
+      previews.set(ref, {
+        externalId: target.externalId,
+        direction: target.direction === "out" ? "out" : "in",
+        body: target.body != null && target.body.length > QUOTED_PREVIEW_MAX
+          ? target.body.slice(0, QUOTED_PREVIEW_MAX)
+          : target.body ?? null,
+      });
+    }
+    return previews;
+  };
+
   /**
    * Shared message serializer: ISO dates, an explicit `kind` (rows from
    * before migration 0008 read as "message"), and the author's display
@@ -3275,12 +3318,21 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   const serializeMessage = (
     m: MessageRow,
     memberById: Map<string, { name: string | null; email: string }>,
+    quotedPreviews?: Map<string, QuotedMessagePreview>,
   ) => ({
     ...m,
     kind: m.kind ?? "message",
     // Producer badge (package #7): rows written before migration 0013
     // read as "human" - none of them came from a badged AI path.
     authorKind: m.authorKind ?? "human",
+    // Quoted reply (migration 0019): the provider reference always
+    // travels (null when the message quotes nothing; rows from before
+    // the migration lack the field entirely) and the resolved preview
+    // rides along only when the quoted row is in this conversation.
+    replyToExternalId: m.replyToExternalId ?? null,
+    quotedMessage: m.replyToExternalId
+      ? quotedPreviews?.get(m.replyToExternalId) ?? null
+      : null,
     createdAt: iso(m.createdAt),
     author: m.authorUserId
       ? {
@@ -3333,8 +3385,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
     const rows = await listMessages(db, id);
     const memberById = await memberMapOf(ws);
+    const quotedPreviews = quotedPreviewsOf(rows);
     return c.json({
-      messages: rows.map((m) => serializeMessage(m, memberById)),
+      messages: rows.map((m) => serializeMessage(m, memberById, quotedPreviews)),
     });
   });
 
