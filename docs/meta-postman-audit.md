@@ -255,7 +255,7 @@ Catatan: `send()` sengaja melempar `NotImplementedError` karena Threads **tidak 
 | WA-4 template lifecycle | **Selesai** | **Pull**: `POST /templates/sync` + `apps/api/src/template-sync.ts` (WABA discovery → `GET /{waba}/message_templates`, paging berbatas 10 halaman → upsert mirror, kini termasuk `components` + `rejected_reason`). **Push**: `apps/api/src/template-write.ts` → `POST /templates/submit` (validator komponen: satu BODY, placeholder `{{n}}` berurutan, plafon tombol per tipe, header media wajib `example.header_handle`; status yang dicerminkan adalah jawaban Meta, bukan asumsi "approved") dan `DELETE /templates/{id}` (hapus di Meta dulu, baru baris lokal). **UI**: composer header/body/footer/tombol + status pill + alasan penolakan + tombol hapus di halaman Broadcast |
 | IG-1 welcome flows | **Selesai** | `InstagramAdapter.welcomeFlows` (list dengan paging berbatas, get, create, update, remove) + route `/channels/{id}/welcome-flows` (5 endpoint) + panel "Instagram automation" di halaman Channels. Body flow dikirim sebagai JSON **string** (bentuk yang disimpan Meta), dan baris yang body-nya rusak tetap terdaftar supaya bisa dihapus |
 | IG-2 IG messenger profile | **Selesai** | `InstagramAdapter.messengerProfile` (get/set/remove) dengan tag `platform: "instagram"` — tanpa tag itu penulisan bisa mendarat di profil Page yang tertaut. `MessengerAdapter` mendapat kapabilitas yang sama lewat `me/messenger_profile`, jadi setter `setGetStarted`/`setPersistentMenu` yang sebelumnya tak terpakai kini punya jalur baca/hapus. UI: menu persisten + ice breakers di panel yang sama |
-| M-1 sender actions | **Sebagian** | `markRead`/`typing` Messenger selesai (sender action). **Belum**: `message_attachments` (media masih wajib public URL) |
+| M-1 sender actions + attachment | **Selesai** | Sender action selesai di gelombang 2. **Attachment upload** selesai: `MessengerAdapter.uploadAttachment` / `InstagramAdapter.uploadAttachment` → `POST /{page-id}/message_attachments` (multipart `message` + `filedata`, `is_reusable: true`) → `send({ media: { id } })` memakai `payload.attachment_id`, jadi media **tidak lagi** wajib public URL. Ditutup dengan jalur kirim yang sebelumnya belum ada sama sekali: route `POST /conversations/{id}/attachments` (multipart `file` + `caption`), port `apps/api/src/outbound-media.ts` (validasi tipe/ukuran → simpan ke R2 → pilih jalur termurah per channel), dan tombol "Attach file" di composer inbox |
 | TH-1 carousel | **Selesai** | `publish()` dengan ≥2 media URL → container `is_carousel_item` per item (dipoll sampai FINISHED) → container `CAROUSEL` → `threads_publish`; menolak carousel-as-reply dengan pesan jelas |
 | P2-1 metrik insights | **Selesai** | `page_post_views` → `page_post_engagements` (`messenger.ts`), dengan komentar alasan |
 | P2-3 validasi parameter template | **Selesai** | `POST /broadcasts` menolak `templateParams` yang jumlahnya ≠ jumlah placeholder BODY (`templateBodyParamCount`, null = tidak diketahui → tidak dipaksa), plus gerbang "template harus approved" sebelum enqueue |
@@ -272,7 +272,7 @@ Catatan: `send()` sengaja melempar `NotImplementedError` karena Threads **tidak 
 | **WA-4** | Template tidak dikelola ke Meta | ✅ diperbaiki (sync + submit + delete + composer) |
 | **IG-1** | Welcome Message Flows API tidak ada | ✅ diperbaiki (5 endpoint + panel) |
 | **IG-2** | `messenger_profile` IG (persistent menu, ice breakers) tidak ada | ✅ diperbaiki (IG + Messenger) |
-| **M-1** | Sender actions ✅, attachment upload ❌ | ⚠️ sebagian |
+| **M-1** | Sender actions + attachment upload | ✅ diperbaiki (upload reusable + route lampiran + UI) |
 | **TH-1** | Carousel Threads tidak ada | ✅ diperbaiki |
 
 ### P2 — perlu verifikasi terhadap API live
@@ -280,7 +280,7 @@ Catatan: `send()` sengaja melempar `NotImplementedError` karena Threads **tidak 
 | ID | Temuan | Status |
 |---|---|---|
 | **P2-1** | `page_post_views` bukan metrik Page Insights → diganti `page_post_engagements` | ✅ diperbaiki (verifikasi live tetap disarankan) |
-| **P2-2** | `GET /{waba}/subscribed_apps` belum dipakai untuk health-check | ⬜ belum |
+| **P2-2** | `GET /{waba}/subscribed_apps` belum dipakai untuk health-check | ✅ diperbaiki (`GET /channels/{id}/health`) |
 | **P2-3** | Tidak ada validasi jumlah parameter template | ✅ diperbaiki (gate pra-kirim) |
 | **P2-4** | Bentuk auth `Bearer` vs `access_token` query | 📝 catatan saja |
 
@@ -340,6 +340,7 @@ Catatan: `send()` sengaja melempar `NotImplementedError` karena Threads **tidak 
 - **Gelombang 2 (2026-10-27):** reply/quote native (`context.message_id` / `reply_to.mid`), read receipt + typing indicator dengan kontrak adapter yang jujur (`markRead?`/`typing?`, `unsupported_channel` alih-alih pura-pura), Threads carousel dengan polling container per item, dan template sync yang memisahkan "apa yang diketik operator" dari "apa yang disetujui Meta".
 - **Gelombang 3 (2026-10-27):** template lifecycle dua arah — `POST /templates/submit` memvalidasi pohon komponen dengan aturan Meta **sebelum** memanggil Graph (jadi kesalahan struktural tidak menghabiskan satu putaran review), mencerminkan status balasan Meta apa adanya, dan `DELETE /templates/{id}` menghapus di Meta lebih dulu. Ditambah dua gerbang pra-kirim di `POST /broadcasts`: template wajib `approved`, dan jumlah `templateParams` wajib sama dengan jumlah placeholder BODY.
 - **Gelombang 4 (2026-10-27):** Instagram automation sebagai kapabilitas adapter (`welcomeFlows`, `messengerProfile`) alih-alih method longgar di antarmuka — kanal yang tidak punya permukaan itu menjawab `unsupported_channel`/400 dengan satu pemeriksaan. Validator memakai batas resmi Meta (nama flow 100, teks 640, quick reply 20 judul / 11 buah, menu 3 item / 30 karakter, ice breaker 4 / 80 karakter), dan resolver menegakkan batas workspace + keluarga kanal di satu tempat yang bisa diuji tanpa registry.
+- **Gelombang 5 (2026-10-27):** M-1 dan P2-2. Lampiran keluar akhirnya punya jalur: validasi → simpan → kirim, dengan Messenger/IG mengunggah bytes ke Meta (tidak perlu public URL) dan WhatsApp/Telegram memakai public URL. Health-check per akun menjawab pertanyaan yang tidak bisa dijawab dashboard mana pun sebelumnya — "apakah app kita masih berlangganan ke WABA ini?" — dengan jawaban tri-state supaya "tidak bisa dipastikan" tidak pernah tampil sebagai "tidak berlangganan".
 
 ---
 
@@ -347,7 +348,7 @@ Catatan: `send()` sengaja melempar `NotImplementedError` karena Threads **tidak 
 
 ```
 bun test packages apps
-1167 pass · 0 fail · 6106 expect() calls · 107 files (28.9s)
+1231 pass · 0 fail · 6305 expect() calls · 112 files (34.3s)
 ```
 
 Kondisi awal audit adalah `578 pass · 46 fail`: 2 file gagal me-resolve `@botara/flow-engine/graph` karena symlink workspace di `apps/web/node_modules/@botara/` tidak ada (bukan bug kode). Di mesin Windows ini `bun install` — termasuk `--force` — tidak membuat junction itu, jadi dibuat manual (`New-Item -ItemType Junction`); di CI Linux `bun install` sudah cukup. Setelah itu suite hijau dan tetap hijau sepanjang gelombang 2 dan 3.
@@ -362,13 +363,17 @@ Kondisi awal audit adalah `578 pass · 46 fail`: 2 file gagal me-resolve `@botar
 
 **Gelombang 3 sudah dikerjakan**: WA-4 ditutup end-to-end (sync + submit + delete + composer + gate "approved" + validasi jumlah parameter), P2-3 selesai.
 
-**Gelombang 4 sudah dikerjakan**: IG-1 dan IG-2 ditutup (welcome flows 5 endpoint + `messenger_profile` untuk IG dan Messenger, dengan panel di halaman Channels). M-1 tinggal attachment upload.
+**Gelombang 4 sudah dikerjakan**: IG-1 dan IG-2 ditutup (welcome flows 5 endpoint + `messenger_profile` untuk IG dan Messenger, dengan panel di halaman Channels).
 
-Sisa pekerjaan, berurutan:
+**Gelombang 5 sudah dikerjakan**: M-1 dan P2-2 ditutup.
 
-1. **M-1 lanjutan** — `POST /{page}/message_attachments` supaya media Messenger tidak wajib public URL.
-2. **P2-2** — health-check `GET /{waba}/subscribed_apps` per akun (mendeteksi langganan webhook yang hilang tanpa menunggu onboarding ulang).
-3. Sisanya (QR Meta, commerce settings, block users, business profile update, FB Reels, Threads repost/read-replies, IG Conversations API) masuk backlog P3 dan dikerjakan hanya bila ada permintaan nyata.
+1. **M-1 (attachment)** — `uploadAttachment` di adapter Messenger & Instagram (`POST /{page-id}/message_attachments`, multipart, `is_reusable: true`) dan `send({ media: { id } })` yang mengirim `payload.attachment_id`. Yang membuat ini berguna adalah jalur kirim yang sebelumnya tidak ada: `POST /conversations/{id}/attachments` + `apps/api/src/outbound-media.ts` + tombol "Attach file" di composer. Tiga keputusan yang perlu dicatat:
+   - **Urutan**: prasyarat (workspace, status akun, window, cap) → validasi tipe/ukuran → baris pesan `queued` → kirim → status. Lampiran yang ditolak tidak pernah meninggalkan objek di storage, dan kirim yang gagal tidak pernah meninggalkan baris `sent`.
+   - **Jalur per channel**: Messenger/IG selalu upload (itulah inti M-1: tanpa public URL). WhatsApp memakai public URL bila ada (satu panggilan, caption + filename ikut), jika tidak upload ke Meta dan kirim media id. Telegram hanya public URL dan hanya foto — `send()` belum punya cabang dokumen/audio, jadi tipe lain ditolak dengan alasannya, bukan dikirim sebagai teks.
+   - **Caption**: attachment Send API tidak punya field caption, jadi untuk Messenger/IG caption dikirim sebagai pesan teks **lebih dulu**, baru lampiran.
+2. **P2-2 (health-check)** — `GET /channels/{id}/health` + `apps/api/src/channel-health.ts`. `adapter.health()` selama ini tidak pernah dipanggil dan tidak pernah menyentuh jaringan; yang benar-benar mematikan akun WhatsApp adalah langganan `subscribed_apps` yang hilang (kirim tetap jalan, pesan masuk berhenti diam-diam). Karena itu jawabannya **tri-state**: `subscribed: true | false | null`, dan `null` (tidak ada `META_APP_ID`, tidak ada token, atau Graph gagal) **tidak boleh** dirender sebagai "tidak berlangganan" — alarm palsu pada akun sehat lebih buruk daripada "tidak bisa dipastikan". Route selalu 200: provider yang gagal adalah laporan (`ok: false` + alasan), bukan 5xx.
+
+Sisa pekerjaan: QR Meta, commerce settings, block users, business profile update, FB Reels, Threads repost/read-replies, IG Conversations API — semuanya backlog P3, dikerjakan hanya bila ada permintaan nyata.
 
 Catatan WA-4: template **tidak bisa** diedit di Meta — perubahan komponen berarti submit ulang (Meta mem-version-kan template) atau hapus lalu buat baru. Karena itu panel hanya menyediakan submit + hapus, bukan "edit": tombol edit yang hanya mengubah baris lokal akan berbohong tentang apa yang dipegang Meta.
 

@@ -120,7 +120,12 @@ export const CHANNEL_CAPABILITIES: Record<ChannelKey, CapabilitySet> = {
 /** Media attached to a message, normalized across providers. */
 export interface MessageMedia {
   type: "image" | "video" | "document" | "audio" | "sticker" | "photo" | "unknown";
-  /** Provider media id (e.g. WhatsApp media id, Telegram file_id). */
+  /**
+   * Provider media id: a WhatsApp media id, a Telegram file_id, or the
+   * REUSABLE attachment id returned by the Messenger/Instagram
+   * `message_attachments` upload (M-1). Id-based media needs no public
+   * URL - the provider already holds the bytes.
+   */
   id?: string;
   /**
    * Provider-hosted URL the bytes can be fetched from (Messenger /
@@ -366,7 +371,13 @@ export interface ChannelAdapter {
 
   /** Normalize a raw provider webhook payload into standardized events. */
   parseWebhook(payload: unknown): Promise<InboundEvent[]>;
-  health(): Promise<AdapterHealth>;
+  /**
+   * Readiness probe. Every real adapter already resolves the account's
+   * credential, so the account is part of the contract (P2-2): without it
+   * a per-account health report could only ever answer "no credential".
+   * Omitting it stays valid for channel-wide probes.
+   */
+  health(account?: ChannelAccountRef): Promise<AdapterHealth>;
 }
 
 /**

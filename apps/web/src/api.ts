@@ -554,8 +554,27 @@ export interface ChannelAccount {
   createdAt: string;
 }
 
-/** One provider-side welcome message flow (IG-1). */
-export interface WelcomeMessageFlow {
+/**
+ * Per-account health report (P2-2). `appSubscription` is WhatsApp-only and
+ * TRI-STATE: `subscribed: null` means "could not be determined" (no app id
+ * configured, no token, or Graph unreachable) and must never be rendered as
+ * "not subscribed".
+ */
+export interface ChannelHealthReport {
+  accountId: string;
+  channel: string;
+  ok: boolean;
+  detail: string;
+  checkedAt: string;
+  appSubscription?: {
+    wabaId: string | null;
+    subscribed: boolean | null;
+    appIds: string[];
+    detail?: string;
+  };
+}
+
+/** One provider-side welcome message flow (IG-1). */export interface WelcomeMessageFlow {
   id: string;
   name: string;
   /** Provider body: `[{ message: { text, quick_replies? } }]`. */
@@ -1073,6 +1092,22 @@ export const api = {
     });
   },
   /**
+   * Outbound attachment (M-1). Multipart upload: the API stores the bytes,
+   * then delivers them over the channel's cheapest path (Meta messaging
+   * uploads and sends a reusable attachment id - no public URL needed).
+   * `strategy` reports which path was used.
+   */
+  sendAttachment(
+    conversationId: string,
+    file: File,
+    caption?: string,
+  ): Promise<{ message: unknown; strategy: "provider_upload" | "public_url"; warnings?: string[] }> {
+    const form = new FormData();
+    form.append("file", file);
+    if (caption?.trim()) form.append("caption", caption.trim());
+    return request(`/conversations/${conversationId}/attachments`, { method: "POST", body: form });
+  },
+  /**
    * Presence: mark the thread read on the provider (WhatsApp blue ticks,
    * Messenger/Instagram seen). Best-effort - the API answers
    * `{ read: false, reason }` for channels without a read surface.
@@ -1355,6 +1390,14 @@ export const api = {
     purge = false,
   ): Promise<{ mode: "deleted" | "disconnected" | "purged" }> {
     return request(`/channels/accounts/${id}${purge ? "?purge=true" : ""}`, { method: "DELETE" });
+  },
+  /**
+   * Per-account health (P2-2). Always 200 - a failing provider is a
+   * report (`ok: false` + reason), never an error status, so the card can
+   * show exactly what is broken.
+   */
+  channelHealth(id: string): Promise<ChannelHealthReport> {
+    return request(`/channels/${id}/health`);
   },
   // ------------------------------------------------- email domains (F2)
   listEmailDomains(): Promise<{ domains: WorkspaceDomain[] }> {

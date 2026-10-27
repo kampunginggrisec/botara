@@ -1,5 +1,6 @@
 import { AppError, NotImplementedError } from "@botara/shared";
 import { mapGraphError, ProviderApiError, type GraphErrorBodyShape } from "./errors";
+import { metaAttachmentPayload, metaAttachmentType, uploadMetaAttachment } from "./meta-media";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
@@ -230,17 +231,31 @@ export class MessengerAdapter implements ChannelAdapter {
   async send(input: SendInput): Promise<SendResult> {
     if (input.rich) return this.sendRich(input, input.rich);
     let message: Record<string, unknown>;
-    if (input.media?.link) {
+    if (input.media && (input.media.id || input.media.link || input.media.url)) {
+      // A caption is not part of a Send API attachment: Meta renders
+      // media-only bubbles, so the caption goes out as its own text
+      // message FIRST (a failed text send aborts before the attachment
+      // leaves, which is the only ordering that cannot lose the words).
+      if (input.media.caption) {
+        await this.graph(input.account, "POST", "me/messages", {
+          recipient: { id: input.toExternalId },
+          messaging_type: "RESPONSE",
+          message: { text: input.media.caption },
+        });
+      }
       message = {
         attachment: {
-          type: input.media.type === "video" ? "file" : "image",
-          payload: { url: input.media.link, is_reusable: true },
+          type: metaAttachmentType(input.media.type),
+          payload: metaAttachmentPayload(input.media),
         },
       };
     } else if (input.text !== undefined) {
       message = { text: input.text };
     } else {
-      throw new AppError("VALIDATION", "messenger.send requires text or media with a public link");
+      throw new AppError(
+        "VALIDATION",
+        "messenger.send requires text, an uploaded attachment id, or media with a public link",
+      );
     }
     if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", "me/messages", {
@@ -253,6 +268,30 @@ export class MessengerAdapter implements ChannelAdapter {
       throw new ProviderApiError("Messenger send returned no message id", { provider: "messenger", retryable: false });
     }
     return { externalMessageId: messageId, status: "sent" };
+  }
+
+  /**
+   * Upload bytes once, get a REUSABLE attachment id (M-1).
+   *
+   * The id is what `send({ media: { id } })` takes, and it is the reason
+   * Messenger media no longer needs a publicly hosted URL: Meta holds the
+   * bytes. The endpoint owner is the Page itself.
+   */
+  async uploadAttachment(
+    account: ChannelAccountRef,
+    input: { data: Uint8Array; type?: "image" | "video" | "audio" | "file"; filename?: string; mimeType?: string },
+  ): Promise<{ attachmentId: string }> {
+    const attachmentId = await uploadMetaAttachment(this.fetchFn, {
+      endpointBase: `${this.baseUrl}/${this.apiVersion}`,
+      accessToken: await this.tokenFor(account),
+      ownerId: account.externalId,
+      provider: "messenger",
+      data: input.data,
+      type: input.type ?? "file",
+      ...(input.filename ? { filename: input.filename } : {}),
+      ...(input.mimeType ? { mimeType: input.mimeType } : {}),
+    });
+    return { attachmentId };
   }
 
   /** Map a rich button onto a Messenger template button. */

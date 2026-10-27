@@ -108,11 +108,28 @@ export async function connectTemplateGraph(
 
   if (options.knownWabaId) return { token, wabaId: options.knownWabaId, adapter };
 
-  // WABA discovery from the phone number id.
-  const numberUrl = new URL(`${base}/${version}/${account.externalId}`);
+  const wabaId = await resolveWabaIdForNumber(deps, { token, phoneNumberId: account.externalId });
+  return { token, wabaId, adapter };
+}
+
+/**
+ * Discover the WhatsApp Business Account that owns a phone number.
+ *
+ * Extracted from `connectTemplateGraph` so the health check (P2-2) can ask
+ * the same question with the same auth and the same error mapping - two
+ * copies of this lookup would eventually disagree about which number's
+ * WABA is being checked.
+ */
+export async function resolveWabaIdForNumber(
+  deps: Pick<TemplateGraphDeps, "fetchFn" | "graphVersion" | "baseUrl">,
+  input: { token: string; phoneNumberId: string },
+): Promise<string> {
+  const version = deps.graphVersion ?? "v26.0";
+  const base = (deps.baseUrl ?? "https://graph.facebook.com").replace(/\/$/, "");
+  const numberUrl = new URL(`${base}/${version}/${input.phoneNumberId}`);
   numberUrl.searchParams.set("fields", "whatsapp_business_account");
   const numberRes = await deps.fetchFn(numberUrl.toString(), {
-    headers: { Authorization: `Bearer ${token}` },
+    headers: { Authorization: `Bearer ${input.token}` },
   });
   const numberJson = (await numberRes.json().catch(() => ({}))) as {
     whatsapp_business_account?: { id?: string };
@@ -128,7 +145,7 @@ export async function connectTemplateGraph(
       { status: 502 },
     );
   }
-  return { token, wabaId, adapter };
+  return wabaId;
 }
 
 export async function syncWhatsAppTemplates(

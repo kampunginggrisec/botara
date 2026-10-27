@@ -54,6 +54,7 @@ import {
   type Database, type ScheduledPostTarget, type SequenceStep, type FlowRow,
   type GrowthLinkRow, type ConversationListItem, type EnvLike,
 } from "@botara/db";
+import { putObject } from "@botara/media";
 import { DbAdminStore, registerAdminRoutes, type AdminStore } from "./admin";
 import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
@@ -129,6 +130,16 @@ import {
   validateTemplateComponents,
   type SubmitTemplateResult as TemplateSubmitResult,
 } from "./template-write";
+import {
+  OUTBOUND_MEDIA_MAX_BYTES,
+  createOutboundMediaPort,
+  validateAttachment,
+  type OutboundMediaPort,
+} from "./outbound-media";
+import {
+  createChannelHealthPort,
+  type ChannelHealthPort,
+} from "./channel-health";
 
 /**
  * Botara API - Fase 3.
@@ -266,6 +277,24 @@ export interface ApiDeps {
    * which Graph host a channel uses.
    */
   channelAutomation: ChannelAutomationPort;
+  /**
+   * Outbound attachments (M-1): validate bytes, store them, and deliver
+   * over the cheapest provider path (upload for the Meta messaging
+   * channels, public URL where the provider fetches media itself).
+   */
+  outboundMedia: OutboundMediaPort;
+  /**
+   * Object write for outbound attachments (defaults to @botara/media
+   * putObject against process env). Injected so the route is testable
+   * without R2 - storage is best-effort, the send is not.
+   */
+  putOutboundObject?: (key: string, data: Uint8Array, contentType: string) => Promise<{ key: string; publicUrl?: string }>;
+  /**
+   * Per-account channel health (P2-2): adapter credential check plus the
+   * WhatsApp `subscribed_apps` verification that catches a silently
+   * unsubscribed app.
+   */
+  channelHealth: ChannelHealthPort;
   /** The configured AI provider, or null - routes answer 503, never fake. */
   getAiProvider: () => AIProvider | null;
   /** Fase 3: users, workspaces, memberships, audit (auth persistence). */
@@ -876,6 +905,28 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
         },
       };
     })(),
+    /**
+     * Outbound attachments (M-1). The adapter registry owns credentials
+     * and host selection; this layer only picks the delivery path. Media
+     * is stored by the ROUTE (it owns storage + the message row), so the
+     * port receives the public URL instead of writing objects itself.
+     */
+    outboundMedia: createOutboundMediaPort({
+      getAdapter,
+      maxBytes: OUTBOUND_MEDIA_MAX_BYTES,
+    }),
+    /**
+     * Channel health (P2-2). The app id is what makes the WhatsApp
+     * subscription answer actionable: without it the report can list the
+     * subscribed app ids but must not claim ours is missing.
+     */
+    channelHealth: createChannelHealthPort({
+      fetchFn: (url, init) => fetch(url, init as RequestInit),
+      graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+      appId: process.env.META_APP_ID ?? null,
+      resolveAccessToken: createCatalogTokenResolver(),
+      getAdapter,
+    }),
     getAiProvider: () => createAIProviderFromEnv(process.env),
     adminStore: new DbAdminStore(defaultGetDatabase),
     platformSettings: new PlatformSettingsService(
@@ -3218,6 +3269,58 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ message: serializeMessage(note, memberById) }, 201);
   });
 
+  /**
+   * The preconditions EVERY outbound send must pass, in one place so the
+   * text reply and the attachment route cannot drift apart:
+   *   - the conversation and its account belong to this workspace,
+   *   - the account is not soft-disconnected (it keeps history, it may not
+   *     send),
+   *   - the channel's messaging window allows this kind of send,
+   *   - the channel's consecutive-outbound cap is not exhausted.
+   * A caller that skips this helper would be able to send outside the
+   * window or past the cap, which is exactly why it lives here.
+   */
+  async function loadSendableConversation(input: {
+    db: Database;
+    workspaceId: string;
+    conversationId: string;
+    kind: "free_form" | "template";
+  }) {
+    const conversation = await getConversation(input.db, input.workspaceId, input.conversationId);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    const account = await getChannelAccount(input.db, input.workspaceId, conversation.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+
+    // A soft-disconnected account keeps its history but may not send:
+    // fail BEFORE any message row is persisted or the adapter is called.
+    if (account.status !== "connected") throw new ChannelAccountDisconnectedError(account.channel);
+
+    // Window enforcement (fail closed): free-form replies outside the
+    // window are rejected; template replies stay allowed. The window
+    // length is per-channel (Meta 24h, TikTok 48h - see @botara/shared).
+    const decision = evaluateReplyWindow({
+      channel: conversation.channel,
+      kind: input.kind,
+      lastUserMessageAt: conversation.lastUserMessageAt,
+      now: new Date(),
+    });
+    if (!decision.allowed) throw new MessagingWindowClosedError(conversation.channel);
+
+    // Consecutive-outbound cap (TikTok: max 10 business messages since
+    // the customer's last message). Counted from the persisted rows -
+    // the same counter the worker's send processor uses, so the rule
+    // cannot drift between the inbox and automation sends.
+    const caps = CHANNEL_CAPABILITIES[conversation.channel as ChannelKey];
+    if (caps?.maxConsecutiveOutbound) {
+      const rows = await listMessages(input.db, conversation.id);
+      const consecutive = countConsecutiveOutbound(rows);
+      if (consecutive >= caps.maxConsecutiveOutbound) {
+        throw new ConsecutiveSendCapError(conversation.channel, caps.maxConsecutiveOutbound, consecutive);
+      }
+    }
+    return { conversation, account, decision };
+  }
+
   const replyRoute = createRoute({
     method: "post", path: "/conversations/{id}/reply",
     request: {
@@ -3251,38 +3354,9 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const { id } = c.req.valid("param");
     const body = c.req.valid("json");
 
-    const conversation = await getConversation(db, ws, id);
-    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
-    const account = await getChannelAccount(db, ws, conversation.channelAccountId);
-    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
-
-    // A soft-disconnected account keeps its history but may not send:
-    // fail BEFORE any message row is persisted or the adapter is called.
-    if (account.status !== "connected") throw new ChannelAccountDisconnectedError(account.channel);
-
-    // Window enforcement (fail closed): free-form replies outside the
-    // window are rejected; template replies stay allowed. The window
-    // length is per-channel (Meta 24h, TikTok 48h - see @botara/shared).
-    const decision = evaluateReplyWindow({
-      channel: conversation.channel,
-      kind: body.kind,
-      lastUserMessageAt: conversation.lastUserMessageAt,
-      now: new Date(),
+    const { conversation, account, decision } = await loadSendableConversation({
+      db, workspaceId: ws, conversationId: id, kind: body.kind,
     });
-    if (!decision.allowed) throw new MessagingWindowClosedError(conversation.channel);
-
-    // Consecutive-outbound cap (TikTok: max 10 business messages since
-    // the customer's last message). Counted from the persisted rows -
-    // the same counter the worker's send processor uses, so the rule
-    // cannot drift between the inbox and automation sends.
-    const caps = CHANNEL_CAPABILITIES[conversation.channel as ChannelKey];
-    if (caps?.maxConsecutiveOutbound) {
-      const rows = await listMessages(db, conversation.id);
-      const consecutive = countConsecutiveOutbound(rows);
-      if (consecutive >= caps.maxConsecutiveOutbound) {
-        throw new ConsecutiveSendCapError(conversation.channel, caps.maxConsecutiveOutbound, consecutive);
-      }
-    }
 
     let templateInput: { name: string; language: string; latestCategory: string } | undefined;
     if (body.kind === "template") {
@@ -3430,6 +3504,145 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       await updateMessageStatus(db, message.id, "failed").catch(() => undefined);
       if (err instanceof AppError) throw err;
       throw new AppError("PROVIDER_ERROR", `Provider send failed: ${err instanceof Error ? err.message : String(err)}`, { status: 502 });
+    }
+  });
+
+  /**
+   * Outbound attachment (M-1).
+   *
+   * Multipart: `file` (required) + `caption` (optional). The bytes are
+   * stored in Botara's own storage so the thread can render the bubble,
+   * then delivered over the cheapest provider path - see
+   * `outbound-media.ts` for why the Meta messaging channels upload and
+   * WhatsApp/Telegram use a public URL.
+   *
+   * Deliberately NOT behind `guardMutator`: that guard excludes the
+   * `agent` role, which is the role that answers customers (the reply
+   * route makes the same choice).
+   *
+   * Ordering matters and is enforced here:
+   *   1. preconditions (workspace, connected, window, cap),
+   *   2. validation of type/size BEFORE anything is stored or uploaded,
+   *   3. the message row (status "queued"),
+   *   4. the send, then the status update.
+   * A rejected attachment therefore never leaves bytes in storage and a
+   * failed send never leaves a "sent" row.
+   */
+  app.post("/conversations/:id/attachments", async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const id = c.req.param("id");
+
+    const form = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>;
+    const file = form.file;
+    if (!(file instanceof File)) {
+      throw new AppError("VALIDATION", "Multipart form field 'file' is required.", { status: 400 });
+    }
+
+    const { conversation, account } = await loadSendableConversation({
+      db, workspaceId: ws, conversationId: id, kind: "free_form",
+    });
+
+    const validated = validateAttachment({
+      channel: conversation.channel,
+      // An empty type means the browser did not recognize the file; the
+      // honest read is "not sendable", not "assume octet-stream".
+      mimeType: file.type || "application/octet-stream",
+      size: file.size,
+      filename: sanitizeUploadFilename(file.name || "attachment"),
+    });
+    const rawCaption = typeof form.caption === "string" ? form.caption.trim() : "";
+    // WhatsApp's caption ceiling is 1024 characters; the other channels
+    // are looser, so this is the one limit that is safe everywhere.
+    if (rawCaption.length > 1024) {
+      throw new AppError(
+        "VALIDATION",
+        `The caption is ${rawCaption.length} characters; the limit is 1024.`,
+        { status: 400 },
+      );
+    }
+    const caption = rawCaption || undefined;
+    const bytes = new Uint8Array(await file.arrayBuffer());
+
+    // Storage is best-effort, exactly like the inbound pipeline: without
+    // R2 the channels that upload still deliver, the thread just has no
+    // durable copy to render.
+    const putObjectFn = deps.putOutboundObject
+      ?? ((key: string, data: Uint8Array, contentType: string) => putObject(key, data, contentType));
+    let stored: { key: string; publicUrl?: string } | null = null;
+    try {
+      stored = await putObjectFn(
+        `workspaces/${ws}/outbound/${crypto.randomUUID()}/${validated.filename}`,
+        bytes,
+        validated.mimeType,
+      );
+    } catch {
+      stored = null;
+    }
+
+    const idempotencyKey = `attachment:${id}:${crypto.randomUUID()}`;
+    const message = await createMessage(db, {
+      conversationId: id,
+      direction: "out",
+      type: validated.type,
+      // The thread shows the caption when there is one and the filename
+      // otherwise - a media row is never blank in the inbox.
+      body: caption ?? validated.filename,
+      mediaUrls: stored?.publicUrl ? [stored.publicUrl] : [],
+      mediaKeys: stored ? [stored.key] : [],
+      status: "queued",
+      idempotencyKey,
+    });
+
+    try {
+      const result = await deps.outboundMedia.send({
+        workspaceId: ws,
+        channel: conversation.channel,
+        account: {
+          id: account.id,
+          externalId: account.externalId,
+          tokenVaultRef: account.tokenVaultRef ?? undefined,
+        },
+        toExternalId: conversation.contactExternalId,
+        data: bytes,
+        mimeType: validated.mimeType,
+        filename: validated.filename,
+        ...(caption ? { caption } : {}),
+        ...(stored?.publicUrl ? { publicUrl: stored.publicUrl } : {}),
+        idempotencyKey,
+      });
+      await updateMessageStatus(db, message.id, "sent", result.externalMessageId);
+      // Same AI-takeover rule as a text reply: a human attaching a file
+      // takes the wheel, so automatic AI sends pause on this thread.
+      if (!conversation.aiPausedAt) {
+        await setConversationAiPaused(db, ws, id, true).catch(() => undefined);
+        await deps.realtimePublisher
+          .publishInboxUpdate({ workspaceId: ws, conversationId: id })
+          .catch(() => undefined);
+      }
+      await deps.realtimePublisher.publishInboxMessage({
+        workspaceId: ws, conversationId: id, direction: "out", messageId: message.id,
+      }).catch(() => undefined);
+      return c.json({
+        message: {
+          ...message,
+          status: "sent",
+          externalId: result.externalMessageId,
+          createdAt: iso(message.createdAt),
+        },
+        // Which provider path delivered the bytes - "provider_upload" means
+        // no public URL was needed (the M-1 path).
+        strategy: result.strategy,
+        ...(result.warnings ? { warnings: result.warnings } : {}),
+      }, 201);
+    } catch (err) {
+      await updateMessageStatus(db, message.id, "failed").catch(() => undefined);
+      if (err instanceof AppError) throw err;
+      throw new AppError(
+        "PROVIDER_ERROR",
+        `Attachment send failed: ${err instanceof Error ? err.message : String(err)}`,
+        { status: 502 },
+      );
     }
   });
 
@@ -5450,6 +5663,44 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         "Cache-Control": "private, max-age=3600",
       },
     });
+  });
+
+  /**
+   * Per-account channel health (P2-2).
+   *
+   * Answers two questions an operator cannot otherwise ask: is the
+   * credential still usable, and (WhatsApp) is our app still subscribed to
+   * the WABA? An unsubscribed app keeps sending happily while inbound
+   * messages silently stop - the exact shape of the 2026-10-27 incident.
+   *
+   * Never throws for a provider failure: an unreachable Graph API is an
+   * unhealthy REPORT (`ok: false` with the reason), not a 5xx, because the
+   * dashboard must be able to show the failure it was asked about.
+   */
+  const channelHealthRoute = createRoute({
+    method: "get", path: "/channels/{id}/health",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Channel account health report" } },
+  });
+  app.openapi(channelHealthRoute, async (c) => {
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const account = await getChannelAccount(db, ws, id);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+    // Nullable columns become ABSENT fields: the adapter contract reads
+    // "no authMode" as the documented default, while null would read as an
+    // unknown mode.
+    const report = await deps.channelHealth.check({
+      channel: account.channel,
+      account: {
+        id: account.id,
+        externalId: account.externalId,
+        ...(account.authMode ? { authMode: account.authMode } : {}),
+        ...(account.tokenVaultRef ? { tokenVaultRef: account.tokenVaultRef } : {}),
+      },
+    });
+    return c.json(report);
   });
 
   // ------------------------------------------------- Meta catalog sync

@@ -441,3 +441,68 @@ describe("instagram messaging profile (IG-2)", () => {
     expect(decodeURIComponent(calls[0]!.url)).toContain('fields=["persistent_menu"]');
   });
 });
+
+describe("instagram media: reusable attachment upload (M-1)", () => {
+  test("instagram-login uploads on the versionless IG host", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { attachment_id: "ig-att-1" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    const res = await ig.uploadAttachment(IG_ACCOUNT, {
+      data: new Uint8Array([9]), type: "image", filename: "p.png", mimeType: "image/png",
+    });
+    expect(res.attachmentId).toBe("ig-att-1");
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/message_attachments");
+    expect((calls[0]!.init!.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+  });
+
+  test("facebook-login uploads on graph.facebook.com with the pinned version", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { attachment_id: "ig-att-2" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.uploadAttachment(FB_ACCOUNT, { data: new Uint8Array([9]), type: "video" });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/ig-user-2/message_attachments");
+  });
+
+  test("send with an attachment id carries attachment_id and no url", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.ig" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.send({
+      account: IG_ACCOUNT, toExternalId: "u1", idempotencyKey: "k",
+      media: { type: "image", id: "ig-att-1" },
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({
+      attachment: { type: "image", payload: { attachment_id: "ig-att-1" } },
+    });
+  });
+
+  test("a document maps to Meta's file attachment type", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.doc" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.send({
+      account: IG_ACCOUNT, toExternalId: "u1", idempotencyKey: "k",
+      media: { type: "document", id: "ig-att-3" },
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).message.attachment.type).toBe("file");
+  });
+
+  test("a caption goes out as a text message before the attachment", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { message_id: "mid.text" } },
+      { body: { message_id: "mid.media" } },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    const res = await ig.send({
+      account: IG_ACCOUNT, toExternalId: "u1", idempotencyKey: "k",
+      media: { type: "image", id: "ig-att-1", caption: "Halo kak" },
+    });
+    expect(res.externalMessageId).toBe("mid.media");
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({ text: "Halo kak" });
+  });
+
+  test("media without an id or url is a typed validation error", async () => {
+    const { fetchFn } = mockFetch([]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await expect(ig.send({
+      account: IG_ACCOUNT, toExternalId: "u1", idempotencyKey: "k",
+      media: { type: "image" },
+    })).rejects.toMatchObject({ code: "VALIDATION" });
+  });
+});

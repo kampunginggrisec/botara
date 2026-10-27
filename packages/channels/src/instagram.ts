@@ -1,5 +1,6 @@
 import { AppError, NotImplementedError } from "@botara/shared";
 import { mapGraphError, ProviderApiError, type GraphErrorBodyShape } from "./errors";
+import { metaAttachmentPayload, metaAttachmentType, uploadMetaAttachment } from "./meta-media";
 import { evaluateLongLivedRefresh } from "./token-lifecycle";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
@@ -324,12 +325,28 @@ export class InstagramAdapter implements ChannelAdapter {
     if (input.rich) return this.sendRich(input, input.rich);
     const igUserId = input.account.externalId;
     let message: Record<string, unknown>;
-    if (input.media?.link) {
-      message = { attachment: { type: input.media.type === "video" ? "file" : "image", payload: { url: input.media.link } } };
+    if (input.media && (input.media.id || input.media.link || input.media.url)) {
+      // Same rule as Messenger: an IG attachment has no caption field, so
+      // a caption is a separate text message sent first.
+      if (input.media.caption) {
+        await this.graph(input.account, "POST", `${igUserId}/messages`, {
+          recipient: { id: input.toExternalId },
+          message: { text: input.media.caption },
+        });
+      }
+      message = {
+        attachment: {
+          type: metaAttachmentType(input.media.type),
+          payload: metaAttachmentPayload(input.media),
+        },
+      };
     } else if (input.text !== undefined) {
       message = { text: input.text };
     } else {
-      throw new AppError("VALIDATION", "instagram.send requires text or media with a public link");
+      throw new AppError(
+        "VALIDATION",
+        "instagram.send requires text, an uploaded attachment id, or media with a public link",
+      );
     }
     if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", `${igUserId}/messages`, {
@@ -341,6 +358,28 @@ export class InstagramAdapter implements ChannelAdapter {
       throw new ProviderApiError("Instagram send returned no message id", { provider: "instagram", retryable: false });
     }
     return { externalMessageId: messageId, status: "sent" };
+  }
+
+  /**
+   * Upload bytes once, get a REUSABLE attachment id (M-1 parity with
+   * Messenger). The endpoint owner is the IG user, and the host follows
+   * the account's auth mode - the same `baseFor` every other call uses.
+   */
+  async uploadAttachment(
+    account: ChannelAccountRef,
+    input: { data: Uint8Array; type?: "image" | "video" | "audio" | "file"; filename?: string; mimeType?: string },
+  ): Promise<{ attachmentId: string }> {
+    const attachmentId = await uploadMetaAttachment(this.fetchFn, {
+      endpointBase: this.baseFor(account),
+      accessToken: await this.tokenFor(account),
+      ownerId: account.externalId,
+      provider: "instagram",
+      data: input.data,
+      type: input.type ?? "file",
+      ...(input.filename ? { filename: input.filename } : {}),
+      ...(input.mimeType ? { mimeType: input.mimeType } : {}),
+    });
+    return { attachmentId };
   }
 
   /**

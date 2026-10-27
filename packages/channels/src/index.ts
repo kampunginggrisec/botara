@@ -48,6 +48,10 @@ export {
   type MessengerAdapterOptions, type MessengerPageSummary,
 } from "./messenger";
 export {
+  metaAttachmentType, metaAttachmentPayload, uploadMetaAttachment,
+  type MetaAttachmentType, type MetaAttachmentUploadInput, type OutboundMedia,
+} from "./meta-media";
+export {
   ThreadsAdapter, threadsRefreshDecision, buildThreadsAuthorizeUrl, THREADS_OAUTH_SCOPES,
   type ThreadsAdapterOptions,
 } from "./threads";

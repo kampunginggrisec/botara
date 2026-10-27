@@ -7,7 +7,7 @@ import {
   type WebhookDeliveryInfo, type WebhookEndpointInfo,
   type BroadcastRecipientCounts, type BroadcastSummary,
   type CatalogProduct, type CatalogSummary,
-  type ChannelAccount, type ConnectionInfo, type Contact,
+  type ChannelAccount, type ChannelHealthReport, type ConnectionInfo, type Contact,
   type ContactImportResult, type Conversation, type Deal, type Flow, type GrowthLink, type InvitePreview, type KbDocument,
   type Member, type Message, type Pipeline, type PipelineSummary, type PublicConfig,
   type RichBlock, type ScheduledPost, type SegmentInfo,
@@ -291,6 +291,10 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const [error, setError] = useState<string | null>(null);
   const [windowClosed, setWindowClosed] = useState(false);
   const [sending, setSending] = useState(false);
+  // Outbound attachment (M-1): one file per send, the composer text
+  // becomes the caption.
+  const attachFileRef = useRef<HTMLInputElement | null>(null);
+  const [attachBusy, setAttachBusy] = useState(false);
   // Assignment: workspace members for the filter + header select, and
   // the list filter itself ("" = all, "me", "unassigned", or a user id).
   const [members, setMembers] = useState<Member[]>([]);
@@ -614,6 +618,35 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
       }
     } finally {
       setSending(false);
+    }
+  };
+
+  /**
+   * Outbound attachment (M-1). The composer's current text rides along as
+   * the caption, then the thread refetches so the bubble appears in place.
+   * A closed messaging window is surfaced the same way a text reply does.
+   */
+  const sendAttachment = async (file: File) => {
+    if (!selected) return;
+    setAttachBusy(true);
+    try {
+      const caption = replyText.trim();
+      const res = await api.sendAttachment(selected.id, file, caption || undefined);
+      if (res.warnings && res.warnings.length > 0) {
+        setRichWarning(t("inbox.richDegraded", { warnings: res.warnings.join(", ") }));
+      }
+      setReplyText("");
+      setWindowClosed(false);
+      await openConversation(selected);
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "MESSAGING_WINDOW_CLOSED") {
+        setWindowClosed(true);
+      } else {
+        setError(errText(err, t("inbox.attachFailed")));
+      }
+    } finally {
+      setAttachBusy(false);
+      if (attachFileRef.current) attachFileRef.current.value = "";
     }
   };
 
@@ -973,6 +1006,26 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                   </button>
                   <VariablePicker target={() => replyTextareaRef.current} />
                   <SavedRepliesPicker target={() => replyTextareaRef.current} />
+                  {/* Outbound attachment (M-1): one file, current text = caption. */}
+                  <button
+                    type="button"
+                    onClick={() => attachFileRef.current?.click()}
+                    disabled={attachBusy || sending}
+                    title={t("inbox.attachHint")}
+                    className="rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+                  >
+                    {attachBusy ? t("inbox.attaching") : t("inbox.attach")}
+                  </button>
+                  <input
+                    ref={attachFileRef}
+                    type="file"
+                    className="hidden"
+                    accept="image/*,video/*,audio/*,application/pdf,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.txt,.csv,.zip"
+                    onChange={(e) => {
+                      const picked = e.target.files?.[0];
+                      if (picked) void sendAttachment(picked);
+                    }}
+                  />
                 </div>
                 )}
                 {composerMode === "reply" && (
@@ -4243,8 +4296,88 @@ function CatalogSyncSection({ accountId }: { accountId: string }) {
   );
 }
 
-const CHANNEL_META: Record<string, { label: string; glyph: string; accent: string }> = {
-  whatsapp: { label: "WhatsApp", glyph: "W", accent: "bg-emerald-500" },
+/**
+ * Per-account health (P2-2). The credential check plus, on WhatsApp, the
+ * `subscribed_apps` verification that catches the silent killer: sends
+ * keep working while inbound messages stop arriving because the app is no
+ * longer subscribed to the WABA.
+ *
+ * `subscribed: null` is rendered as "unknown", never as "not subscribed" -
+ * a false alarm on a healthy account is worse than an honest "cannot tell".
+ */
+function ChannelHealthSection({ accountId }: { accountId: string }) {
+  const { t } = useI18n();
+  const [report, setReport] = useState<ChannelHealthReport | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [errorText, setErrorText] = useState<string | null>(null);
+
+  const runCheck = async () => {
+    setChecking(true);
+    setErrorText(null);
+    try {
+      setReport(await api.channelHealth(accountId));
+    } catch (err) {
+      setErrorText(errText(err, t("channels.health.failed")));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const sub = report?.appSubscription;
+  const subState = sub
+    ? sub.subscribed === true
+      ? t("channels.health.subscribed")
+      : sub.subscribed === false
+        ? t("channels.health.notSubscribed")
+        : t("channels.health.subscriptionUnknown")
+    : null;
+
+  return (
+    <div className="mt-3 border-t border-slate-100 pt-3 dark:border-slate-800">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="text-xs font-medium text-slate-600 dark:text-slate-300">{t("channels.health.title")}</span>
+        {report && (
+          <span
+            className={`rounded-full px-2 py-0.5 text-[11px] font-medium ${
+              report.ok
+                ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300"
+                : "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-300"
+            }`}
+          >
+            {report.ok ? t("channels.health.ok") : t("channels.health.broken")}
+          </span>
+        )}
+        <button
+          onClick={() => void runCheck()}
+          disabled={checking}
+          className="ml-auto rounded-md border border-slate-300 px-2.5 py-1 text-xs text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+        >
+          {checking ? t("channels.health.checking") : t("channels.health.check")}
+        </button>
+      </div>
+      {report && (
+        <div className="mt-2 space-y-1 text-xs text-slate-500 dark:text-slate-400">
+          <p>{report.detail}</p>
+          {sub && (
+            <p>
+              {t("channels.health.subscriptionLine", {
+                state: subState ?? "",
+                waba: sub.wabaId ?? "—",
+              })}
+              {sub.detail ? ` · ${sub.detail}` : ""}
+            </p>
+          )}
+          <p className="text-slate-400 dark:text-slate-500">
+            {t("channels.health.checkedAt", { date: new Date(report.checkedAt).toLocaleString() })}
+          </p>
+        </div>
+      )}
+      {errorText && <p className="mt-2 text-xs text-red-600 dark:text-red-400">{errorText}</p>}
+    </div>
+  );
+}
+
+const CHANNEL_META: Record<string, { label: string; glyph: string; accent: string }> = {  whatsapp: { label: "WhatsApp", glyph: "W", accent: "bg-emerald-500" },
   telegram: { label: "Telegram", glyph: "T", accent: "bg-sky-500" },
   instagram: { label: "Instagram", glyph: "I", accent: "bg-rose-500" },
   threads: { label: "Threads", glyph: "@", accent: "bg-slate-900 dark:bg-slate-600" },
@@ -4755,6 +4888,8 @@ function ChannelsPage() {
                   </div>
                 )}
                 {a.channel === "whatsapp" && <CatalogSyncSection accountId={a.id} />}
+                {/* P2-2: on-demand health check (credential + WABA subscription). */}
+                {a.status === "connected" && <ChannelHealthSection accountId={a.id} />}
                 {a.status === "disconnected" && a.purgeAt && (
                   <p className="mt-2 text-xs text-slate-400 dark:text-slate-500">
                     {t("channels.autoPurgeNote", { date: new Date(a.purgeAt).toLocaleDateString() })}

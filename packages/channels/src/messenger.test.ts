@@ -242,3 +242,72 @@ describe("messenger messaging profile (IG-2 parity)", () => {
     expect(decodeURIComponent(calls[1]!.url)).toContain('fields=["ice_breakers"]');
   });
 });
+
+describe("messenger media: reusable attachment upload (M-1)", () => {
+  test("uploads bytes as multipart and returns the reusable attachment id", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { attachment_id: "att-42" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    const res = await msgr.uploadAttachment(PAGE, {
+      data: new Uint8Array([1, 2, 3]), type: "image", filename: "photo.png", mimeType: "image/png",
+    });
+    expect(res.attachmentId).toBe("att-42");
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/page-1/message_attachments");
+    expect(calls[0]!.init!.method).toBe("POST");
+    // Multipart: the runtime must set the boundary, so no manual content-type.
+    expect((calls[0]!.init!.headers as Record<string, string>)["Content-Type"]).toBeUndefined();
+    const body = calls[0]!.init!.body as FormData;
+    expect(JSON.parse(String(body.get("message")))).toEqual({
+      attachment: { type: "image", payload: { is_reusable: true } },
+    });
+    expect(body.get("filedata")).toBeInstanceOf(Blob);
+  });
+
+  test("an upload without an id is a typed provider error", async () => {
+    const { fetchFn } = mockFetch([{ body: {} }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await expect(msgr.uploadAttachment(PAGE, { data: new Uint8Array([1]) }))
+      .rejects.toMatchObject({ code: "PROVIDER_ERROR" });
+  });
+
+  test("send with an attachment id needs no public URL", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.9" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    const res = await msgr.send({
+      account: PAGE, toExternalId: "psid-1", idempotencyKey: "k",
+      media: { type: "image", id: "att-42" },
+    });
+    expect(res.externalMessageId).toBe("mid.9");
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({
+      attachment: { type: "image", payload: { attachment_id: "att-42" } },
+    });
+  });
+
+  test("a caption is sent as its own text message first, then the attachment", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { message_id: "mid.text" } },
+      { body: { message_id: "mid.media" } },
+    ]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    const res = await msgr.send({
+      account: PAGE, toExternalId: "psid-1", idempotencyKey: "k",
+      media: { type: "image", id: "att-42", caption: "Struk ya kak" },
+    });
+    expect(res.externalMessageId).toBe("mid.media");
+    expect(calls).toHaveLength(2);
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({ text: "Struk ya kak" });
+    expect(JSON.parse(calls[1]!.init!.body as string).message.attachment.payload)
+      .toEqual({ attachment_id: "att-42" });
+  });
+
+  test("a public URL still works (payload.url, is_reusable)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.url" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.send({
+      account: PAGE, toExternalId: "psid-1", idempotencyKey: "k",
+      media: { type: "video", link: "https://cdn.test/v.mp4" },
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({
+      attachment: { type: "video", payload: { url: "https://cdn.test/v.mp4", is_reusable: true } },
+    });
+  });
+});

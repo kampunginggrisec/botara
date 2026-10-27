@@ -56,6 +56,22 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
         async remove() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
       },
     },
+    outboundMedia: {
+      async send() {
+        throw new AppError("CONFIGURATION", "outbound media not configured (test).", { status: 503 });
+      },
+    },
+    channelHealth: {
+      async check(input) {
+        return {
+          accountId: input.account.id,
+          channel: input.channel,
+          ok: false,
+          detail: "channel health not configured (test).",
+          checkedAt: new Date().toISOString(),
+        };
+      },
+    },
     getAiProvider: () => null,
     authStore: new InMemoryAuthStore(),
     emailInboundEnqueuer: { async enqueueEmailInbound() {} },

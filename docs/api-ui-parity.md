@@ -31,9 +31,9 @@ classification entry goes stale (route deleted, or a UI caller appeared).
    its classification entry (the guard's stale-entry checks fail until
    you do).
 
-## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27, #10 rows added 2026-10-27; WA-2/WA-3 presence rows added 2026-10-27; WA-4 template write rows added 2026-10-27; IG-1/IG-2 automation rows added 2026-10-27)
+## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27, #10 rows added 2026-10-27; WA-2/WA-3 presence rows added 2026-10-27; WA-4 template write rows added 2026-10-27; IG-1/IG-2 automation rows added 2026-10-27; M-1 attachment + P2-2 health rows added 2026-10-27)
 
-214 routes: 186 UI · 18 WEBHOOK · 10 API-ONLY.
+216 routes: 188 UI · 18 WEBHOOK · 10 API-ONLY.
 
 (The counts are `app.routes` de-duplicated at method+path granularity, minus the
 18+10 classified rows. The previous header read "150 routes: 122 UI" — that
@@ -92,6 +92,7 @@ number, is what enforces coverage.)
 | GET /conversations | UI | Inbox list |
 | GET /conversations/{}/messages | UI | Inbox thread |
 | POST /conversations/{}/reply | UI | Inbox composer; `replyToMessageId` quotes a message of the same thread (WA-2 — WhatsApp `context.message_id`, Messenger/IG `reply_to`) |
+| POST /conversations/{}/attachments | UI | Inbox composer "Attach file" (M-1) — multipart `file` + `caption`; the API stores the bytes, then delivers via the channel's cheapest path (`strategy: provider_upload` = Messenger/IG `message_attachments`, no public URL needed; `public_url` = WhatsApp/Telegram). Same preconditions as a text reply (connected, window, consecutive cap) |
 | POST /conversations/{}/read | UI | Inbox: opening a thread marks it read on the provider (WA-3 — WhatsApp `PUT /messages` blue ticks, Messenger/IG `mark_seen`). Best-effort: `{read:false,reason}` for channels without a read surface |
 | POST /conversations/{}/typing | UI | Inbox composer: throttled typing indicator while the agent types (WA-3 — WhatsApp `typing_indicator`, Messenger/IG `typing_on`/`typing_off`) |
 | PATCH /conversations/{}/assign | UI | Inbox header assignee select |
@@ -125,6 +126,7 @@ same contact the Contacts page edits.
 | GET /channels/accounts | UI | Channels cards; Publish/Broadcast account pickers |
 | DELETE /channels/accounts/{} | UI | Channels card Disconnect / Delete permanently. Without data references the account is hard-deleted; with history it soft-disconnects (status `disconnected`, data kept, vault entry revoked); `?purge=true` permanently deletes a disconnected account. See the retention note below |
 | GET /channels/accounts/{}/avatar | UI | Channels card avatar (Telegram proxy — token-bearing URLs never reach the browser) |
+| GET /channels/{}/health | UI | Channels card "Check health" (P2-2) — adapter credential probe plus the WhatsApp `GET /{waba}/subscribed_apps` verification. Always 200: a failing provider is a report (`ok:false` + reason), and `appSubscription.subscribed` is tri-state (`null` = could not be determined) |
 | POST /channels/telegram/connect | UI | Channels connect modal → Telegram card |
 | POST /channels/whatsapp/embedded-signup/exchange | UI | Channels connect modal → WhatsApp card |
 | GET /channels/messenger/pending-pages | UI | Channels connect modal (Page picker) |
