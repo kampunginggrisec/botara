@@ -14,7 +14,8 @@
  *     vault.store({ channel: "whatsapp", label: "waba:{wabaId}" }) - the
  *     raw token never lands in channel_accounts, only the `vault:db:` ref;
  *   - one channel_accounts row via createChannelAccount with externalId =
- *     the phone_number_id, the WhatsApp capability snapshot, and
+ *     the phone_number_id, the WhatsApp capability snapshot plus the
+ *     wabaId stamp (mirroring the onboarding persister), and
  *     status "connected" - so the normal dispatcher/send paths (which
  *     resolve the token from token_vault_ref through VaultCredentialProvider)
  *     pick the account up with no special-casing.
@@ -51,7 +52,7 @@
 import { CHANNEL_CAPABILITIES, type FetchLike } from "../packages/channels/src/index";
 import {
   createChannelAccount, createTokenVault, getDb, getWorkspaceById,
-  listChannelAccounts, updateChannelAccountToken,
+  listChannelAccounts, updateChannelAccountCapabilities, updateChannelAccountToken,
 } from "../packages/db/src/index";
 
 // ------------------------------------------------------------- core (tested)
@@ -67,7 +68,11 @@ export interface ProvisionAccountsPort {
   findExisting(
     workspaceId: string,
     externalId: string,
-  ): Promise<{ id: string; tokenVaultRef: string | null } | null>;
+  ): Promise<{
+    id: string;
+    tokenVaultRef: string | null;
+    capabilities: Record<string, unknown> | null;
+  } | null>;
   create(input: {
     workspaceId: string;
     channel: "whatsapp";
@@ -81,6 +86,8 @@ export interface ProvisionAccountsPort {
   }): Promise<{ id: string }>;
   /** Point an existing account at a (new) vault ref and mark it connected. */
   setTokenRef(accountId: string, tokenVaultRef: string): Promise<void>;
+  /** Replace an existing account's capabilities bag (WABA-id stamping). */
+  setCapabilities(accountId: string, capabilities: Record<string, unknown>): Promise<void>;
 }
 
 export interface ProvisionWaTestNumberDeps {
@@ -125,6 +132,16 @@ export async function provisionWaTestNumber(
 
   if (existing) {
     accountId = existing.id;
+    // Heal the WABA stamp on accounts provisioned before it existed:
+    // template operations and the health check read the WABA id from
+    // capabilities (Graph v26 dropped the discovery field they used
+    // before), so a missing or stale stamp silently breaks both.
+    if (existing.capabilities?.wabaId !== input.wabaId) {
+      await deps.accounts.setCapabilities(accountId, {
+        ...(existing.capabilities ?? {}),
+        wabaId: input.wabaId,
+      });
+    }
     const ref = existing.tokenVaultRef;
     if (ref?.startsWith("vault:db:")) {
       // Rotate in place: the account row (and every queued job holding the
@@ -154,7 +171,14 @@ export async function provisionWaTestNumber(
       externalId: input.phoneNumberId,
       displayName: input.displayName,
       apiVersion: version,
-      capabilities: CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>,
+      // Stamp the WABA id at provisioning time, exactly like the
+      // Embedded Signup persister does since 7f65f0e: template
+      // operations and the subscription health check read it from
+      // capabilities and no longer re-derive it from Graph.
+      capabilities: {
+        ...(CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>),
+        wabaId: input.wabaId,
+      },
       isCoexistence: false,
       tokenVaultRef,
       status: "connected",
@@ -224,7 +248,13 @@ async function main(): Promise<void> {
         async findExisting(wsId, externalId) {
           const rows = await listChannelAccounts(db, wsId);
           const row = rows.find((r) => r.channel === "whatsapp" && r.externalId === externalId);
-          return row ? { id: row.id, tokenVaultRef: row.tokenVaultRef } : null;
+          return row
+            ? {
+                id: row.id,
+                tokenVaultRef: row.tokenVaultRef,
+                capabilities: (row.capabilities as Record<string, unknown> | null) ?? null,
+              }
+            : null;
         },
         async create(input) {
           const row = await createChannelAccount(db, input);
@@ -232,6 +262,9 @@ async function main(): Promise<void> {
         },
         async setTokenRef(accountId, tokenVaultRef) {
           await updateChannelAccountToken(db, accountId, { tokenVaultRef, status: "connected" });
+        },
+        async setCapabilities(accountId, capabilities) {
+          await updateChannelAccountCapabilities(db, accountId, capabilities);
         },
       },
       fetchFn: (url, init) => fetch(url, init as RequestInit),

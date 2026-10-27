@@ -18,7 +18,7 @@ function fakeAccounts() {
   const port: ProvisionAccountsPort = {
     async findExisting(workspaceId, externalId) {
       const row = rows.find((r) => r.workspaceId === workspaceId && r.externalId === externalId);
-      return row ? { id: row.id, tokenVaultRef: row.tokenVaultRef } : null;
+      return row ? { id: row.id, tokenVaultRef: row.tokenVaultRef, capabilities: row.capabilities } : null;
     },
     async create(input) {
       const row = { ...input, id: `acc-${rows.length + 1}` };
@@ -28,6 +28,10 @@ function fakeAccounts() {
     async setTokenRef(accountId, tokenVaultRef) {
       const row = rows.find((r) => r.id === accountId);
       if (row) row.tokenVaultRef = tokenVaultRef;
+    },
+    async setCapabilities(accountId, capabilities) {
+      const row = rows.find((r) => r.id === accountId);
+      if (row) row.capabilities = capabilities;
     },
   };
   return { port, rows };
@@ -88,9 +92,10 @@ describe("provision-wa-test-number (fake accounts + real TokenVault over in-memo
       isCoexistence: false,
       status: "connected",
     });
-    expect(row.capabilities).toEqual(
-      CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>,
-    );
+    expect(row.capabilities).toEqual({
+      ...(CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>),
+      wabaId: "2227032434830165",
+    });
     // Only the vault ref lands on the row; the token is inside the vault.
     expect(row.tokenVaultRef).toStartWith("vault:db:");
     expect(JSON.stringify(row)).not.toContain(TEMP_TOKEN);
@@ -134,6 +139,31 @@ describe("provision-wa-test-number (fake accounts + real TokenVault over in-memo
       id: row.id, externalId: row.externalId, tokenVaultRef: row.tokenVaultRef!,
     });
     expect(resolved).toBe(FRESH_TOKEN);
+  });
+
+  test("re-running heals a missing WABA stamp on a legacy account", async () => {
+    // Accounts provisioned before the wabaId stamp existed carry the
+    // bare capability snapshot; template ops and the health check read
+    // the WABA from capabilities, so a refresh run must stamp it.
+    const { deps, accounts } = fakeDeps();
+    await accounts.port.create({
+      workspaceId: INPUT.workspaceId,
+      channel: "whatsapp",
+      externalId: INPUT.phoneNumberId,
+      displayName: INPUT.displayName,
+      apiVersion: "v26.0",
+      capabilities: { ...(CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>) },
+      isCoexistence: false,
+      tokenVaultRef: "vault:db:legacy",
+      status: "connected",
+    });
+    const result = await provisionWaTestNumber(deps, INPUT);
+    expect(result.created).toBe(false);
+    expect(accounts.rows).toHaveLength(1);
+    expect(accounts.rows[0]!.capabilities).toEqual({
+      ...(CHANNEL_CAPABILITIES.whatsapp as unknown as Record<string, unknown>),
+      wabaId: "2227032434830165",
+    });
   });
 
   test("the result summary contains NO token material anywhere", async () => {
