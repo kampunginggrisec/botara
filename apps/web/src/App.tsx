@@ -47,6 +47,18 @@ import {
 
 type PageId = "dashboard" | "inbox" | "contacts" | "flows" | "broadcast" | "sequences" | "deals" | "analytics" | "publish" | "channels" | "knowledge" | "growth" | "settings" | "admin";
 
+/**
+ * WhatsApp coexistence ("Connect WhatsApp Business App") entry point.
+ * Hidden on the owner's call (2026-10-28): Meta only renders the
+ * Business-App branch of Embedded Signup for apps holding Advanced
+ * Access, and until this app passes App Review the button drops users
+ * into the standard number picker instead - a dead end that reads as a
+ * Botara bug. The backend (exchange flag, echoes/history sync) stays
+ * fully wired; flip this to true once the review passes, redeploy, and
+ * re-verify the button end-to-end.
+ */
+const WHATSAPP_COEXISTENCE_ENABLED = false;
+
 const NAV: Array<{ id: PageId; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "dashboard", labelKey: "nav.dashboard" },
   { id: "inbox", labelKey: "nav.inbox" },
@@ -5056,8 +5068,12 @@ function ChannelsPage() {
           {config?.metaAppId && config?.whatsappEmbeddedConfigId ? (
             <>
               <button onClick={() => void launchWhatsApp()} className={`mt-3 ${primaryBtn}`}>{t("channels.whatsapp.button")}</button>
-              <p className={`mt-4 ${mutedCls}`}>{t("channels.whatsapp.coexistenceBody")}</p>
-              <button onClick={() => void launchWhatsApp("coexistence")} className="mt-3 rounded-md border border-slate-300 text-sm px-4 py-2 disabled:opacity-50 dark:border-slate-700">{t("channels.whatsapp.coexistenceButton")}</button>
+              {WHATSAPP_COEXISTENCE_ENABLED && (
+                <>
+                  <p className={`mt-4 ${mutedCls}`}>{t("channels.whatsapp.coexistenceBody")}</p>
+                  <button onClick={() => void launchWhatsApp("coexistence")} className="mt-3 rounded-md border border-slate-300 text-sm px-4 py-2 disabled:opacity-50 dark:border-slate-700">{t("channels.whatsapp.coexistenceButton")}</button>
+                </>
+              )}
             </>
           ) : (
             <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
