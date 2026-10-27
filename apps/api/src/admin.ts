@@ -8,6 +8,10 @@ import {
 } from "@botara/db";
 import { requirePlatformAdmin, type AuthStore, type AuthUser } from "./auth";
 import type { AppEnv } from "./app";
+import {
+  listWebhookReceiptItems,
+  type WebhookReceiptItem,
+} from "./webhook-receipts";
 
 /**
  * Platform admin (operator panel) - Fase: admin panel.
@@ -127,12 +131,21 @@ export function groupBillingRows(rows: PlatformBillingRow[]): AdminBilling {
 // ------------------------------------------------------------------- store
 
 /** Everything the admin read views need from persistence. */
+/** One inbound webhook receipt as the Admin → Webhook log shows it. */
+export type AdminWebhookLogItem = WebhookReceiptItem;
+
 export interface AdminStore {
   overview(now: Date): Promise<AdminOverview>;
   listUsers(): Promise<AdminUserItem[]>;
   listWorkspaces(): Promise<AdminWorkspaceItem[]>;
   billing(since: Date): Promise<AdminBilling>;
   audit(limit: number): Promise<AdminAuditItem[]>;
+  /** Newest inbound webhook receipts (Admin → Webhook log). */
+  webhookLog(filters: {
+    channel?: string;
+    outcome?: string;
+    limit: number;
+  }): Promise<AdminWebhookLogItem[]>;
 }
 
 const DAY_MS = 24 * 3600 * 1000;
@@ -215,6 +228,14 @@ export class DbAdminStore implements AdminStore {
       details: r.details,
       createdAt: r.createdAt.toISOString(),
     }));
+  }
+
+  async webhookLog(filters: {
+    channel?: string;
+    outcome?: string;
+    limit: number;
+  }): Promise<AdminWebhookLogItem[]> {
+    return listWebhookReceiptItems(this.getDatabase, filters);
   }
 }
 
@@ -303,6 +324,20 @@ export class InMemoryAdminStore implements AdminStore {
       .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
       .slice(0, limit)
       .map((r) => ({ ...r, createdAt: r.createdAt.toISOString() }));
+  }
+
+  /** Seed newest-first, exactly as the recorder stores them. */
+  webhookReceipts: AdminWebhookLogItem[] = [];
+
+  async webhookLog(filters: {
+    channel?: string;
+    outcome?: string;
+    limit: number;
+  }): Promise<AdminWebhookLogItem[]> {
+    return this.webhookReceipts
+      .filter((r) => !filters.channel || r.channel === filters.channel)
+      .filter((r) => !filters.outcome || r.outcome === filters.outcome)
+      .slice(0, filters.limit);
   }
 }
 
@@ -438,6 +473,18 @@ export function registerAdminRoutes(app: OpenAPIHono<AppEnv>, deps: AdminRouteDe
   app.get("/admin/audit", async (c) => {
     await guard(c);
     return c.json({ entries: await deps.adminStore.audit(parseLimit(c.req.query("limit"))) });
+  });
+
+  app.get("/admin/webhook-log", async (c) => {
+    await guard(c);
+    const channel = c.req.query("channel") || undefined;
+    const outcome = c.req.query("outcome") || undefined;
+    const receipts = await deps.adminStore.webhookLog({
+      channel,
+      outcome,
+      limit: parseLimit(c.req.query("limit")),
+    });
+    return c.json({ receipts });
   });
 
   app.get("/admin/connection-info", async (c) => {

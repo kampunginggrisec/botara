@@ -900,3 +900,45 @@ export const webhookDeliveries = pgTable("webhook_deliveries", {
   index("webhook_deliveries_endpoint_created_idx").on(t.endpointId, t.createdAt),
   index("webhook_deliveries_ws_idx").on(t.workspaceId),
 ]);
+
+/**
+ * Inbound webhook receipts (Admin → Webhook log): one row per provider
+ * webhook POST the API handled, across every channel, so the platform
+ * operator can answer "did Meta's webhook actually reach us, and what
+ * did we do with it?" without shell access to the API logs.
+ *
+ * Written BEST-EFFORT by the webhook routes after handling completes -
+ * a failed insert never changes the provider-facing response. The
+ * payload summary is the raw request BODY (JSON) truncated to 4 KB; it
+ * is stored only for signature-VERIFIED requests: a forged or unsigned
+ * body is never persisted (its `payload_summary` stays null and the
+ * `error` column says why). Headers, signatures and tokens are never
+ * stored. Retention is short (see WEBHOOK_RECEIPT_RETENTION_DAYS in
+ * @botara/shared): the worker's daily sweeper deletes older rows.
+ *
+ * workspace_id / channel_account_id are resolved from the first parsed
+ * event's account external id when possible; both stay null for
+ * unverifiable or unresolvable receipts rather than guessing.
+ */
+export const webhookReceipts = pgTable("webhook_receipts", {
+  id: uuid("id").primaryKey().defaultRandom(),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Provider channel key: whatsapp|messenger|instagram|threads|telegram|tiktok|... */
+  channel: varchar("channel", { length: 40 }).notNull(),
+  /** First parsed event type (message.received, message.echo, ...); null when nothing parsed. */
+  eventType: varchar("event_type", { length: 80 }),
+  /** processed (dispatch ran) | ignored (verified, nothing actionable) | error (rejected/failed). */
+  outcome: varchar("outcome", { length: 20 }).notNull(),
+  /** The HTTP status the API answered the provider with. */
+  httpStatus: integer("http_status").notNull(),
+  workspaceId: uuid("workspace_id").references(() => workspaces.id),
+  channelAccountId: uuid("channel_account_id").references(() => channelAccounts.id),
+  /** Raw body JSON truncated to 4000 chars; null for unverified requests. */
+  payloadSummary: text("payload_summary"),
+  /** Short failure note when outcome = "error". */
+  error: text("error"),
+}, (t) => [
+  index("webhook_receipts_created_idx").on(t.createdAt),
+  index("webhook_receipts_channel_created_idx").on(t.channel, t.createdAt),
+  index("webhook_receipts_outcome_created_idx").on(t.outcome, t.createdAt),
+]);

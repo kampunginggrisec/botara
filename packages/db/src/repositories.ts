@@ -8,7 +8,7 @@ import {
   processedComments,
   savedReplies,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
-  users, webchatSessions, webhookDeliveries, webhookEndpoints, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
+  users, webchatSessions, webhookDeliveries, webhookEndpoints, webhookReceipts, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
   type TemplateComponentRow,
 } from "./schema";
 
@@ -4706,4 +4706,113 @@ export async function registerWebhookEndpointFailure(
     });
   }
   return { consecutiveFailures: next, autoDisabled };
+}
+
+// ------------------------------------------------- inbound webhook receipts
+
+export type WebhookReceiptRow = typeof webhookReceipts.$inferSelect;
+
+export type WebhookReceiptOutcome = "processed" | "ignored" | "error";
+
+/** Hard cap on a stored payload summary (chars), truncation marker included. */
+export const WEBHOOK_RECEIPT_SUMMARY_MAX = 4000;
+
+const TRUNCATION_MARKER = "…[truncated]";
+
+/**
+ * Truncate a webhook body for storage in a receipt summary: at most
+ * WEBHOOK_RECEIPT_SUMMARY_MAX chars, with a clear marker when cut.
+ * Pure and exported so the contract is unit-testable without a DB.
+ */
+export function truncateWebhookPayloadSummary(raw: string): string {
+  if (raw.length <= WEBHOOK_RECEIPT_SUMMARY_MAX) return raw;
+  return raw.slice(0, WEBHOOK_RECEIPT_SUMMARY_MAX - TRUNCATION_MARKER.length) + TRUNCATION_MARKER;
+}
+
+export interface CreateWebhookReceiptInput {
+  channel: string;
+  eventType?: string | null;
+  outcome: WebhookReceiptOutcome;
+  httpStatus: number;
+  workspaceId?: string | null;
+  channelAccountId?: string | null;
+  /** Raw body (pass through truncateWebhookPayloadSummary here); null for unverified requests. */
+  payloadSummary?: string | null;
+  error?: string | null;
+}
+
+export async function createWebhookReceipt(
+  db: Database,
+  input: CreateWebhookReceiptInput,
+): Promise<WebhookReceiptRow> {
+  const [row] = await db
+    .insert(webhookReceipts)
+    .values({
+      channel: input.channel,
+      eventType: input.eventType ?? null,
+      outcome: input.outcome,
+      httpStatus: input.httpStatus,
+      workspaceId: input.workspaceId ?? null,
+      channelAccountId: input.channelAccountId ?? null,
+      payloadSummary: input.payloadSummary == null
+        ? null
+        : truncateWebhookPayloadSummary(input.payloadSummary),
+      error: input.error ?? null,
+    })
+    .returning();
+  return row!;
+}
+
+export interface WebhookReceiptFilters {
+  channel?: string;
+  outcome?: string;
+  limit?: number;
+}
+
+/**
+ * WHERE clause for the receipt list (exported for the dialect-rendered
+ * contract tests, same pattern as inviteConsumableWhere: filter params
+ * travel as column-encoded values, never raw JS objects).
+ */
+export function webhookReceiptListWhere(filters: WebhookReceiptFilters) {
+  const conditions = [];
+  if (filters.channel) conditions.push(eq(webhookReceipts.channel, filters.channel));
+  if (filters.outcome) conditions.push(eq(webhookReceipts.outcome, filters.outcome));
+  return conditions.length > 0 ? and(...conditions) : undefined;
+}
+
+/** Newest receipts first (Admin → Webhook log), optionally filtered. */
+export async function listWebhookReceipts(
+  db: Database,
+  filters: WebhookReceiptFilters = {},
+): Promise<WebhookReceiptRow[]> {
+  const limit = Math.min(200, Math.max(1, Math.floor(filters.limit ?? 50)));
+  const where = webhookReceiptListWhere(filters);
+  const query = db.select().from(webhookReceipts);
+  const rows = where
+    ? await query.where(where).orderBy(desc(webhookReceipts.createdAt)).limit(limit)
+    : await query.orderBy(desc(webhookReceipts.createdAt)).limit(limit);
+  return rows;
+}
+
+/**
+ * Retention: delete receipts created before `cutoff` (the worker's
+ * daily sweeper passes now - WEBHOOK_RECEIPT_RETENTION_DAYS). The bound
+ * travels via the column-typed lt() operator, never a sql`` fragment -
+ * the #9 raw-Date lesson. Returns how many rows were deleted.
+ */
+/** Expiry predicate for the retention delete (exported for contract tests). */
+export function webhookReceiptExpiredWhere(cutoff: Date) {
+  return lt(webhookReceipts.createdAt, cutoff);
+}
+
+export async function deleteWebhookReceiptsOlderThan(
+  db: Database,
+  cutoff: Date,
+): Promise<number> {
+  const deleted = await db
+    .delete(webhookReceipts)
+    .where(webhookReceiptExpiredWhere(cutoff))
+    .returning({ id: webhookReceipts.id });
+  return deleted.length;
 }

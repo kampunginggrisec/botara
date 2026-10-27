@@ -23,3 +23,19 @@ export function disconnectPurgeAt(disconnectedAt: Date | null | undefined): Date
 export function disconnectRetentionCutoff(now: Date): Date {
   return new Date(now.getTime() - DISCONNECT_RETENTION_DAYS * DAY_MS);
 }
+
+/**
+ * Retention policy for inbound webhook receipts (Admin → Webhook log).
+ *
+ * Receipts are an operator debugging aid, not an audit trail: the newest
+ * week is plenty to chase a provider delivery problem, and each row can
+ * carry up to 4 KB of payload summary, so the table must stay bounded.
+ * The worker's daily retention sweeper deletes receipts older than this
+ * window with the same job that purges disconnected accounts.
+ */
+export const WEBHOOK_RECEIPT_RETENTION_DAYS = 7;
+
+/** Receipts created at or before this instant are expired at `now`. */
+export function webhookReceiptRetentionCutoff(now: Date): Date {
+  return new Date(now.getTime() - WEBHOOK_RECEIPT_RETENTION_DAYS * DAY_MS);
+}

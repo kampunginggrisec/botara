@@ -57,6 +57,10 @@ import {
 import { putObject } from "@botara/media";
 import { DbAdminStore, registerAdminRoutes, type AdminStore } from "./admin";
 import {
+  DbWebhookReceiptRecorder, recordWebhookReceipt, summarizeWebhookEvents,
+  type NewWebhookReceipt, type WebhookReceiptRecorder,
+} from "./webhook-receipts";
+import {
   getAdapter, verifyWebhookChallenge, verifyWebhookSignature, verifyResendWebhookSignature,
   WebchatAdapter, CHANNEL_CAPABILITIES,
   TelegramAdapter, InstagramAdapter, ThreadsAdapter, MessengerAdapter, TikTokAdapter,
@@ -331,6 +335,12 @@ export interface ApiDeps {
   providerFetch: FetchLike;
   /** Platform admin (operator panel): deployment-scoped read views. */
   adminStore: AdminStore;
+  /**
+   * Inbound webhook receipts (Admin → Webhook log): best-effort write
+   * port used by the provider webhook routes. Optional - when absent
+   * the routes record nothing (recording must never break a webhook).
+   */
+  webhookReceiptStore?: WebhookReceiptRecorder;
   /** Platform admin: DB-managed settings with env fallback (see @botara/db). */
   platformSettings: PlatformSettingsService;
   env: Record<string, string | undefined>;
@@ -929,6 +939,7 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
     }),
     getAiProvider: () => createAIProviderFromEnv(process.env),
     adminStore: new DbAdminStore(defaultGetDatabase),
+    webhookReceiptStore: new DbWebhookReceiptRecorder(defaultGetDatabase),
     platformSettings: new PlatformSettingsService(
       new DbPlatformSettingsStorage(defaultGetDatabase),
       {
@@ -1873,6 +1884,15 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
   });
 
 
+  // Inbound webhook receipts (Admin → Webhook log): one best-effort row
+  // per provider webhook POST, recorded as handling completes - the
+  // response is decided first and recording never changes it
+  // (recordWebhookReceipt swallows every storage failure).
+  const recordReceipt = (input: NewWebhookReceipt): Promise<void> =>
+    deps.webhookReceiptStore
+      ? recordWebhookReceipt(deps.webhookReceiptStore, input)
+      : Promise.resolve();
+
   // ------------------------------------------------------------ webhooks
   // Webhooks are provider-facing: no workspace header, no DB. Auth is the
   // provider's own scheme (Meta signature / Telegram secret token).
@@ -1898,6 +1918,10 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     // Development fixtures may intentionally omit Meta credentials, but a
     // production endpoint must never accept an unsigned provider payload.
     if (!appSecret && deps.env.NODE_ENV === "production") {
+      await recordReceipt({
+        channel: "whatsapp", outcome: "error", httpStatus: 503,
+        error: "META_APP_SECRET is not configured; webhook cannot be authenticated.",
+      });
       throw new AppError(
         "CONFIGURATION",
         "META_APP_SECRET is required to authenticate WhatsApp webhooks in production.",
@@ -1906,10 +1930,21 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     }
     if (appSecret) {
       const ok = verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret);
-      if (!ok) throw new AppError("UNAUTHORIZED", "Invalid X-Hub-Signature-256.", { status: 401 });
+      if (!ok) {
+        // Unverified body: the receipt stores NO payload summary.
+        await recordReceipt({
+          channel: "whatsapp", outcome: "error", httpStatus: 401,
+          error: "Invalid X-Hub-Signature-256.",
+        });
+        throw new AppError("UNAUTHORIZED", "Invalid X-Hub-Signature-256.", { status: 401 });
+      }
     }
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch {
+      await recordReceipt({
+        channel: "whatsapp", outcome: "error", httpStatus: 400, payloadSummary: raw,
+        error: "Webhook body is not valid JSON.",
+      });
       throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
     }
     const events = await getAdapter("whatsapp").parseWebhook(payload);
@@ -1933,18 +1968,52 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     // Fase 4: persist inbound messages + match flow triggers. The
     // dispatcher never throws - the provider still gets its 200.
     await deps.flowDispatcher.dispatch(events);
+    const waSummary = summarizeWebhookEvents(events);
+    await recordReceipt({
+      channel: "whatsapp",
+      outcome: events.length > 0 ? "processed" : "ignored",
+      httpStatus: 200,
+      eventType: waSummary.eventType,
+      accountExternalId: waSummary.accountExternalId,
+      payloadSummary: raw,
+    });
     return c.json({ received: true, events: events.length });
   });
 
   app.post("/webhooks/telegram", async (c) => {
     const secret = deps.env.TELEGRAM_WEBHOOK_SECRET;
     if (secret && c.req.header("x-telegram-bot-api-secret-token") !== secret) {
+      // Unverified body: the receipt stores NO payload summary.
+      await recordReceipt({
+        channel: "telegram", outcome: "error", httpStatus: 401,
+        error: "Invalid Telegram webhook secret token.",
+      });
       throw new AppError("UNAUTHORIZED", "Invalid Telegram webhook secret token.", { status: 401 });
     }
-    const payload = await readJsonBody(c);
+    const raw = await c.req.text();
+    let payload: Record<string, unknown>;
+    try {
+      payload = JSON.parse(raw) as Record<string, unknown>;
+      if (typeof payload !== "object" || payload === null) throw new Error("not an object");
+    } catch {
+      await recordReceipt({
+        channel: "telegram", outcome: "error", httpStatus: 400, payloadSummary: raw,
+        error: "Request body must be a JSON object.",
+      });
+      throw new AppError("VALIDATION", "Request body must be a JSON object.", { status: 400 });
+    }
     const events = await getAdapter("telegram").parseWebhook(payload);
     await deps.eventSink.handle(events);
     await deps.flowDispatcher.dispatch(events);
+    const tgSummary = summarizeWebhookEvents(events);
+    await recordReceipt({
+      channel: "telegram",
+      outcome: events.length > 0 ? "processed" : "ignored",
+      httpStatus: 200,
+      eventType: tgSummary.eventType,
+      accountExternalId: tgSummary.accountExternalId,
+      payloadSummary: raw,
+    });
     return c.json({ received: true, events: events.length });
   });
 
@@ -1971,15 +2040,33 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       const raw = await c.req.text();
       const appSecret = deps.env.META_APP_SECRET;
       if (appSecret && !verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret)) {
+        // Unverified body: the receipt stores NO payload summary.
+        await recordReceipt({
+          channel, outcome: "error", httpStatus: 401,
+          error: `Invalid X-Hub-Signature-256 (${channel}).`,
+        });
         throw new AppError("UNAUTHORIZED", `Invalid X-Hub-Signature-256 (${channel}).`, { status: 401 });
       }
       let payload: unknown;
       try { payload = JSON.parse(raw); } catch {
+        await recordReceipt({
+          channel, outcome: "error", httpStatus: 400, payloadSummary: raw,
+          error: "Webhook body is not valid JSON.",
+        });
         throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
       }
       const events = await getAdapter(channel).parseWebhook(payload);
       await deps.eventSink.handle(events);
       await deps.flowDispatcher.dispatch(events);
+      const summary = summarizeWebhookEvents(events);
+      await recordReceipt({
+        channel,
+        outcome: events.length > 0 ? "processed" : "ignored",
+        httpStatus: 200,
+        eventType: summary.eventType,
+        accountExternalId: summary.accountExternalId,
+        payloadSummary: raw,
+      });
       return c.json({ received: true, events: events.length });
     });
   }
@@ -2001,15 +2088,33 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     const raw = await c.req.text();
     const appSecret = deps.env.THREADS_APP_SECRET ?? deps.env.META_APP_SECRET;
     if (appSecret && !verifyWebhookSignature(raw, c.req.header("x-hub-signature-256"), appSecret)) {
+      // Unverified body: the receipt stores NO payload summary.
+      await recordReceipt({
+        channel: "threads", outcome: "error", httpStatus: 401,
+        error: "Invalid X-Hub-Signature-256 (threads).",
+      });
       throw new AppError("UNAUTHORIZED", "Invalid X-Hub-Signature-256 (threads).", { status: 401 });
     }
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch {
+      await recordReceipt({
+        channel: "threads", outcome: "error", httpStatus: 400, payloadSummary: raw,
+        error: "Webhook body is not valid JSON.",
+      });
       throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
     }
     const events = await getAdapter("threads").parseWebhook(payload);
     await deps.eventSink.handle(events);
     await deps.flowDispatcher.dispatch(events);
+    const thSummary = summarizeWebhookEvents(events);
+    await recordReceipt({
+      channel: "threads",
+      outcome: events.length > 0 ? "processed" : "ignored",
+      httpStatus: 200,
+      eventType: thSummary.eventType,
+      accountExternalId: thSummary.accountExternalId,
+      payloadSummary: raw,
+    });
     return c.json({ received: true, events: events.length });
   });
 
@@ -2027,15 +2132,33 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       c.req.header("x-tiktok-signature") ?? c.req.header("x-signature"),
       appSecret,
     )) {
+      // Unverified body: the receipt stores NO payload summary.
+      await recordReceipt({
+        channel: "tiktok", outcome: "error", httpStatus: 401,
+        error: "Invalid TikTok webhook signature (placeholder scheme).",
+      });
       throw new AppError("UNAUTHORIZED", "Invalid TikTok webhook signature (placeholder scheme).", { status: 401 });
     }
     let payload: unknown;
     try { payload = JSON.parse(raw); } catch {
+      await recordReceipt({
+        channel: "tiktok", outcome: "error", httpStatus: 400, payloadSummary: raw,
+        error: "Webhook body is not valid JSON.",
+      });
       throw new AppError("VALIDATION", "Webhook body is not valid JSON.", { status: 400 });
     }
     const events = await getAdapter("tiktok").parseWebhook(payload);
     await deps.eventSink.handle(events);
     await deps.flowDispatcher.dispatch(events);
+    const ttSummary = summarizeWebhookEvents(events);
+    await recordReceipt({
+      channel: "tiktok",
+      outcome: events.length > 0 ? "processed" : "ignored",
+      httpStatus: 200,
+      eventType: ttSummary.eventType,
+      accountExternalId: ttSummary.accountExternalId,
+      payloadSummary: raw,
+    });
     return c.json({ received: true, events: events.length });
   });
 

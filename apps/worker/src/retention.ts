@@ -1,4 +1,4 @@
-import { disconnectRetentionCutoff } from "@botara/shared";
+import { disconnectRetentionCutoff, webhookReceiptRetentionCutoff } from "@botara/shared";
 
 /**
  * Retention sweeper (item G).
@@ -23,4 +23,24 @@ export async function processRetentionScan(
 ): Promise<{ purged: number }> {
   const purged = await ports.purgeExpired(disconnectRetentionCutoff(now));
   return { purged: purged.length };
+}
+
+/**
+ * Inbound webhook receipt retention (Admin → Webhook log): receipts are
+ * a short-lived debugging aid, so the same daily sweep deletes rows
+ * older than WEBHOOK_RECEIPT_RETENTION_DAYS (7) - keeping the table
+ * (and its up-to-4 KB payload summaries) bounded without any insert-time
+ * trim on the hot webhook path.
+ */
+export interface WebhookReceiptRetentionPorts {
+  /** Delete receipts created before the cutoff; returns the row count. */
+  deleteExpiredReceipts(cutoff: Date): Promise<number>;
+}
+
+export async function processWebhookReceiptRetention(
+  ports: WebhookReceiptRetentionPorts,
+  now: Date,
+): Promise<{ deleted: number }> {
+  const deleted = await ports.deleteExpiredReceipts(webhookReceiptRetentionCutoff(now));
+  return { deleted };
 }

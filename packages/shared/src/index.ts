@@ -13,6 +13,7 @@ export {
 } from "./window";
 export {
   DISCONNECT_RETENTION_DAYS, disconnectPurgeAt, disconnectRetentionCutoff,
+  WEBHOOK_RECEIPT_RETENTION_DAYS, webhookReceiptRetentionCutoff,
 } from "./retention";
 export {
   interpolate, buildVariableContext,

@@ -122,6 +122,38 @@ These stay in `.env` / process environment only, by design:
 Changing any of these still means editing the environment and restarting
 the affected services.
 
+## Webhook log — inbound webhook receipts
+
+**Admin → Webhook log** shows one row per inbound provider webhook POST
+the API handled — WhatsApp, Messenger, Instagram, Threads, Telegram and
+TikTok — newest first: time, channel, the first parsed event type,
+outcome (`processed` when dispatch ran, `ignored` when the payload was
+verified but nothing was actionable, `error` when the request was
+rejected or handling failed), the HTTP status we answered, and the
+resolved workspace / channel account when the event's account could be
+matched. Channel and outcome filters are supported; expanding a row
+shows the stored payload (and the error note for failures). The API is
+`GET /admin/webhook-log?channel=&outcome=&limit=` (default 50, max 200),
+behind the same platform-admin guard as every other `/admin` route.
+
+Three properties are deliberate:
+
+- **Best-effort, always.** A receipt is written as handling completes
+  and every recording failure is swallowed server-side: a storage
+  problem can never change the response a provider gets (a changed
+  response would trigger provider retry storms — far worse than a
+  missing log row).
+- **Unverified bodies are never stored.** A request that fails
+  signature verification (or arrives when the app secret is missing in
+  production) leaves a receipt with the outcome `error`, a null payload
+  summary, and the rejection reason — forged junk is not persisted.
+  Verified bodies are stored truncated to 4 KB (`…[truncated]` marker).
+  Headers, signatures and tokens are never recorded.
+- **Short retention.** Receipts are a debugging aid, not an audit
+  trail: the worker's daily retention sweep (the same `retention` job
+  that purges disconnected channel accounts) deletes receipts older
+  than 7 days (`WEBHOOK_RECEIPT_RETENTION_DAYS` in `@botara/shared`).
+
 ## "Active users" — the honest definition
 
 Active-user counts are **users with a successful login** inside the

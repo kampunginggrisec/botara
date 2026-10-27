@@ -911,6 +911,21 @@ export interface AdminAuditItem {
   createdAt: string;
 }
 
+/** One inbound webhook receipt (Admin → Webhook log). */
+export interface AdminWebhookLogItem {
+  id: string;
+  createdAt: string;
+  channel: string;
+  eventType: string | null;
+  outcome: "processed" | "ignored" | "error";
+  httpStatus: number;
+  workspaceId: string | null;
+  channelAccountId: string | null;
+  /** Raw body JSON truncated server-side; null when the request was unverified. */
+  payloadSummary: string | null;
+  error: string | null;
+}
+
 export interface StatsOverview {
   contacts: { total: number };
   conversations: { open: number; total: number };
@@ -1658,6 +1673,13 @@ export const api = {
   },
   adminAudit(limit: number): Promise<{ entries: AdminAuditItem[] }> {
     return request(`/admin/audit?limit=${limit}`);
+  },
+  adminWebhookLog(params: { channel?: string; outcome?: string; limit?: number }): Promise<{ receipts: AdminWebhookLogItem[] }> {
+    const query = new URLSearchParams();
+    if (params.channel) query.set("channel", params.channel);
+    if (params.outcome) query.set("outcome", params.outcome);
+    query.set("limit", String(params.limit ?? 50));
+    return request(`/admin/webhook-log?${query.toString()}`);
   },
   /** Callback-URL connection reference for provider dashboards (F11). */
   adminConnectionInfo(): Promise<ConnectionInfo> {

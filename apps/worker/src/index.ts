@@ -11,6 +11,7 @@ import {
   countServiceUnitsInRange,
   getKbDocument, listKbChunksByWorkspace, replaceKbChunks, updateKbDocument,
   listChannelAccountsDueForRefresh, updateChannelAccountToken, purgeExpiredDisconnectedAccounts,
+  deleteWebhookReceiptsOlderThan,
   getScheduledPostById, listDueScheduledPosts, updateScheduledPost,
   listDueEnrollments, updateEnrollment,
   addContactTag, removeContactTag, getWorkspaceMember, updateConversationAssignment,
@@ -53,7 +54,7 @@ import {
   type PublishPorts, type ScheduledPostSnapshot,
 } from "./publish";
 import { processSequenceAdvance, type SequencePorts } from "./sequences";
-import { processRetentionScan } from "./retention";
+import { processRetentionScan, processWebhookReceiptRetention } from "./retention";
 import { processEmailInbound, type EmailInboundJobData, type EmailInboundPorts } from "./email-inbound";
 import { processKbIngest, type KbIngestJobData, type KbIngestPorts } from "./kb-ingest";
 import {
@@ -1041,11 +1042,18 @@ async function dispatch(queueName: string, job: Job): Promise<unknown> {
         return processTokenRefreshScan(buildTokenRefreshPorts(db), new Date());
       }
       if (job.name === "retention") {
-        // Item G: daily retention sweep for soft-disconnected accounts.
-        return processRetentionScan(
+        // Item G: daily retention sweep for soft-disconnected accounts,
+        // plus the inbound webhook receipt sweep (Admin → Webhook log,
+        // 7-day retention) on the same daily job.
+        const accounts = await processRetentionScan(
           { purgeExpired: (cutoff) => purgeExpiredDisconnectedAccounts(db, cutoff) },
           new Date(),
         );
+        const receipts = await processWebhookReceiptRetention(
+          { deleteExpiredReceipts: (cutoff) => deleteWebhookReceiptsOlderThan(db, cutoff) },
+          new Date(),
+        );
+        return { ...accounts, receiptsDeleted: receipts.deleted };
       }
       return processTokenRefreshAccount(buildTokenRefreshPorts(db), job.data as { accountId: string });
     case "publish":

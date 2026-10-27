@@ -2,7 +2,7 @@ import { Fragment, useCallback, useEffect, useRef, useState, useSyncExternalStor
 import {
   api, ApiError, BASE_URL, clearSession, downloadTextFile, getToken, getWorkspaceId, onUnauthorized, setToken, setWorkspaceId,
   type AdminAuditItem, type AdminBilling, type AdminOverview, type AdminSettingUpdate, type AdminSettingView,
-  type AdminUserItem, type AdminWorkspaceItem,
+  type AdminUserItem, type AdminWebhookLogItem, type AdminWorkspaceItem,
   type ApiTokenInfo, type AuthUser, type BroadcastDetail, type BroadcastEstimate, type BroadcastRecipient,
   type WebhookDeliveryInfo, type WebhookEndpointInfo,
   type BroadcastRecipientCounts, type BroadcastSummary,
@@ -29,6 +29,7 @@ import { InstagramAutomation } from "./instagram-automation";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { formatDealMoney, groupDealsByStage, movedStageOrder, visibleDeals } from "./deals";
 import { formatMinutes, isStatsInsights, responseDelta } from "./insights";
+import { isWebhookLogResponse, WEBHOOK_LOG_CHANNELS, WEBHOOK_LOG_OUTCOMES } from "./webhook-log";
 import { messageStatusLabelKey, messageStatusTicks } from "./message-status";
 import {
   TOKEN_RESOURCES, countPickedResources, defaultTokenFormState, emptyScopePicks, expiryIsoFromDays,
@@ -5299,7 +5300,7 @@ function GrowthPage() {
 // only for users with isPlatformAdmin; every /admin route also enforces
 // the flag server-side (401/403 otherwise).
 
-type AdminTab = "overview" | "users" | "workspaces" | "billing" | "settings" | "audit";
+type AdminTab = "overview" | "users" | "workspaces" | "billing" | "settings" | "audit" | "webhook-log";
 
 const ADMIN_TABS: Array<{ id: AdminTab; labelKey: Parameters<ReturnType<typeof useI18n>["t"]>[0] }> = [
   { id: "overview", labelKey: "admin.tab.overview" },
@@ -5308,6 +5309,7 @@ const ADMIN_TABS: Array<{ id: AdminTab; labelKey: Parameters<ReturnType<typeof u
   { id: "billing", labelKey: "admin.tab.billing" },
   { id: "settings", labelKey: "admin.tab.settings" },
   { id: "audit", labelKey: "admin.tab.audit" },
+  { id: "webhook-log", labelKey: "admin.tab.webhookLog" },
 ];
 
 /** Managed-setting groups are rendered by AdminSettingsView: meta /
@@ -5546,6 +5548,7 @@ function AdminPage() {
         {tab === "billing" && <AdminBillingView />}
         {tab === "settings" && <AdminSettingsView />}
         {tab === "audit" && <AdminAuditView />}
+        {tab === "webhook-log" && <AdminWebhookLogView />}
       </div>
     </div>
   );
@@ -6136,6 +6139,169 @@ function AdminAuditView() {
                     <td className="px-4 py-2"><code className="text-xs break-all">{JSON.stringify(entry.details)}</code></td>
                   </tr>
                 ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const WEBHOOK_OUTCOME_CHIP: Record<AdminWebhookLogItem["outcome"], string> = {
+  processed: "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300",
+  ignored: "bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300",
+  error: "bg-rose-100 text-rose-800 dark:bg-rose-900/40 dark:text-rose-300",
+};
+
+/**
+ * Admin → Webhook log: recent inbound webhook receipts from every
+ * provider (one row per POST), newest first. The payload is validated
+ * with isWebhookLogResponse before rendering - a malformed response
+ * becomes the load-error state, never a white screen. Receipts are
+ * best-effort server-side and kept for 7 days (see docs/admin-panel.md).
+ */
+function AdminWebhookLogView() {
+  const { t } = useI18n();
+  const [receipts, setReceipts] = useState<AdminWebhookLogItem[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [channel, setChannel] = useState("");
+  const [outcome, setOutcome] = useState("");
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setReceipts(null);
+    api.adminWebhookLog({
+      channel: channel || undefined,
+      outcome: outcome || undefined,
+      limit: 100,
+    })
+      .then((data) => {
+        if (cancelled) return;
+        if (!isWebhookLogResponse(data)) {
+          setReceipts(null);
+          setError(t("admin.webhookLog.loadFailed"));
+          return;
+        }
+        setReceipts(data.receipts);
+        setError(null);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setReceipts(null);
+        setError(errText(err, t("admin.webhookLog.loadFailed")));
+      });
+    return () => { cancelled = true; };
+  }, [channel, outcome, t]);
+
+  const outcomeLabel = (value: AdminWebhookLogItem["outcome"]): string =>
+    t(`admin.webhookLog.outcome.${value}` as I18nKey);
+
+  return (
+    <div>
+      <div className="flex flex-wrap items-end gap-3">
+        <div>
+          <label className={labelCls} htmlFor="webhook-log-channel">{t("admin.webhookLog.channel")}</label>
+          <select
+            id="webhook-log-channel"
+            className={inputCls}
+            value={channel}
+            onChange={(e) => setChannel(e.target.value)}
+          >
+            <option value="">{t("admin.webhookLog.allChannels")}</option>
+            {WEBHOOK_LOG_CHANNELS.map((ch) => (
+              <option key={ch} value={ch}>{ch}</option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label className={labelCls} htmlFor="webhook-log-outcome">{t("admin.webhookLog.outcomeLabel")}</label>
+          <select
+            id="webhook-log-outcome"
+            className={inputCls}
+            value={outcome}
+            onChange={(e) => setOutcome(e.target.value)}
+          >
+            <option value="">{t("admin.webhookLog.allOutcomes")}</option>
+            {WEBHOOK_LOG_OUTCOMES.map((oc) => (
+              <option key={oc} value={oc}>{outcomeLabel(oc)}</option>
+            ))}
+          </select>
+        </div>
+      </div>
+      <p className={`${mutedCls} mt-3 max-w-3xl`}>{t("admin.webhookLog.note")}</p>
+      {error && <div className="max-w-2xl mt-4"><ErrorBox error={error} /></div>}
+      {!receipts && !error && <p className={`${mutedCls} mt-4`}>{t("app.loading")}</p>}
+      {receipts && (
+        <div className={`${cardCls} overflow-hidden max-w-6xl mt-4`}>
+          {receipts.length === 0 ? (
+            <div className="px-4 py-6 text-sm text-slate-500 dark:text-slate-400">{t("admin.webhookLog.empty")}</div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-left text-slate-500 dark:bg-slate-800/60 dark:text-slate-400">
+                <tr>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.time")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.channel")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.eventType")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.outcomeLabel")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.httpStatus")}</th>
+                  <th className="px-4 py-2 font-medium">{t("admin.webhookLog.account")}</th>
+                  <th className="px-4 py-2 font-medium"><span className="sr-only">{t("admin.webhookLog.details")}</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {receipts.map((receipt) => {
+                  const expanded = expandedId === receipt.id;
+                  return (
+                    <Fragment key={receipt.id}>
+                      <tr className="border-t border-slate-100 dark:border-slate-800 align-top">
+                        <td className="px-4 py-2 whitespace-nowrap">{fmtDateTime(receipt.createdAt)}</td>
+                        <td className="px-4 py-2 whitespace-nowrap">{receipt.channel}</td>
+                        <td className="px-4 py-2 whitespace-nowrap">{receipt.eventType ?? "-"}</td>
+                        <td className="px-4 py-2 whitespace-nowrap">
+                          <span className={`inline-block rounded-full px-2 py-0.5 text-xs font-medium ${WEBHOOK_OUTCOME_CHIP[receipt.outcome]}`}>
+                            {outcomeLabel(receipt.outcome)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 whitespace-nowrap">{receipt.httpStatus}</td>
+                        <td className="px-4 py-2">
+                          {receipt.channelAccountId
+                            ? <code className="text-xs break-all">{receipt.channelAccountId}</code>
+                            : "-"}
+                          {receipt.workspaceId && (
+                            <div className="text-xs text-slate-500 dark:text-slate-400 break-all">{receipt.workspaceId}</div>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 whitespace-nowrap">
+                          <button
+                            type="button"
+                            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 dark:border-slate-700 dark:text-slate-300"
+                            onClick={() => setExpandedId(expanded ? null : receipt.id)}
+                          >
+                            {expanded ? t("admin.webhookLog.hide") : t("admin.webhookLog.details")}
+                          </button>
+                        </td>
+                      </tr>
+                      {expanded && (
+                        <tr className="border-t border-slate-100 dark:border-slate-800">
+                          <td colSpan={7} className="px-4 py-3 bg-slate-50/60 dark:bg-slate-800/30">
+                            {receipt.error && (
+                              <p className="mb-2 text-sm text-rose-700 dark:text-rose-300">
+                                {t("admin.webhookLog.errorLabel")}: {receipt.error}
+                              </p>
+                            )}
+                            {receipt.payloadSummary !== null ? (
+                              <pre className="max-h-96 overflow-auto whitespace-pre-wrap break-all rounded-md bg-white p-3 font-mono text-xs text-slate-700 dark:bg-slate-900 dark:text-slate-200">{receipt.payloadSummary}</pre>
+                            ) : (
+                              <p className="text-sm text-slate-500 dark:text-slate-400">{t("admin.webhookLog.noPayload")}</p>
+                            )}
+                          </td>
+                        </tr>
+                      )}
+                    </Fragment>
+                  );
+                })}
               </tbody>
             </table>
           )}

@@ -5,6 +5,7 @@ import { createApp, type ApiDeps } from "./app";
 import { InMemoryAdminStore } from "./admin";
 import { InMemoryAuthStore } from "./auth";
 import { InMemoryVault } from "./whatsapp-onboarding";
+import { InMemoryWebhookReceiptRecorder } from "./webhook-receipts";
 
 /** Fixed 32-byte vault key for the in-memory platform-settings service. */
 export const TEST_VAULT_KEY = Buffer.alloc(32, 7);
@@ -94,6 +95,7 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
       async checkRedis() { return { ok: false, detail: "not configured (test)" }; },
     },
     adminStore: new InMemoryAdminStore(),
+    webhookReceiptStore: new InMemoryWebhookReceiptRecorder(),
     platformSettings: new PlatformSettingsService(new InMemoryPlatformSettingsStorage(), {
       baseEnv: env,
       liveEnv: env,
