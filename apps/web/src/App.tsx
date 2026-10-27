@@ -7911,6 +7911,16 @@ function AuthedApp() {
           <LanguageSwitcher />
           <ThemeToggle />
         </div>
+        {/*
+          Pages load their data on mount, while the API client reads the
+          workspace id per request - so without a remount, switching
+          workspaces changed only future requests and the mounted page
+          kept showing the previous workspace until a manual refresh
+          (owner report 2026-10-28). Keying the page region by
+          workspaceId makes a switch remount the page, exactly like the
+          refresh users were forced to do.
+        */}
+        <div key={workspaceId}>
         {page === "dashboard" && <DashboardPage goTo={setPage} />}
         {page === "inbox" && <InboxPage liveEvent={liveEvent} />}
         {page === "contacts" && <ContactsPage />}
@@ -7931,6 +7941,7 @@ function AuthedApp() {
           />
         )}
         {page === "admin" && user.isPlatformAdmin && <AdminPage />}
+        </div>
       </main>
       {showNewWorkspace && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/60 p-4" onClick={() => setShowNewWorkspace(false)}>
