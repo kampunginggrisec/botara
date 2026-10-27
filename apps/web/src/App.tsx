@@ -25,6 +25,7 @@ import { downloadFlowExport, parseFlowImport } from "./flows/flow-transfer";
 import { RICH_BUTTONS_EXAMPLE, RICH_BUTTONS_EXAMPLE_COMPOSER } from "./rich-example";
 import { dismissToast, getToasts, pushToast, subscribeToasts } from "./toast";
 import { VariablePicker } from "./variable-picker";
+import { InstagramAutomation } from "./instagram-automation";
 import { RECIPIENT_STATUSES, broadcastCostUsd, formatUsd, recipientStatusTone, recipientTimeline } from "./broadcast-recipients";
 import { formatDealMoney, groupDealsByStage, movedStageOrder, visibleDeals } from "./deals";
 import { formatMinutes, isStatsInsights, responseDelta } from "./insights";
@@ -316,6 +317,11 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   // AI analysis (package #7): the header's Analyze/Refresh button.
   const [aiAnalyzeBusy, setAiAnalyzeBusy] = useState(false);
   const [checkBusy, setCheckBusy] = useState(false);
+  // Quoted reply (WA-2): the message the NEXT reply quotes, if any. The
+  // API resolves it to the provider id, so only the local id travels.
+  const [quote, setQuote] = useState<Message | null>(null);
+  // Typing indicator (WA-3): throttled so a keystroke burst is one call.
+  const typingSentAtRef = useRef(0);
 
   const showButtons = richKind === "buttons";
 
@@ -526,13 +532,37 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
   const openConversation = async (conv: Conversation) => {
     setSelected(conv);
     setWindowClosed(false);
+    // A quote belongs to the thread it was picked in - never carry it over.
+    if (selectedRef.current?.id !== conv.id) setQuote(null);
     try {
       const data = await api.listMessages(conv.id);
       setMessages(data.messages);
     } catch (err) {
       setError(errText(err, t("inbox.messagesFailed")));
     }
+    // Presence (WA-3): opening the thread acknowledges the customer's
+    // messages on the provider side (WhatsApp blue ticks / "seen").
+    // Best-effort and unawaited: presence never blocks reading a thread.
+    void api.markConversationRead(conv.id).catch(() => undefined);
   };
+
+  // Typing indicator (WA-3): the first keystroke after a pause tells the
+  // provider "typing", and 3s of silence clears it. Throttled through a
+  // ref so a fast typist produces one call per window, not one per key.
+  useEffect(() => {
+    const conversationId = selected?.id;
+    if (!conversationId || composerMode !== "reply" || !replyText) return;
+    const now = Date.now();
+    if (now - typingSentAtRef.current > 3000) {
+      typingSentAtRef.current = now;
+      void api.sendTyping(conversationId, true).catch(() => undefined);
+    }
+    const stop = setTimeout(() => {
+      typingSentAtRef.current = 0;
+      void api.sendTyping(conversationId, false).catch(() => undefined);
+    }, 3000);
+    return () => clearTimeout(stop);
+  }, [replyText, selected?.id, composerMode]);
 
   const sendReply = async () => {
     if (!selected || !replyText.trim()) return;
@@ -556,7 +586,12 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
               text: replyText.trim(),
             }
           : undefined;
-      const res = await api.reply(selected.id, { kind: "free_form", text: replyText.trim(), ...(rich ? { rich } : {}) });
+      const res = await api.reply(selected.id, {
+        kind: "free_form",
+        text: replyText.trim(),
+        ...(rich ? { rich } : {}),
+        ...(quote ? { replyToMessageId: quote.id } : {}),
+      });
       if (res.warnings && res.warnings.length > 0) {
         setRichWarning(t("inbox.richDegraded", { warnings: res.warnings.join(", ") }));
       }
@@ -564,6 +599,7 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
         pushToast("err", t("inbox.variablesUnknown", { vars: res.interpolationWarnings.join(", ") }));
       }
       setReplyText("");
+      setQuote(null);
       setRichButtons([]);
       setRichKind("none");
       setProductCatalogId("");
@@ -814,6 +850,24 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                             </span>
                           )}
                           <MessageStatusLine message={m} />
+                          {/* Quote (WA-2): provider-native quote of THIS
+                              message on the next reply. A message that
+                              never reached the provider has no external
+                              id, so it is not quotable. */}
+                          {m.externalId && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setQuote(m);
+                                setComposerMode("reply");
+                                replyTextareaRef.current?.focus();
+                              }}
+                              title={t("inbox.quote")}
+                              className="rounded px-1 font-medium underline-offset-2 hover:underline"
+                            >
+                              {t("inbox.quote")}
+                            </button>
+                          )}
                         </div>
                       </div>
                       <MessageMediaList message={m} />
@@ -855,6 +909,27 @@ function InboxPage({ liveEvent }: { liveEvent: InboxRealtimeEvent | null }) {
                     {t("inbox.modeNote")}
                   </button>
                 </div>
+                {composerMode === "reply" && quote && (
+                  <div className="mb-2 flex items-start gap-2 rounded-md border-l-2 border-slate-400 bg-slate-50 px-2 py-1.5 dark:border-slate-500 dark:bg-slate-800/60">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400">
+                        {t("inbox.quoteActive")}
+                      </div>
+                      <div className="truncate text-xs text-slate-700 dark:text-slate-200">
+                        {quote.body ?? t("inbox.quoteNoBody")}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setQuote(null)}
+                      aria-label={t("inbox.quoteCancel")}
+                      title={t("inbox.quoteCancel")}
+                      className="rounded px-1 text-sm text-slate-500 hover:text-slate-800 dark:text-slate-400 dark:hover:text-slate-100"
+                    >
+                      ×
+                    </button>
+                  </div>
+                )}
                 <div className="flex gap-2">
                   <textarea
                     ref={replyTextareaRef}
@@ -1528,6 +1603,39 @@ function ContactsPage() {
 
 // --------------------------------------------------------------- Broadcast
 
+/**
+ * Count `{{n}}` body placeholders the way the API does: distinct indexes,
+ * sequential from {{1}}. This is only the composer's live hint - the server
+ * is the authority, and the pre-send gate uses the stored tree.
+ */
+function countBodyPlaceholders(text: string): number {
+  const found = [...text.matchAll(/\{\{\s*(\d+)\s*\}\}/g)].map((m) => Number(m[1]));
+  return new Set(found).size;
+}
+
+/** Body parameter count of a mirrored template, or null when unknown. */
+function templateParamCount(tpl: Template): number | null {
+  const body = (tpl.components ?? []).find((c) => String(c.type ?? "").toUpperCase() === "BODY");
+  if (!body || typeof body.text !== "string") return null;
+  return countBodyPlaceholders(body.text);
+}
+
+/** Approval status pill: green approved, amber pending, red rejected. */
+function templateStatusCls(status: string): string {
+  const normalized = status.toLowerCase();
+  const base = "text-xs px-2 py-0.5 rounded-full";
+  if (normalized === "approved") {
+    return `${base} bg-emerald-100 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300`;
+  }
+  if (normalized === "pending") {
+    return `${base} bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300`;
+  }
+  if (normalized === "rejected") {
+    return `${base} bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-300`;
+  }
+  return `${base} bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300`;
+}
+
 function BroadcastPage() {
   const { t } = useI18n();
   const [templates, setTemplates] = useState<Template[]>([]);
@@ -1563,6 +1671,16 @@ function BroadcastPage() {
   const [tplCategory, setTplCategory] = useState("marketing");
   const [tplExternalId, setTplExternalId] = useState("");
   const [tplBusy, setTplBusy] = useState(false);
+  const [tplSyncBusy, setTplSyncBusy] = useState(false);
+  // Template composer (WA-4 write path): the component tree an operator
+  // builds here is what Meta reviews. Kept as flat fields - a nested editor
+  // would be more "correct" and far worse to use for a 3-field template.
+  const [tplHeader, setTplHeader] = useState("");
+  const [tplBodyText, setTplBodyText] = useState("");
+  const [tplFooter, setTplFooter] = useState("");
+  const [tplButtons, setTplButtons] = useState<Array<{ type: string; text: string; url: string }>>([]);
+  const [tplSubmitBusy, setTplSubmitBusy] = useState(false);
+  const [tplDeletingId, setTplDeletingId] = useState<string | null>(null);
   const [categoryDrafts, setCategoryDrafts] = useState<Record<string, string>>({});
 
   const loadTemplates = useCallback(async () => {
@@ -1660,6 +1778,91 @@ function BroadcastPage() {
     }
   };
 
+  /**
+   * Template sync (WA-4): pull the WABA's real templates from Meta so the
+   * panel sees approval status and categories instead of hand-typed rows.
+   */
+  const syncTemplatesFromMeta = async () => {
+    const accountId = tplAccountId || channelAccountId;
+    if (!accountId) return;
+    setTplSyncBusy(true);
+    try {
+      const res = await api.syncTemplates(accountId);
+      await loadTemplates();
+      pushToast("ok", t("broadcast.templateSyncDone", {
+        count: String(res.templates), created: String(res.created), updated: String(res.updated),
+      }));
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.templateSyncFailed")));
+    } finally {
+      setTplSyncBusy(false);
+    }
+  };
+
+  /**
+   * Submit the composer's component tree to Meta (WA-4). The API validates
+   * it first, so a rule violation comes back as a readable 400 without
+   * spending a Meta review round-trip. Meta's answer is normally `pending`:
+   * the row becomes sendable only after review, which a sync picks up.
+   */
+  const submitTemplateToMeta = async () => {
+    const accountId = tplAccountId || channelAccountId;
+    if (!accountId) return;
+    const buttons = tplButtons
+      .filter((b) => b.text.trim().length > 0)
+      .map((b) => (b.type === "URL"
+        ? { type: b.type, text: b.text.trim(), url: b.url.trim() }
+        : { type: b.type, text: b.text.trim() }));
+    const components = [
+      ...(tplHeader.trim() ? [{ type: "HEADER", format: "TEXT", text: tplHeader.trim() }] : []),
+      { type: "BODY", text: tplBodyText.trim() },
+      ...(tplFooter.trim() ? [{ type: "FOOTER", text: tplFooter.trim() }] : []),
+      ...(buttons.length > 0 ? [{ type: "BUTTONS", buttons }] : []),
+    ];
+    setTplSubmitBusy(true);
+    try {
+      const res = await api.submitTemplate({
+        channelAccountId: accountId,
+        name: tplName.trim(),
+        language: tplLanguage.trim() || undefined,
+        category: tplCategory,
+        components,
+      });
+      // Upsert into the list: submitting an existing name/language UPDATES
+      // the mirror row, so appending would show the template twice.
+      setTemplates((prev) => {
+        const idx = prev.findIndex((x) => x.id === res.template.id);
+        if (idx >= 0) return prev.map((x) => (x.id === res.template.id ? res.template : x));
+        return [...prev, res.template];
+      });
+      setTplHeader("");
+      setTplBodyText("");
+      setTplFooter("");
+      setTplButtons([]);
+      pushToast("ok", t("broadcast.templateSubmitted", { status: res.template.status }));
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.templateSubmitFailed")));
+    } finally {
+      setTplSubmitBusy(false);
+    }
+  };
+
+  /** Delete a template: Meta first, then the local row (API enforces it). */
+  const removeTemplate = async (tpl: Template) => {
+    if (!window.confirm(t("broadcast.templateDeleteConfirm", { name: tpl.name }))) return;
+    setTplDeletingId(tpl.id);
+    try {
+      await api.deleteTemplate(tpl.id);
+      setTemplates((prev) => prev.filter((x) => x.id !== tpl.id));
+      if (templateId === tpl.id) setTemplateId("");
+      pushToast("ok", t("broadcast.templateDeleted"));
+    } catch (err) {
+      pushToast("err", errText(err, t("broadcast.templateDeleteFailed")));
+    } finally {
+      setTplDeletingId(null);
+    }
+  };
+
   const correctCategory = async (tpl: Template) => {
     const latestCategory = categoryDrafts[tpl.id] ?? tpl.latestCategory ?? tpl.category ?? "marketing";
     try {
@@ -1673,6 +1876,21 @@ function BroadcastPage() {
 
   const selectedTemplate = templates.find((tpl) => tpl.id === templateId);
   const category = (selectedTemplate?.latestCategory ?? selectedTemplate?.category ?? "marketing").toLowerCase();
+  /**
+   * Size the parameter inputs to the selected template's real body: too few
+   * values fails per recipient at the provider, too many is rejected
+   * outright. Null (hand-registered row, no tree) leaves the operator in
+   * charge.
+   */
+  const selectedParamCount = selectedTemplate ? templateParamCount(selectedTemplate) : null;
+  useEffect(() => {
+    if (selectedParamCount === null) return;
+    setTemplateParams((prev) => {
+      if (prev.length === selectedParamCount) return prev;
+      if (prev.length > selectedParamCount) return prev.slice(0, selectedParamCount);
+      return [...prev, ...Array.from({ length: selectedParamCount - prev.length }, () => "")];
+    });
+  }, [selectedParamCount]);
 
   const doEstimate = async () => {
     setBusy(true);
@@ -1943,73 +2161,194 @@ function BroadcastPage() {
           <div className="mt-2 text-sm text-slate-500 dark:text-slate-400">{t("broadcast.templatesEmpty")}</div>
         ) : (
           <div className="mt-3 space-y-2">
-            {templates.map((tpl) => (
-              <div key={tpl.id} className="flex flex-wrap items-center gap-2 rounded-md border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
-                <span className="font-medium">{tpl.name}</span>
-                <span className={chipCls}>{tpl.language}</span>
-                <span className={chipCls}>{tpl.latestCategory ?? tpl.category ?? "-"}</span>
-                <span className={chipCls}>{tpl.status}</span>
-                <span className="ml-auto flex items-center gap-2">
-                  <label className="text-xs text-slate-500 dark:text-slate-400">{t("broadcast.correctCategory")}</label>
-                  <select
-                    value={categoryDrafts[tpl.id] ?? tpl.latestCategory ?? tpl.category ?? "marketing"}
-                    onChange={(e) => setCategoryDrafts((prev) => ({ ...prev, [tpl.id]: e.target.value }))}
-                    className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-                  >
-                    <option value="marketing">marketing</option>
-                    <option value="utility">utility</option>
-                    <option value="authentication">authentication</option>
-                  </select>
-                  <button onClick={() => void correctCategory(tpl)} className="text-xs text-slate-600 underline dark:text-slate-300">
-                    {t("common.save")}
-                  </button>
-                </span>
-              </div>
-            ))}
+            {templates.map((tpl) => {
+              const paramCount = templateParamCount(tpl);
+              return (
+                <div key={tpl.id} className="rounded-md border border-slate-200 px-3 py-2 text-sm dark:border-slate-700">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <span className="font-medium">{tpl.name}</span>
+                    <span className={chipCls}>{tpl.language}</span>
+                    <span className={chipCls}>{tpl.latestCategory ?? tpl.category ?? "-"}</span>
+                    {/* WA-4: the status is Meta's, mirrored by a sync - it is
+                        what the broadcast pre-send gate reads. */}
+                    <span className={templateStatusCls(tpl.status)}>{tpl.status}</span>
+                    {paramCount !== null && (
+                      <span className={chipCls}>{t("broadcast.templateParamsChip", { count: String(paramCount) })}</span>
+                    )}
+                    <span className="ml-auto flex items-center gap-2">
+                      <label className="text-xs text-slate-500 dark:text-slate-400">{t("broadcast.correctCategory")}</label>
+                      <select
+                        value={categoryDrafts[tpl.id] ?? tpl.latestCategory ?? tpl.category ?? "marketing"}
+                        onChange={(e) => setCategoryDrafts((prev) => ({ ...prev, [tpl.id]: e.target.value }))}
+                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                      >
+                        <option value="marketing">marketing</option>
+                        <option value="utility">utility</option>
+                        <option value="authentication">authentication</option>
+                      </select>
+                      <button onClick={() => void correctCategory(tpl)} className="text-xs text-slate-600 underline dark:text-slate-300">
+                        {t("common.save")}
+                      </button>
+                      <button
+                        onClick={() => void removeTemplate(tpl)}
+                        disabled={tplDeletingId === tpl.id}
+                        className="text-xs text-red-600 underline disabled:opacity-50 dark:text-red-400"
+                      >
+                        {tplDeletingId === tpl.id ? t("broadcast.templateDeleting") : t("broadcast.templateDelete")}
+                      </button>
+                    </span>
+                  </div>
+                  {tpl.rejectedReason && (
+                    <p className="mt-1 text-xs text-red-600 dark:text-red-400">
+                      {t("broadcast.templateRejectedReason", { reason: tpl.rejectedReason })}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <div>
-            <label className={labelCls}>{t("broadcast.templateAccount")}</label>
-            {waAccounts.length > 0 ? (
-              <select value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} className={inputCls}>
-                <option value="">-</option>
-                {waAccounts.map((a) => (
-                  <option key={a.id} value={a.id}>{a.displayName ?? a.externalId}</option>
-                ))}
+        {/* WA-4 write path: build the component tree, submit it to Meta,
+            then sync once it is approved. The composer is deliberately
+            TEXT-header + text body + footer + quick-reply/URL buttons -
+            the shapes that cover almost every real template. */}
+        <div className="mt-4 border-t border-slate-200 pt-4 dark:border-slate-700">
+          <div className="text-sm font-medium">{t("broadcast.templateComposeTitle")}</div>
+          <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{t("broadcast.templateComposeHint")}</p>
+          <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label className={labelCls}>{t("broadcast.templateAccount")}</label>
+              {waAccounts.length > 0 ? (
+                <select value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} className={inputCls}>
+                  <option value="">-</option>
+                  {waAccounts.map((a) => (
+                    <option key={a.id} value={a.id}>{a.displayName ?? a.externalId}</option>
+                  ))}
+                </select>
+              ) : (
+                <input value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} placeholder={t("broadcast.accountIdPlaceholder")} className={inputCls} />
+              )}
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateName")}</label>
+              <input value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder={t("broadcast.templateNamePlaceholder")} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateLanguage")}</label>
+              <input value={tplLanguage} onChange={(e) => setTplLanguage(e.target.value)} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateCategory")}</label>
+              <select value={tplCategory} onChange={(e) => setTplCategory(e.target.value)} className={inputCls}>
+                <option value="marketing">marketing</option>
+                <option value="utility">utility</option>
+                <option value="authentication">authentication</option>
               </select>
-            ) : (
-              <input value={tplAccountId} onChange={(e) => setTplAccountId(e.target.value)} placeholder={t("broadcast.accountIdPlaceholder")} className={inputCls} />
-            )}
+            </div>
           </div>
-          <div>
-            <label className={labelCls}>{t("broadcast.templateName")}</label>
-            <input value={tplName} onChange={(e) => setTplName(e.target.value)} placeholder={t("broadcast.templateNamePlaceholder")} className={inputCls} />
+          <div className="mt-3 space-y-3">
+            <div>
+              <label className={labelCls}>{t("broadcast.templateHeaderField")}</label>
+              <input value={tplHeader} onChange={(e) => setTplHeader(e.target.value)} maxLength={60} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateBodyField")}</label>
+              <textarea
+                value={tplBodyText}
+                onChange={(e) => setTplBodyText(e.target.value)}
+                rows={4}
+                maxLength={1024}
+                placeholder={t("broadcast.templateBodyPlaceholder")}
+                className={inputCls}
+              />
+              <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
+                {t("broadcast.templateBodyParamsHint", { count: String(countBodyPlaceholders(tplBodyText)) })}
+              </p>
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateFooterField")}</label>
+              <input value={tplFooter} onChange={(e) => setTplFooter(e.target.value)} maxLength={60} className={inputCls} />
+            </div>
+            <div>
+              <label className={labelCls}>{t("broadcast.templateButtons")}</label>
+              {tplButtons.map((button, index) => (
+                <div key={index} className="mb-2 flex flex-wrap items-center gap-2">
+                  <select
+                    value={button.type}
+                    onChange={(e) => setTplButtons((prev) => prev.map((b, i) => (i === index ? { ...b, type: e.target.value } : b)))}
+                    className="rounded-md border border-slate-300 bg-white px-2 py-1.5 text-xs dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
+                  >
+                    <option value="QUICK_REPLY">QUICK_REPLY</option>
+                    <option value="URL">URL</option>
+                  </select>
+                  <input
+                    value={button.text}
+                    onChange={(e) => setTplButtons((prev) => prev.map((b, i) => (i === index ? { ...b, text: e.target.value } : b)))}
+                    maxLength={25}
+                    placeholder={t("broadcast.templateButtonLabel")}
+                    className={`${inputCls} max-w-[12rem]`}
+                  />
+                  {button.type === "URL" && (
+                    <input
+                      value={button.url}
+                      onChange={(e) => setTplButtons((prev) => prev.map((b, i) => (i === index ? { ...b, url: e.target.value } : b)))}
+                      placeholder="https://example.com"
+                      className={`${inputCls} max-w-[16rem]`}
+                    />
+                  )}
+                  <button
+                    onClick={() => setTplButtons((prev) => prev.filter((_, i) => i !== index))}
+                    className="text-xs text-red-600 underline dark:text-red-400"
+                  >
+                    {t("templateParams.remove")}
+                  </button>
+                </div>
+              ))}
+              <button
+                onClick={() => setTplButtons((prev) => [...prev, { type: "QUICK_REPLY", text: "", url: "" }])}
+                className="text-xs text-slate-600 underline dark:text-slate-300"
+              >
+                {t("broadcast.templateAddButton")}
+              </button>
+            </div>
           </div>
-          <div>
-            <label className={labelCls}>{t("broadcast.templateLanguage")}</label>
-            <input value={tplLanguage} onChange={(e) => setTplLanguage(e.target.value)} className={inputCls} />
-          </div>
-          <div>
-            <label className={labelCls}>{t("broadcast.templateCategory")}</label>
-            <select value={tplCategory} onChange={(e) => setTplCategory(e.target.value)} className={inputCls}>
-              <option value="marketing">marketing</option>
-              <option value="utility">utility</option>
-              <option value="authentication">authentication</option>
-            </select>
-          </div>
-          <div>
-            <label className={labelCls}>{t("broadcast.templateExternalId")}</label>
-            <input value={tplExternalId} onChange={(e) => setTplExternalId(e.target.value)} className={inputCls} />
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              onClick={() => void submitTemplateToMeta()}
+              disabled={tplSubmitBusy || !tplName.trim() || !tplBodyText.trim() || !(tplAccountId || channelAccountId)}
+              className={primaryBtn}
+            >
+              {tplSubmitBusy ? t("broadcast.templateSubmitting") : t("broadcast.templateSubmit")}
+            </button>
+            {/* Sync pulls what Meta actually approved (status + category), so a
+                broadcast is never built on an unapproved template. */}
+            <button
+              onClick={() => void syncTemplatesFromMeta()}
+              disabled={tplSyncBusy || !(tplAccountId || channelAccountId)}
+              className="rounded-md border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700 disabled:opacity-50 dark:border-slate-700 dark:text-slate-200"
+            >
+              {tplSyncBusy ? t("broadcast.templateSyncing") : t("broadcast.templateSync")}
+            </button>
           </div>
         </div>
-        <button
-          onClick={() => void registerTemplate()}
-          disabled={tplBusy || !tplName.trim() || !(tplAccountId || channelAccountId)}
-          className={`mt-3 ${primaryBtn}`}
-        >
-          {t("broadcast.registerTemplate")}
-        </button>
+        {/* Escape hatch: a template approved outside Botara (Business
+            Manager, another tool) can still be registered by hand. */}
+        <details className="mt-4">
+          <summary className="cursor-pointer text-xs text-slate-500 dark:text-slate-400">
+            {t("broadcast.templateAdvanced")}
+          </summary>
+          <div className="mt-3">
+            <label className={labelCls}>{t("broadcast.templateExternalId")}</label>
+            <input value={tplExternalId} onChange={(e) => setTplExternalId(e.target.value)} className={inputCls} />
+            <button
+              onClick={() => void registerTemplate()}
+              disabled={tplBusy || !tplName.trim() || !(tplAccountId || channelAccountId)}
+              className={`mt-3 ${outlineBtn}`}
+            >
+              {t("broadcast.registerTemplate")}
+            </button>
+          </div>
+        </details>
       </div>
     </div>
   );
@@ -4613,6 +4952,9 @@ function ChannelsPage() {
           </div>
         </div>
       )}
+      {/* IG-1 / IG-2: provider-side automation for the connected Instagram
+          (and Messenger) accounts. Renders nothing when neither exists. */}
+      <InstagramAutomation accounts={accounts} />
     </div>
   );
 }

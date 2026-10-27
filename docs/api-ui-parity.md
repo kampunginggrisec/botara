@@ -31,9 +31,14 @@ classification entry goes stale (route deleted, or a UI caller appeared).
    its classification entry (the guard's stale-entry checks fail until
    you do).
 
-## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27, #10 rows added 2026-10-27)
+## Parity table (post-fix state, 2026-10-26; #9 rows added 2026-10-27, #10 rows added 2026-10-27; WA-2/WA-3 presence rows added 2026-10-27; WA-4 template write rows added 2026-10-27; IG-1/IG-2 automation rows added 2026-10-27)
 
-148 routes: 120 UI · 18 WEBHOOK · 10 API-ONLY.
+214 routes: 186 UI · 18 WEBHOOK · 10 API-ONLY.
+
+(The counts are `app.routes` de-duplicated at method+path granularity, minus the
+18+10 classified rows. The previous header read "150 routes: 122 UI" — that
+snapshot was never refreshed as later packages added routes; the guard, not this
+number, is what enforces coverage.)
 
 ### Auth & session
 
@@ -86,7 +91,9 @@ classification entry goes stale (route deleted, or a UI caller appeared).
 |---|---|---|
 | GET /conversations | UI | Inbox list |
 | GET /conversations/{}/messages | UI | Inbox thread |
-| POST /conversations/{}/reply | UI | Inbox composer |
+| POST /conversations/{}/reply | UI | Inbox composer; `replyToMessageId` quotes a message of the same thread (WA-2 — WhatsApp `context.message_id`, Messenger/IG `reply_to`) |
+| POST /conversations/{}/read | UI | Inbox: opening a thread marks it read on the provider (WA-3 — WhatsApp `PUT /messages` blue ticks, Messenger/IG `mark_seen`). Best-effort: `{read:false,reason}` for channels without a read surface |
+| POST /conversations/{}/typing | UI | Inbox composer: throttled typing indicator while the agent types (WA-3 — WhatsApp `typing_indicator`, Messenger/IG `typing_on`/`typing_off`) |
 | PATCH /conversations/{}/assign | UI | Inbox header assignee select |
 | PATCH /conversations/{}/status | UI | Inbox header status select |
 | POST /conversations/{}/ai-suggest | UI | Inbox composer "AI suggest" (F4) — fills the draft, never auto-sends; honest 503 toast when no AI provider is configured |
@@ -135,6 +142,14 @@ same contact the Contacts page edits.
 | DELETE /channels/email/domains/{} | UI | Email domains card → Delete |
 | GET /channels/{}/catalog | UI | Channels → WhatsApp catalog summary |
 | POST /channels/{}/catalog/sync | UI | Channels → Sync catalog |
+| GET /channels/{}/welcome-flows | UI | Channels → Instagram automation → welcome flow list (IG-1) |
+| POST /channels/{}/welcome-flows | UI | Instagram automation → "New flow" (IG-1). Validated server-side against Meta's limits before the provider call |
+| GET /channels/{}/welcome-flows/{} | UI | Instagram automation → Edit: re-reads the flow before editing, because an update replaces the whole body |
+| PATCH /channels/{}/welcome-flows/{} | UI | Instagram automation → Save on an existing flow (IG-1) |
+| DELETE /channels/{}/welcome-flows/{} | UI | Instagram automation → Delete flow (IG-1) |
+| GET /channels/{}/messenger-profile | UI | Instagram automation → persistent menu + ice breakers (IG-2) |
+| PUT /channels/{}/messenger-profile | UI | Instagram automation → "Save menu" / "Save ice breakers". Only the sections present are replaced |
+| DELETE /channels/{}/messenger-profile | UI | Instagram automation → "Remove menu" / "Remove ice breakers" (field-scoped delete) |
 | GET /catalog-products | UI | Inbox product picker; Flows rich blocks |
 
 Email domains (F2): the API exposes domain registration only — a domain
@@ -156,7 +171,10 @@ Resend; the status shown is the stored verification state.
 | GET /broadcasts/{}/recipients | UI | Broadcast detail → per-recipient delivery records with status filter + per-status counts (package #4) |
 | POST /broadcasts/{}/resend-failed | UI | Broadcast detail → "Resend to failed" re-queues only the failed recipients (package #4) |
 | GET /templates | UI | Broadcast form + template manager (F6); Inbox template replies |
-| POST /templates | UI | Broadcast → Template manager register form (F6). Fields match the API schema exactly: channelAccountId, name, language?, category?, externalId? |
+| POST /templates | UI | Broadcast → Template manager → "Register a template that already exists in Meta" (advanced). Fields match the API schema exactly: channelAccountId, name, language?, category?, externalId? |
+| POST /templates/sync | UI | Template manager → "Sync from Meta" (WA-4). Mirrors the WABA's real templates: name, language, approval status, category, component tree, rejection reason |
+| POST /templates/submit | UI | Template manager → composer + "Submit to Meta" (WA-4). The component tree is validated server-side before the provider call; the mirrored status is Meta's (normally `pending`) |
+| DELETE /templates/{} | UI | Template manager → per-template "Delete". Meta is deleted first, the local row second |
 | PATCH /templates/{}/category | UI | Template manager → per-template category correction (F6) |
 
 ### Deals & pipelines (package #6)

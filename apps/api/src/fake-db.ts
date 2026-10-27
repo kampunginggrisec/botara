@@ -316,6 +316,20 @@ class FakeDelete {
   private whereCond: unknown = null;
   constructor(private readonly core: FakeCore, private readonly table: unknown) {}
   where(cond: unknown): this { this.whereCond = cond; return this; }
+  /**
+   * Drizzle's `.returning()` on a delete resolves the rows it removed (the
+   * repositories use it to report "did anything match"). Same removal, with
+   * the rows handed back in table order.
+   */
+  returning(): Promise<Row[]> {
+    const { filters } = parseCondition(this.whereCond);
+    const rows = this.core.rowsOf(this.table);
+    const removed: Row[] = [];
+    for (let i = rows.length - 1; i >= 0; i--) {
+      if (filters.every((f) => matchesFilter(rows[i]![f.key], f))) removed.unshift(rows.splice(i, 1)[0]!);
+    }
+    return Promise.resolve(removed);
+  }
   then<TResult1 = void, TResult2 = never>(
     onFulfilled?: ((value: void) => TResult1 | PromiseLike<TResult1>) | null,
     onRejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,

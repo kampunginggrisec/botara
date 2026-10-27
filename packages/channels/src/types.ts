@@ -244,6 +244,13 @@ export interface SendInput {
    * message that opens a DM from a comment; mutually exclusive with it.
    */
   commentReplyExternalId?: string;
+  /**
+   * Reply/quote target: the provider message id this send answers.
+   * WhatsApp carries it as `context.message_id`, Messenger and Instagram
+   * as `reply_to.mid`. Channels without a reply surface ignore it; the
+   * caller passes the message row's `externalId` (never a local id).
+   */
+  replyToExternalId?: string;
   /** REQUIRED: providers are called with this key so retries never double-send. */
   idempotencyKey: string;
   /**
@@ -315,9 +322,107 @@ export interface ChannelAdapter {
   moderate?(input: { account: ChannelAccountRef; targetExternalId: string; action: "hide" | "unhide" | "delete" | "reply"; text?: string }): Promise<void>;
   fetchInsights?(input: { account: ChannelAccountRef; targetExternalId?: string }): Promise<Record<string, number>>;
 
+  /**
+   * Mark the CUSTOMER's side as read on the provider (WhatsApp blue
+   * ticks, Messenger/Instagram "seen"). Optional: channels without a
+   * read surface omit the method entirely rather than faking it.
+   *
+   * Providers address read receipts differently, so BOTH ids travel:
+   * WhatsApp needs the inbound message's provider id (wamid) for
+   * `PUT /{phone}/messages`, Meta messaging needs the customer id (PSID
+   * / IGSID) because `mark_seen` marks the whole thread. An adapter
+   * throws VALIDATION when the id its provider needs is missing.
+   */
+  markRead?(input: {
+    account: ChannelAccountRef;
+    contactExternalId: string;
+    messageExternalId?: string;
+  }): Promise<void>;
+  /**
+   * Typing indicator toward a contact. Best-effort and transient: the
+   * provider clears it on its own (WhatsApp after ~25s or on the next
+   * outbound message, Meta messaging surfaces on `typing_off`). `on:
+   * false` is a no-op on channels that only have a one-shot indicator.
+   */
+  typing?(input: { account: ChannelAccountRef; toExternalId: string; on: boolean }): Promise<void>;
+
+  /**
+   * Instagram welcome message flows (IG-1): the automated first reply a
+   * professional account sends to a brand-new DM thread, managed on the
+   * provider rather than in Botara's own flow engine.
+   *
+   * Grouped into one optional capability (rather than five loose methods)
+   * because a channel either has the surface or does not - the API can then
+   * answer "unsupported_channel" with a single check.
+   */
+  welcomeFlows?: WelcomeFlowsCapability;
+
+  /**
+   * Messaging profile (IG-2): persistent menu, ice breakers and the Get
+   * Started button. Instagram and Messenger share the endpoint shape but
+   * differ in addressing (IG uses the account id, Messenger `me`).
+   */
+  messengerProfile?: MessengerProfileCapability;
+
   /** Normalize a raw provider webhook payload into standardized events. */
   parseWebhook(payload: unknown): Promise<InboundEvent[]>;
   health(): Promise<AdapterHealth>;
+}
+
+/**
+ * One welcome message flow as the provider stores it. `flow` is kept as
+ * the provider's own array (a `message` with optional `quick_replies`) so
+ * nothing is lost on read-modify-write.
+ */
+export interface WelcomeMessageFlow {
+  id: string;
+  name: string;
+  flow: unknown[];
+  /** Provider timestamp, when reported (IG returns `last_update_time`). */
+  lastUpdateTime?: string;
+  /** True when the flow is currently attached to an ad. */
+  isUsedInAd?: boolean;
+}
+
+export interface WelcomeFlowsCapability {
+  list(input: { account: ChannelAccountRef; limit?: number; maxPages?: number }): Promise<WelcomeMessageFlow[]>;
+  get(input: { account: ChannelAccountRef; flowId: string }): Promise<WelcomeMessageFlow | null>;
+  create(input: { account: ChannelAccountRef; name: string; flow: unknown[] }): Promise<{ id: string }>;
+  update(input: { account: ChannelAccountRef; flowId: string; name: string; flow: unknown[] }): Promise<{ id: string }>;
+  remove(input: { account: ChannelAccountRef; flowId: string }): Promise<void>;
+}
+
+/** One persistent-menu entry. */
+export interface PersistentMenuItem {
+  type: "postback" | "web_url";
+  title: string;
+  /** Required for `postback`. */
+  payload?: string;
+  /** Required for `web_url`. */
+  url?: string;
+}
+
+/** One ice breaker (a tappable starter question). */
+export interface IceBreaker {
+  question: string;
+  payload: string;
+}
+
+export interface MessengerProfileInput {
+  persistentMenu?: {
+    items: PersistentMenuItem[];
+    locale?: string;
+    composerInputDisabled?: boolean;
+  };
+  iceBreakers?: IceBreaker[];
+  /** Get Started button payload (Messenger only). */
+  getStarted?: string;
+}
+
+export interface MessengerProfileCapability {
+  get(input: { account: ChannelAccountRef; fields: string[] }): Promise<Record<string, unknown>>;
+  set(input: { account: ChannelAccountRef; profile: MessengerProfileInput }): Promise<void>;
+  remove(input: { account: ChannelAccountRef; fields: string[] }): Promise<void>;
 }
 
 /**

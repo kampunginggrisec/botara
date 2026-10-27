@@ -120,6 +120,13 @@
       "when": 1793044797384,
       "tag": "0016_romantic_owl",
       "breakpoints": true
+    },
+    {
+      "idx": 17,
+      "version": "7",
+      "when": 1793105622955,
+      "tag": "0017_template_components",
+      "breakpoints": true
     }
   ]
 }

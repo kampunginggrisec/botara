@@ -461,3 +461,154 @@ describe("whatsapp webhook security helpers", () => {
     expect(calls[0]!.init!.body).toBeInstanceOf(FormData);
   });
 });
+
+describe("whatsapp reply context (WA-2)", () => {
+  test("a reply carries context.message_id on the text body", async () => {
+    const { fetchFn, calls } = mockFetch([okSend]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.send({
+      account: ACCOUNT, toExternalId: "62812", text: "siap", idempotencyKey: "k",
+      replyToExternalId: "wamid.INBOUND",
+    });
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.context).toEqual({ message_id: "wamid.INBOUND" });
+  });
+
+  test("a reply on a template send carries the same context", async () => {
+    const { fetchFn, calls } = mockFetch([okSend]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.send({
+      account: ACCOUNT, toExternalId: "62812", idempotencyKey: "k",
+      replyToExternalId: "wamid.INBOUND",
+      template: { name: "promo", language: "id", latestCategory: "marketing" },
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).context).toEqual({ message_id: "wamid.INBOUND" });
+  });
+
+  test("no replyToExternalId means no context key at all", async () => {
+    const { fetchFn, calls } = mockFetch([okSend]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.send({ account: ACCOUNT, toExternalId: "62812", text: "halo", idempotencyKey: "k" });
+    expect(JSON.parse(calls[0]!.init!.body as string)).not.toHaveProperty("context");
+  });
+});
+
+describe("whatsapp presence (WA-3)", () => {
+  test("markRead PUTs status=read with the inbound message id", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { success: true } }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.markRead({ account: ACCOUNT, contactExternalId: "62812", messageExternalId: "wamid.IN" });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/1234567890/messages");
+    expect(calls[0]!.init!.method).toBe("PUT");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      messaging_product: "whatsapp", status: "read", message_id: "wamid.IN",
+    });
+  });
+
+  test("markRead without a message id fails validation instead of guessing", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await expect(wa.markRead({ account: ACCOUNT, contactExternalId: "62812" })).rejects.toThrow(/message id/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("typing on posts a typing_indicator message", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.typing({ account: ACCOUNT, toExternalId: "62812", on: true });
+    expect(calls[0]!.url).toEndWith("/v26.0/1234567890/messages");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      messaging_product: "whatsapp", recipient_type: "individual", to: "62812",
+      typing_indicator: { type: "text" },
+    });
+  });
+
+  test("typing off is a no-op (Meta clears the indicator itself)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.typing({ account: ACCOUNT, toExternalId: "62812", on: false });
+    expect(calls).toHaveLength(0);
+  });
+});
+
+describe("whatsapp templates (WA-4)", () => {
+  test("createMessageTemplate POSTs the component tree with an uppercased category", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "tpl-42", status: "PENDING", category: "UTILITY" } },
+    ]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    const created = await wa.createMessageTemplate(ACCOUNT, "waba-9", {
+      name: "order_update",
+      language: "id",
+      category: "utility",
+      components: [
+        { type: "HEADER", format: "TEXT", text: "Status pesanan" },
+        { type: "BODY", text: "Halo {{1}}, pesanan Anda siap." },
+        { type: "FOOTER", text: "Toko" },
+        { type: "BUTTONS", buttons: [{ type: "QUICK_REPLY", text: "Lacak" }] },
+      ],
+    });
+
+    expect(created).toEqual({ id: "tpl-42", status: "PENDING", category: "UTILITY" });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/waba-9/message_templates");
+    expect(calls[0]!.init!.method).toBe("POST");
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.name).toBe("order_update");
+    expect(sent.language).toBe("id");
+    // Meta expects the category in its own casing.
+    expect(sent.category).toBe("UTILITY");
+    expect(sent.components).toHaveLength(4);
+    expect(sent.allow_category_change).toBeUndefined();
+  });
+
+  test("allowCategoryChange is forwarded as allow_category_change", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { id: "tpl-43", status: "PENDING" } }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.createMessageTemplate(ACCOUNT, "waba-9", {
+      name: "order_update", language: "id", category: "marketing",
+      components: [{ type: "BODY", text: "Halo" }],
+      allowCategoryChange: true,
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).allow_category_change).toBe(true);
+  });
+
+  test("a Graph rejection surfaces as a provider error, never a silent success", async () => {
+    const { fetchFn } = mockFetch([
+      { status: 400, body: { error: { message: "Invalid parameter", code: 100, error_subcode: 2388024 } } },
+    ]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await expect(wa.createMessageTemplate(ACCOUNT, "waba-9", {
+      name: "bad", language: "id", category: "utility",
+      components: [{ type: "BODY", text: "Halo" }],
+    })).rejects.toThrow(/Invalid parameter/);
+  });
+
+  test("listMessageTemplates asks for components and the rejection reason", async () => {
+    const { fetchFn, calls } = mockFetch([
+      {
+        body: {
+          data: [{
+            id: "tpl-1", name: "order_update", language: "id", status: "REJECTED", category: "UTILITY",
+            rejected_reason: "INVALID_FORMAT",
+            components: [{ type: "BODY", text: "Halo {{1}}" }],
+          }],
+        },
+      },
+    ]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    const templates = await wa.listMessageTemplates(ACCOUNT, "waba-9");
+    expect(calls[0]!.url).toContain("components");
+    expect(calls[0]!.url).toContain("rejected_reason");
+    expect(templates[0]!.rejectedReason).toBe("INVALID_FORMAT");
+    expect(templates[0]!.components).toEqual([{ type: "BODY", text: "Halo {{1}}" }]);
+  });
+
+  test("deleteMessageTemplate deletes by name (all languages)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { success: true } }]);
+    const wa = new WhatsAppAdapter({ credentials: creds, fetchFn });
+    await wa.deleteMessageTemplate(ACCOUNT, "waba-9", "order update");
+    expect(calls[0]!.init!.method).toBe("DELETE");
+    // the name is the identity, so it must be URL-encoded, not interpolated raw
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/waba-9/message_templates?name=order%20update");
+  });
+});

@@ -206,9 +206,20 @@ export class WhatsAppAdapter implements ChannelAdapter {
     body: Record<string, unknown>,
     attemptedRoute?: WhatsAppRoute,
   ): Promise<Record<string, unknown>> {
+    return this.graphSend("POST", account, path, body, attemptedRoute);
+  }
+
+  /** POST/PUT with a JSON body (PUT is the read-receipt path). */
+  private async graphSend(
+    method: "POST" | "PUT",
+    account: ChannelAccountRef,
+    path: string,
+    body: Record<string, unknown>,
+    attemptedRoute?: WhatsAppRoute,
+  ): Promise<Record<string, unknown>> {
     const token = await this.tokenFor(account);
     const res = await this.fetchFn(`${this.baseUrl}/${this.apiVersion}/${path}`, {
-      method: "POST",
+      method,
       headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
       body: JSON.stringify(body),
     });
@@ -267,6 +278,10 @@ export class WhatsAppAdapter implements ChannelAdapter {
     } else {
       throw new AppError("VALIDATION", "whatsapp.send requires text, media, or a template");
     }
+
+    // Reply/quote: WhatsApp carries the quoted message as context.message_id
+    // on ANY message type (text, media, template, interactive).
+    if (input.replyToExternalId) body.context = { message_id: input.replyToExternalId };
 
     const json = await this.graphPost(input.account, `${phoneNumberId}/${route}`, body, route);
     const messages = json.messages as Array<{ id?: string }> | undefined;
@@ -392,6 +407,7 @@ export class WhatsAppAdapter implements ChannelAdapter {
       warnings.push("RICH_DEGRADED_TO_TEXT");
       body = { ...base, type: "text", text: { body: richToPlainText(rich) } };
     }
+    if (input.replyToExternalId) body.context = { message_id: input.replyToExternalId };
     const json = await this.graphPost(input.account, `${phoneNumberId}/messages`, body, "messages");
     const messages = json.messages as Array<{ id?: string }> | undefined;
     const externalMessageId = messages?.[0]?.id;
@@ -458,6 +474,165 @@ export class WhatsAppAdapter implements ChannelAdapter {
       });
     }
     return { data: await res.arrayBuffer(), mimeType: meta.mimeType, fileSize: meta.fileSize };
+  }
+
+  // --- presence (read receipts + typing) -----------------------------------
+
+  /**
+   * Mark the customer's message as READ: `PUT /{phone-number-id}/messages`
+   * with status "read". This is what turns the customer's ticks blue -
+   * the read status Botara stores from the `statuses` webhook is the
+   * OTHER direction (our own messages being read by the customer).
+   * Meta also bills nothing for it; it is a plain state update.
+   */
+  async markRead(input: {
+    account: ChannelAccountRef;
+    contactExternalId: string;
+    messageExternalId?: string;
+  }): Promise<void> {
+    // WhatsApp addresses the receipt by message id - without one there is
+    // nothing to acknowledge (never fall back to a guessed wamid).
+    if (!input.messageExternalId) {
+      throw new AppError("VALIDATION", "whatsapp.markRead requires the inbound message id (wamid).");
+    }
+    await this.graphSend("PUT", input.account, `${input.account.externalId}/messages`, {
+      messaging_product: "whatsapp",
+      status: "read",
+      message_id: input.messageExternalId,
+    });
+  }
+
+  /**
+   * Typing indicator (Cloud API `typing_indicator`). Meta shows it for
+   * ~25 seconds or until the next outbound message, so `on: false` has
+   * no request to send - it is a deliberate no-op rather than a fake
+   * call that would 400.
+   */
+  async typing(input: { account: ChannelAccountRef; toExternalId: string; on: boolean }): Promise<void> {
+    if (!input.on) return;
+    await this.graphPost(input.account, `${input.account.externalId}/messages`, {
+      messaging_product: "whatsapp",
+      recipient_type: "individual",
+      to: input.toExternalId,
+      typing_indicator: { type: "text" },
+    }, "messages");
+  }
+
+  // --- templates (WA-4) -----------------------------------------------------
+
+  /**
+   * List the WABA's message templates. This is the ONLY way Botara learns
+   * a template's real approval state - Meta owns it, the local table is a
+   * mirror. Paging is bounded (100/page, 10 pages by default) so a huge
+   * account cannot stall the API request.
+   */
+  async listMessageTemplates(
+    account: ChannelAccountRef,
+    wabaId: string,
+    options: { limit?: number; maxPages?: number } = {},
+  ): Promise<Array<{
+    id: string;
+    name: string;
+    language: string;
+    status: string;
+    category?: string;
+    components?: unknown[];
+    rejectedReason?: string;
+  }>> {
+    const limit = options.limit ?? 100;
+    const maxPages = options.maxPages ?? 10;
+    const out: Array<{
+      id: string;
+      name: string;
+      language: string;
+      status: string;
+      category?: string;
+      components?: unknown[];
+      rejectedReason?: string;
+    }> = [];
+    let after: string | undefined;
+    for (let page = 0; page < maxPages; page++) {
+      const query = new URLSearchParams({
+        fields: "id,name,language,status,category,components,rejected_reason",
+        limit: String(limit),
+      });
+      if (after) query.set("after", after);
+      const json = await this.graphGet(account, `${wabaId}/message_templates?${query.toString()}`);
+      const data = (json.data as Array<Record<string, any>> | undefined) ?? [];
+      for (const t of data) {
+        if (typeof t.name !== "string" || typeof t.language !== "string") continue;
+        out.push({
+          id: String(t.id ?? ""),
+          name: t.name,
+          language: t.language,
+          status: typeof t.status === "string" ? t.status : "UNKNOWN",
+          ...(typeof t.category === "string" ? { category: t.category } : {}),
+          ...(Array.isArray(t.components) ? { components: t.components as unknown[] } : {}),
+          ...(typeof t.rejected_reason === "string" ? { rejectedReason: t.rejected_reason } : {}),
+        });
+      }
+      const nextAfter = (json.paging as { cursors?: { after?: string } } | undefined)?.cursors?.after;
+      // Trust Meta's cursor (not the page length): a short page can still
+      // carry a next cursor. The page cap is what bounds the loop.
+      if (!nextAfter) break;
+      after = nextAfter;
+    }
+    return out;
+  }
+
+  /**
+   * Create a template on Meta (`POST /{waba}/message_templates`).
+   *
+   * Meta answers `{ id, status, category }` with status usually PENDING -
+   * review happens afterwards. The caller MUST mirror THAT status: a
+   * template that was just submitted is not sendable yet, and assuming
+   * "approved" here is exactly how a broadcast gets queued against a
+   * template the provider will refuse.
+   */
+  async createMessageTemplate(
+    account: ChannelAccountRef,
+    wabaId: string,
+    input: {
+      name: string;
+      language: string;
+      category: string;
+      components: unknown[];
+      /**
+       * Meta refuses a category that differs from an existing template of
+       * the same name unless this flag is set (it would otherwise be a
+       * silent pricing change).
+       */
+      allowCategoryChange?: boolean;
+    },
+  ): Promise<{ id: string; status: string; category?: string }> {
+    const json = await this.graphPost(account, `${wabaId}/message_templates`, {
+      name: input.name,
+      language: input.language,
+      category: input.category.toUpperCase(),
+      components: input.components,
+      ...(input.allowCategoryChange ? { allow_category_change: true } : {}),
+    });
+    return {
+      id: String(json.id ?? ""),
+      status: typeof json.status === "string" ? json.status : "PENDING",
+      ...(typeof json.category === "string" ? { category: json.category } : {}),
+    };
+  }
+
+  /**
+   * Delete a template on Meta by name (all its languages). Deleting is
+   * destructive and irreversible - callers must confirm first; the local
+   * row is removed by the caller only after Meta accepts.
+   */
+  async deleteMessageTemplate(account: ChannelAccountRef, wabaId: string, name: string): Promise<void> {
+    const token = await this.tokenFor(account);
+    const url = `${this.baseUrl}/${this.apiVersion}/${wabaId}/message_templates?name=${encodeURIComponent(name)}`;
+    const res = await this.fetchFn(url, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphErrorBody & Record<string, unknown>;
+    if (!res.ok || json.error) throw mapWhatsAppError(json, res.status);
   }
 
   // --- webhooks --------------------------------------------------------------

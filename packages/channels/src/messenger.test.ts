@@ -164,3 +164,81 @@ describe("messenger page picture (onboarding avatar)", () => {
     expect(await msgr.fetchPagePictureUrl({ pageId: "page-1", pageAccessToken: PAGE_TOKEN })).toBeNull();
   });
 });
+
+describe("messenger reply context + presence", () => {
+  test("a reply carries reply_to.mid inside the message object", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.2" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.send({
+      account: PAGE, toExternalId: "psid-1", text: "baik", idempotencyKey: "k",
+      replyToExternalId: "mid.IN",
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({
+      text: "baik", reply_to: { mid: "mid.IN" },
+    });
+  });
+
+  test("markRead sends mark_seen for the PSID (thread-level receipt)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { recipient_id: "psid-1" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.markRead({ account: PAGE, contactExternalId: "psid-1", messageExternalId: "mid.IN" });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/me/messages");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      recipient: { id: "psid-1" }, sender_action: "mark_seen",
+    });
+  });
+
+  test("markRead without a PSID fails validation", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await expect(msgr.markRead({ account: PAGE, contactExternalId: "" })).rejects.toThrow(/PSID/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("typing toggles typing_on / typing_off as separate sender actions", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }, { body: {} }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.typing({ account: PAGE, toExternalId: "psid-1", on: true });
+    await msgr.typing({ account: PAGE, toExternalId: "psid-1", on: false });
+    expect(JSON.parse(calls[0]!.init!.body as string).sender_action).toBe("typing_on");
+    expect(JSON.parse(calls[1]!.init!.body as string).sender_action).toBe("typing_off");
+  });
+
+  test("insights asks for page_post_engagements, never the retired metric names", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { data: [] } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.fetchInsights({ account: PAGE });
+    expect(calls[0]!.url).toContain("metric=page_views_total,page_post_engagements");
+    expect(calls[0]!.url).not.toContain("page_post_views");
+  });
+});
+
+describe("messenger messaging profile (IG-2 parity)", () => {
+  test("set writes the menu on me/messenger_profile without an instagram tag", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { result: "success" } }]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.messengerProfile.set({
+      account: PAGE,
+      profile: { persistentMenu: { items: [{ type: "web_url", title: "Toko", url: "https://toko.test" }] } },
+    });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/me/messenger_profile");
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.platform).toBeUndefined();
+    expect(sent.persistent_menu[0].call_to_actions[0]).toEqual({
+      type: "web_url", title: "Toko", url: "https://toko.test",
+    });
+  });
+
+  test("get and remove address the profile by field", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { data: [{ ice_breakers: [] }] } },
+      { body: { success: true } },
+    ]);
+    const msgr = new MessengerAdapter({ credentials: creds, fetchFn });
+    await msgr.messengerProfile.get({ account: PAGE, fields: ["ice_breakers"] });
+    await msgr.messengerProfile.remove({ account: PAGE, fields: ["ice_breakers"] });
+    expect(calls[0]!.url).toBe("https://graph.facebook.com/v26.0/me/messenger_profile?fields=ice_breakers");
+    expect(calls[1]!.init!.method).toBe("DELETE");
+    expect(decodeURIComponent(calls[1]!.url)).toContain('fields=["ice_breakers"]');
+  });
+});

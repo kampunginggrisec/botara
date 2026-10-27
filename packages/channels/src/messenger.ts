@@ -242,6 +242,7 @@ export class MessengerAdapter implements ChannelAdapter {
     } else {
       throw new AppError("VALIDATION", "messenger.send requires text or media with a public link");
     }
+    if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", "me/messages", {
       recipient: { id: input.toExternalId },
       messaging_type: "RESPONSE",
@@ -334,6 +335,7 @@ export class MessengerAdapter implements ChannelAdapter {
       warnings.push("RICH_DEGRADED_TO_TEXT");
       message = { text: richToPlainText(rich) };
     }
+    if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", "me/messages", {
       recipient: { id: input.toExternalId },
       messaging_type: "RESPONSE",
@@ -363,6 +365,44 @@ export class MessengerAdapter implements ChannelAdapter {
       message: { text },
     });
     return { externalMessageId: String(json.message_id ?? "") };
+  }
+
+  // --- presence (read receipts + typing) -------------------------------------
+
+  /**
+   * Send API sender actions. They must be their OWN request - Meta
+   * rejects a payload that carries both `sender_action` and `message`.
+   */
+  private async senderAction(
+    account: ChannelAccountRef,
+    psid: string,
+    action: "mark_seen" | "typing_on" | "typing_off",
+  ): Promise<void> {
+    await this.graph(account, "POST", "me/messages", {
+      recipient: { id: psid },
+      sender_action: action,
+    });
+  }
+
+  /**
+   * Messenger has no per-message read receipt: `mark_seen` marks the
+   * whole thread seen by the Page, so the customer id (PSID) is what
+   * addresses it and the message id is unused.
+   */
+  async markRead(input: {
+    account: ChannelAccountRef;
+    contactExternalId: string;
+    messageExternalId?: string;
+  }): Promise<void> {
+    if (!input.contactExternalId) {
+      throw new AppError("VALIDATION", "messenger.markRead requires the customer PSID (contactExternalId).");
+    }
+    await this.senderAction(input.account, input.contactExternalId, "mark_seen");
+  }
+
+  /** Typing on/off for a thread (typing_off is a real request here). */
+  async typing(input: { account: ChannelAccountRef; toExternalId: string; on: boolean }): Promise<void> {
+    await this.senderAction(input.account, input.toExternalId, input.on ? "typing_on" : "typing_off");
   }
 
   // --- handover protocol -----------------------------------------------------------------
@@ -416,6 +456,43 @@ export class MessengerAdapter implements ChannelAdapter {
     });
   }
 
+  /**
+   * Messaging profile as a capability (IG-2 parity). `setGetStarted` and
+   * `setPersistentMenu` above are the focused setters Botara used before the
+   * panel existed; this is the same endpoint addressed generically so the
+   * API can read, replace and delete profile fields for a Page the same way
+   * it does for an Instagram account.
+   *
+   * Messenger addresses the profile as `me` (the token identifies the Page);
+   * Instagram must use its user id. No `platform` tag here: on Messenger it
+   * is meaningless, on Instagram it is what keeps the write off a linked Page.
+   */
+  readonly messengerProfile: NonNullable<ChannelAdapter["messengerProfile"]> = {
+    get: async ({ account, fields }) => {
+      const query = new URLSearchParams({ fields: fields.join(",") });
+      return this.graph(account, "GET", `me/messenger_profile?${query.toString()}`);
+    },
+
+    set: async ({ account, profile }) => {
+      const body: Record<string, unknown> = {};
+      if (profile.persistentMenu) {
+        body.persistent_menu = [{
+          locale: profile.persistentMenu.locale ?? "default",
+          composer_input_disabled: profile.persistentMenu.composerInputDisabled ?? false,
+          call_to_actions: profile.persistentMenu.items,
+        }];
+      }
+      if (profile.iceBreakers) body.ice_breakers = profile.iceBreakers;
+      if (profile.getStarted) body.get_started = { payload: profile.getStarted };
+      await this.graph(account, "POST", "me/messenger_profile", body);
+    },
+
+    remove: async ({ account, fields }) => {
+      const query = new URLSearchParams({ fields: JSON.stringify(fields) });
+      await this.graph(account, "DELETE", `me/messenger_profile?${query.toString()}`);
+    },
+  };
+
   // --- page posts + comment moderation -----------------------------------------------------
 
   /** Publish a post to the Page feed (the Messenger account IS a Page). */
@@ -462,10 +539,15 @@ export class MessengerAdapter implements ChannelAdapter {
     targetExternalId?: string;
   }): Promise<Record<string, number>> {
     // Views family only, same retirement rule as Instagram.
+    // NOTE: `page_post_views` is NOT a Page Insights metric (Meta's set is
+    // page_views_total / page_post_engagements / page_posts_impressions …);
+    // requesting it answered 400 "invalid metric". `page_post_engagements`
+    // is the post-interaction counter that survives the impressions
+    // retirement.
     const target = input.targetExternalId ?? input.account.externalId;
     const json = await this.graph(
       input.account, "GET",
-      `${target}/insights?metric=page_views_total,page_post_views&period=day`,
+      `${target}/insights?metric=page_views_total,page_post_engagements&period=day`,
     );
     const data = (json.data as Array<{ name: string; values?: Array<{ value: number }> }> | undefined) ?? [];
     const out: Record<string, number> = {};

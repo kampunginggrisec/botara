@@ -9,6 +9,7 @@ import {
   savedReplies,
   scheduledPosts, sequenceEnrollments, sequences, templates, tokenVault,
   users, webchatSessions, webhookDeliveries, webhookEndpoints, workspaceDomains, workspaceInvites, workspaceMembers, workspaces,
+  type TemplateComponentRow,
 } from "./schema";
 
 /**
@@ -280,6 +281,24 @@ export async function listMessages(db: Database, conversationId: string): Promis
     .orderBy(asc(messages.createdAt));
 }
 
+/**
+ * One message INSIDE a conversation. Scoped by conversation on purpose:
+ * a reply-to target must belong to the same thread, so a caller can never
+ * quote a message from another workspace or another conversation.
+ */
+export async function getMessage(
+  db: Database,
+  conversationId: string,
+  messageId: string,
+): Promise<MessageRow | null> {
+  const rows = await db
+    .select()
+    .from(messages)
+    .where(and(eq(messages.conversationId, conversationId), eq(messages.id, messageId)))
+    .limit(1);
+  return rows[0] ?? null;
+}
+
 export async function createMessage(
   db: Database,
   input: {
@@ -499,6 +518,11 @@ export async function createTemplate(
     latestCategory?: string;
     externalId?: string;
     status?: string;
+    /** Owning WABA id, learned from a sync or a category-change webhook. */
+    messagingAccountId?: string;
+    /** Provider component tree (HEADER/BODY/FOOTER/BUTTONS). */
+    components?: unknown[];
+    rejectedReason?: string;
   },
 ): Promise<TemplateRow> {
   const [row] = await db
@@ -513,13 +537,104 @@ export async function createTemplate(
       latestCategory: input.latestCategory ?? input.category,
       externalId: input.externalId,
       status: input.status ?? "approved",
+      messagingAccountId: input.messagingAccountId,
+      components: input.components as TemplateComponentRow[] | undefined,
+      rejectedReason: input.rejectedReason,
     })
     .returning();
   return row!;
 }
 
-/** Category-changed flow: routing must follow latestCategory. */
-export async function updateTemplateLatestCategory(
+/**
+ * Template sync (WA-4): reconcile ONE provider template into the local
+ * table, keyed by (workspace, channel account, name, language) - the
+ * identity Meta itself uses. Returns whether the row was created, so the
+ * caller can report "N new, M updated" instead of a single number.
+ *
+ * `latestCategory` is only overwritten when the provider reports a
+ * category: an existing reclassification learned from the
+ * template_category_update webhook must survive a sync (ADR-008 routing
+ * depends on it).
+ */
+export async function upsertTemplateFromMeta(
+  db: Database,
+  input: {
+    workspaceId: string;
+    channelAccountId: string;
+    name: string;
+    language: string;
+    category?: string;
+    externalId?: string;
+    status: string;
+    messagingAccountId?: string;
+    components?: unknown[];
+    rejectedReason?: string;
+  },
+): Promise<{ row: TemplateRow; created: boolean }> {
+  const existing = await db
+    .select()
+    .from(templates)
+    .where(and(
+      eq(templates.workspaceId, input.workspaceId),
+      eq(templates.channelAccountId, input.channelAccountId),
+      eq(templates.name, input.name),
+      eq(templates.language, input.language),
+    ))
+    .limit(1);
+  const current = existing[0];
+  if (current) {
+    const [row] = await db
+      .update(templates)
+      .set({
+        externalId: input.externalId ?? current.externalId,
+        status: input.status,
+        category: input.category ?? current.category,
+        latestCategory: input.category ?? current.latestCategory,
+        messagingAccountId: input.messagingAccountId ?? current.messagingAccountId,
+        // The provider tree is authoritative when it is reported: it is
+        // what Meta will actually render, and it is what the pre-send
+        // parameter check counts.
+        components: (input.components as TemplateComponentRow[] | undefined) ?? current.components,
+        // A stale rejection reason must not outlive the rejection: once the
+        // template is no longer `rejected`, Meta stops reporting one.
+        rejectedReason: input.rejectedReason
+          ?? (input.status.toLowerCase() === "rejected" ? current.rejectedReason : null),
+      })
+      .where(eq(templates.id, current.id))
+      .returning();
+    return { row: row!, created: false };
+  }
+  const row = await createTemplate(db, {
+    workspaceId: input.workspaceId,
+    channelAccountId: input.channelAccountId,
+    name: input.name,
+    language: input.language,
+    category: input.category,
+    latestCategory: input.category,
+    externalId: input.externalId,
+    status: input.status,
+    messagingAccountId: input.messagingAccountId,
+    components: input.components,
+    rejectedReason: input.rejectedReason,
+  });
+  return { row, created: true };
+}
+
+/**
+ * Remove a template row. Callers delete on the provider FIRST: a local row
+ * that survives a provider delete is recoverable (re-sync), a local delete
+ * that never reached Meta leaves an orphaned template the panel can no
+ * longer see but Meta still bills for.
+ */
+export async function deleteTemplate(db: Database, workspaceId: string, id: string): Promise<boolean> {
+  const rows = await db
+    .delete(templates)
+    .where(and(eq(templates.id, id), eq(templates.workspaceId, workspaceId)))
+    .returning();
+  return rows.length > 0;
+}
+
+/** Category-changed flow: routing must follow latestCategory. */export async function updateTemplateLatestCategory(
   db: Database,
   workspaceId: string,
   id: string,

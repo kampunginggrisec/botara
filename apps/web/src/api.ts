@@ -302,6 +302,12 @@ export interface Message {
    */
   mediaUrls?: string[];
   mediaKeys?: string[];
+  /**
+   * Provider message id (wamid / mid). Present once the channel accepted
+   * the message; null for rows that never reached the provider (failed
+   * sends, internal notes). The inbox uses it to decide what is quotable.
+   */
+  externalId?: string | null;
   status: string;
   createdAt: string;
 }
@@ -336,6 +342,19 @@ export interface Template {
   category: string | null;
   latestCategory: string | null;
   status: string;
+  /** Provider component tree (HEADER/BODY/FOOTER/BUTTONS), when known. */
+  components?: TemplateComponent[] | null;
+  /** Meta's rejection reason, shown next to a rejected status. */
+  rejectedReason?: string | null;
+}
+
+/** One component of a WhatsApp template, as Meta defines it. */
+export interface TemplateComponent {
+  type: string;
+  format?: string;
+  text?: string;
+  buttons?: Array<{ type: string; text: string; url?: string; phone_number?: string }>;
+  example?: { header_handle?: string[] };
 }
 
 export interface BroadcastEstimateLine {
@@ -533,6 +552,34 @@ export interface ChannelAccount {
   disconnectedAt: string | null;
   purgeAt: string | null;
   createdAt: string;
+}
+
+/** One provider-side welcome message flow (IG-1). */
+export interface WelcomeMessageFlow {
+  id: string;
+  name: string;
+  /** Provider body: `[{ message: { text, quick_replies? } }]`. */
+  flow: unknown[];
+  lastUpdateTime?: string;
+  isUsedInAd?: boolean;
+}
+
+export interface PersistentMenuItem {
+  type: "postback" | "web_url";
+  title: string;
+  payload?: string;
+  url?: string;
+}
+
+export interface IceBreaker {
+  question: string;
+  payload: string;
+}
+
+export interface MessengerProfileInput {
+  persistentMenu?: { items: PersistentMenuItem[]; locale?: string; composerInputDisabled?: boolean };
+  iceBreakers?: IceBreaker[];
+  getStarted?: string;
 }
 
 export interface PostTargetResult {
@@ -1011,11 +1058,33 @@ export const api = {
   },
   reply(
     conversationId: string,
-    body: { kind: "free_form" | "template"; text?: string; templateId?: string; rich?: RichBlock },
+    body: {
+      kind: "free_form" | "template";
+      text?: string;
+      templateId?: string;
+      rich?: RichBlock;
+      /** Quote this message of the same thread (provider-native quote). */
+      replyToMessageId?: string;
+    },
   ): Promise<{ message: unknown; delivery: string; warnings?: string[]; interpolationWarnings?: string[] }> {
     return request(`/conversations/${conversationId}/reply`, {
       method: "POST",
       body: JSON.stringify(body),
+    });
+  },
+  /**
+   * Presence: mark the thread read on the provider (WhatsApp blue ticks,
+   * Messenger/Instagram seen). Best-effort - the API answers
+   * `{ read: false, reason }` for channels without a read surface.
+   */
+  markConversationRead(conversationId: string): Promise<{ read: boolean; reason?: string }> {
+    return request(`/conversations/${conversationId}/read`, { method: "POST" });
+  },
+  /** Presence: typing indicator toward the contact (best-effort). */
+  sendTyping(conversationId: string, on: boolean): Promise<{ typing: boolean; reason?: string }> {
+    return request(`/conversations/${conversationId}/typing`, {
+      method: "POST",
+      body: JSON.stringify({ on }),
     });
   },
   /** Add an internal note to the thread (package #2): team-only, never sent to the customer. */
@@ -1146,6 +1215,37 @@ export const api = {
       body: JSON.stringify({ latestCategory }),
     });
   },
+  /**
+   * Template sync (WA-4): pull the WABA's real templates (approval status,
+   * category, provider id) from Meta into the local mirror.
+   */
+  syncTemplates(channelAccountId: string): Promise<{
+    wabaId: string; templates: number; created: number; updated: number; syncedAt: string;
+  }> {
+    return request("/templates/sync", {
+      method: "POST",
+      body: JSON.stringify({ channelAccountId }),
+    });
+  },
+  /**
+   * Submit a template to Meta (WA-4 write path). The API validates the
+   * component tree first; the returned status is Meta's answer (usually
+   * `pending`), so the row is not sendable until a sync reports approved.
+   */
+  submitTemplate(body: {
+    channelAccountId: string;
+    name: string;
+    language?: string;
+    category: string;
+    components: TemplateComponent[];
+    allowCategoryChange?: boolean;
+  }): Promise<{ template: Template; wabaId: string; created: boolean }> {
+    return request("/templates/submit", { method: "POST", body: JSON.stringify(body) });
+  },
+  /** Delete a template on Meta, then locally. Irreversible. */
+  deleteTemplate(id: string): Promise<{ deleted: boolean; wabaId: string }> {
+    return request(`/templates/${id}`, { method: "DELETE" });
+  },
   estimateBroadcast(body: {
     category: string;
     countryMix: Array<{ country: string; recipients: number }>;
@@ -1269,6 +1369,46 @@ export const api = {
   },
   deleteEmailDomain(id: string): Promise<{ deleted: boolean }> {
     return request(`/channels/email/domains/${id}`, { method: "DELETE" });
+  },
+  // --------------------------- Instagram automation (IG-1 / IG-2)
+  /** Welcome message flows: Meta's automated first reply to a new DM thread. */
+  listWelcomeFlows(accountId: string): Promise<{ flows: WelcomeMessageFlow[] }> {
+    return request(`/channels/${accountId}/welcome-flows`);
+  },
+  getWelcomeFlow(accountId: string, flowId: string): Promise<{ flow: WelcomeMessageFlow }> {
+    return request(`/channels/${accountId}/welcome-flows/${flowId}`);
+  },
+  createWelcomeFlow(
+    accountId: string,
+    body: { name: string; flow: unknown[] },
+  ): Promise<{ id: string }> {
+    return request(`/channels/${accountId}/welcome-flows`, { method: "POST", body: JSON.stringify(body) });
+  },
+  updateWelcomeFlow(
+    accountId: string,
+    flowId: string,
+    body: { name: string; flow: unknown[] },
+  ): Promise<{ id: string }> {
+    return request(`/channels/${accountId}/welcome-flows/${flowId}`, { method: "PATCH", body: JSON.stringify(body) });
+  },
+  deleteWelcomeFlow(accountId: string, flowId: string): Promise<{ deleted: boolean }> {
+    return request(`/channels/${accountId}/welcome-flows/${flowId}`, { method: "DELETE" });
+  },
+  /** Messaging profile: persistent menu, ice breakers, Get Started. */
+  getMessengerProfile(
+    accountId: string,
+    fields?: string[],
+  ): Promise<{ fields: string[]; profile: Record<string, unknown> }> {
+    const qs = fields && fields.length > 0 ? `?fields=${encodeURIComponent(fields.join(","))}` : "";
+    return request(`/channels/${accountId}/messenger-profile${qs}`);
+  },
+  setMessengerProfile(accountId: string, body: MessengerProfileInput): Promise<{ updated: boolean }> {
+    return request(`/channels/${accountId}/messenger-profile`, { method: "PUT", body: JSON.stringify(body) });
+  },
+  deleteMessengerProfileFields(accountId: string, fields: string[]): Promise<{ deleted: boolean; fields: string[] }> {
+    return request(`/channels/${accountId}/messenger-profile?fields=${encodeURIComponent(fields.join(","))}`, {
+      method: "DELETE",
+    });
   },
   // ------------------------------------------------- Meta catalog sync
   listCatalogProducts(

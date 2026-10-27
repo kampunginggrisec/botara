@@ -218,3 +218,59 @@ describe("threads onboarding identity", () => {
     expect(await th.getProfile({ accessToken: "bad" })).toEqual({});
   });
 });
+
+describe("threads carousel publishing (TH-1)", () => {
+  test("two media urls become item containers, then a CAROUSEL container", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "item-1" } },
+      { body: { status: "FINISHED" } },
+      { body: { id: "item-2" } },
+      { body: { status: "FINISHED" } },
+      { body: { id: "carousel-1" } },
+      { body: { id: "post-9" } },
+    ]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn, containerPoll: { sleep: async () => {} } });
+    const res = await th.publish({
+      account: ACCOUNT,
+      text: "dua gambar",
+      mediaUrls: ["https://cdn.test/a.jpg", "https://cdn.test/b.jpg"],
+      idempotencyKey: "k",
+    });
+    expect(res.externalPostId).toBe("post-9");
+    // item containers are flagged is_carousel_item and carry one image each
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      media_type: "IMAGE", image_url: "https://cdn.test/a.jpg", is_carousel_item: true,
+    });
+    expect(calls[1]!.url).toContain("item-1?fields=status");
+    // the carousel container references both children in order
+    const carouselBody = JSON.parse(calls[4]!.init!.body as string);
+    expect(carouselBody).toEqual({
+      media_type: "CAROUSEL", children: "item-1,item-2", text: "dua gambar",
+    });
+    expect(calls[5]!.url).toContain("/threads_publish");
+    expect(JSON.parse(calls[5]!.init!.body as string)).toEqual({ creation_id: "carousel-1" });
+  });
+
+  test("a carousel cannot be sent as a reply in the same call", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: {} }]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    await expect(th.publish({
+      account: ACCOUNT,
+      mediaUrls: ["https://cdn.test/a.jpg", "https://cdn.test/b.jpg"],
+      replyToExternalId: "post-parent",
+      idempotencyKey: "k",
+    })).rejects.toThrow(/carousel/i);
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a single media url keeps the plain two-step container flow", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { id: "container-1" } },
+      { body: { id: "post-1" } },
+    ]);
+    const th = new ThreadsAdapter({ credentials: creds, fetchFn });
+    await th.publish({ account: ACCOUNT, mediaUrls: ["https://cdn.test/a.jpg"], idempotencyKey: "k" });
+    expect(JSON.parse(calls[0]!.init!.body as string)).not.toHaveProperty("is_carousel_item");
+    expect(calls).toHaveLength(2);
+  });
+});

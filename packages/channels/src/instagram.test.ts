@@ -289,3 +289,155 @@ describe("instagram video containers (Fase 3 polling)", () => {
     expect(calls[0]!.url).toBe("https://graph.instagram.com/creation-9?fields=status_code");
   });
 });
+
+describe("instagram reply context + presence", () => {
+  test("a reply carries reply_to.mid inside the message object", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { message_id: "mid.9" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.send({
+      account: IG_ACCOUNT, toExternalId: "igsid-1", text: "hai", idempotencyKey: "k",
+      replyToExternalId: "mid.IN",
+    });
+    expect(JSON.parse(calls[0]!.init!.body as string).message).toEqual({
+      text: "hai", reply_to: { mid: "mid.IN" },
+    });
+  });
+
+  test("markRead sends mark_seen to the mode-correct host", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { recipient_id: "igsid-1" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.markRead({ account: IG_ACCOUNT, contactExternalId: "igsid-1" });
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/messages");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({
+      recipient: { id: "igsid-1" }, sender_action: "mark_seen",
+    });
+  });
+});
+
+describe("instagram welcome message flows (IG-1)", () => {
+  test("list pages through the account endpoint and parses the JSON-string body", async () => {
+    const { fetchFn, calls } = mockFetch([
+      {
+        body: {
+          data: [
+            {
+              id: "flow-1", name: "Customer intake",
+              welcome_message_flow: JSON.stringify([{ message: { text: "Halo!", quick_replies: [{ title: "Ya", payload: "yes" }] } }]),
+              last_update_time: "2025-08-14T19:06:34+0000", is_used_in_ad: false,
+            },
+            { id: "flow-2", name: "Broken", welcome_message_flow: "not-json" },
+          ],
+        },
+      },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    const flows = await ig.welcomeFlows.list({ account: IG_ACCOUNT });
+
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/welcome_message_flows?limit=100");
+    expect(flows).toHaveLength(2);
+    expect(flows[0]!.flow).toEqual([{ message: { text: "Halo!", quick_replies: [{ title: "Ya", payload: "yes" }] } }]);
+    expect(flows[0]!.lastUpdateTime).toBe("2025-08-14T19:06:34+0000");
+    // an unparseable body still lists (so it can be deleted), with an empty flow
+    expect(flows[1]!.flow).toEqual([]);
+  });
+
+  test("list follows Meta's cursor and stops when there is none", async () => {
+    const { fetchFn, calls } = mockFetch([
+      { body: { data: [{ id: "f1", name: "A", welcome_message_flow: "[]" }], paging: { cursors: { after: "c1" } } } },
+      { body: { data: [{ id: "f2", name: "B", welcome_message_flow: "[]" }] } },
+    ]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    const flows = await ig.welcomeFlows.list({ account: IG_ACCOUNT });
+    expect(flows.map((f) => f.id)).toEqual(["f1", "f2"]);
+    expect(calls[1]!.url).toContain("after=c1");
+  });
+
+  test("get filters by flow_id and returns null for an empty envelope", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { data: [] } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    expect(await ig.welcomeFlows.get({ account: IG_ACCOUNT, flowId: "flow-9" })).toBeNull();
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/welcome_message_flows?flow_id=flow-9");
+  });
+
+  test("create POSTs name + a JSON-encoded flow body", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { id: "flow-new" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    const flow = [{ message: { text: "Halo" } }];
+    const created = await ig.welcomeFlows.create({ account: IG_ACCOUNT, name: "Welcome", flow });
+    expect(created.id).toBe("flow-new");
+    expect(calls[0]!.init!.method).toBe("POST");
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.name).toBe("Welcome");
+    // Meta stores the body as a string; sending an array is silently mangled
+    expect(sent.welcome_message_flow).toBe(JSON.stringify(flow));
+  });
+
+  test("create without an id is a provider error, not a silent success", async () => {
+    const { fetchFn } = mockFetch([{ body: {} }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await expect(ig.welcomeFlows.create({ account: IG_ACCOUNT, name: "x", flow: [{ message: { text: "y" } }] }))
+      .rejects.toThrow(/no id/);
+  });
+
+  test("update and remove address the flow through flow_id", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { id: "flow-1" } }, { body: { success: true } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.welcomeFlows.update({
+      account: IG_ACCOUNT, flowId: "flow-1", name: "Renamed", flow: [{ message: { text: "Baru" } }],
+    });
+    await ig.welcomeFlows.remove({ account: IG_ACCOUNT, flowId: "flow-1" });
+    expect(calls[0]!.url).toContain("/welcome_message_flows?flow_id=flow-1");
+    expect(calls[0]!.init!.method).toBe("POST");
+    expect(calls[1]!.url).toContain("/welcome_message_flows?flow_id=flow-1");
+    expect(calls[1]!.init!.method).toBe("DELETE");
+  });
+});
+
+describe("instagram messaging profile (IG-2)", () => {
+  test("set tags platform=instagram so the write cannot land on a linked Page", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { result: "success" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.messengerProfile.set({
+      account: IG_ACCOUNT,
+      profile: {
+        persistentMenu: {
+          items: [{ type: "postback", title: "Bicara dengan agen", payload: "CARE_HELP" }],
+        },
+      },
+    });
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/messenger_profile");
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.platform).toBe("instagram");
+    expect(sent.persistent_menu[0].call_to_actions[0]).toEqual({
+      type: "postback", title: "Bicara dengan agen", payload: "CARE_HELP",
+    });
+    expect(sent.persistent_menu[0].composer_input_disabled).toBe(false);
+  });
+
+  test("ice breakers are sent as-is, without a menu", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { result: "success" } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.messengerProfile.set({
+      account: IG_ACCOUNT,
+      profile: { iceBreakers: [{ question: "Ada promo?", payload: "PROMO" }] },
+    });
+    const sent = JSON.parse(calls[0]!.init!.body as string);
+    expect(sent.ice_breakers).toEqual([{ question: "Ada promo?", payload: "PROMO" }]);
+    expect(sent.persistent_menu).toBeUndefined();
+  });
+
+  test("get asks for the named fields", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { data: [{ persistent_menu: [] }] } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.messengerProfile.get({ account: IG_ACCOUNT, fields: ["persistent_menu", "ice_breakers"] });
+    expect(calls[0]!.url).toBe("https://graph.instagram.com/ig-user-1/messenger_profile?fields=persistent_menu%2Cice_breakers");
+  });
+
+  test("remove quotes the field list (a bare list deletes nothing)", async () => {
+    const { fetchFn, calls } = mockFetch([{ body: { success: true } }]);
+    const ig = new InstagramAdapter({ credentials: creds, fetchFn });
+    await ig.messengerProfile.remove({ account: IG_ACCOUNT, fields: ["persistent_menu"] });
+    expect(calls[0]!.init!.method).toBe("DELETE");
+    expect(decodeURIComponent(calls[0]!.url)).toContain('fields=["persistent_menu"]');
+  });
+});

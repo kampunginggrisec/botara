@@ -11,12 +11,12 @@ import {
 } from "@botara/shared";
 import {
   getDb, getWorkspaceById, listContacts, getContact, createContact, updateContact, segmentCounts,
-  listConversations, getConversation, listMessages, createMessage, updateMessageStatus,
+  listConversations, getConversation, listMessages, getMessage, createMessage, updateMessageStatus,
   touchConversationLastUserMessage,
   listSavedReplies, getSavedReply, getSavedReplyByShortcut, createSavedReply,
   updateSavedReply, deleteSavedReply, isUniqueViolation,
   type SavedReplyRow, type MessageRow,
-  listTemplates, createTemplate, updateTemplateLatestCategory,
+  listTemplates, createTemplate, updateTemplateLatestCategory, upsertTemplateFromMeta, deleteTemplate,
   createBroadcast, listBroadcasts, getBroadcast, updateBroadcastStatus, sumCostLedgerByReference,
   listBroadcastRecipients, listFailedBroadcastRecipientContactIds, resetBroadcastRecipients,
   getChannelAccount, getChannelAccountById, getTemplate, listChannelAccounts, createChannelAccount,
@@ -111,6 +111,24 @@ import {
 } from "./kb-upload";
 import { buildGrowthTarget, generateGrowthSlug, growthShortUrl } from "./growth";
 import { syncWhatsAppCatalog, type CatalogSyncResult } from "./catalog-sync";
+import { syncWhatsAppTemplates, type TemplateSyncResult } from "./template-sync";
+import {
+  MAX_WELCOME_FLOW_PAGES,
+  PROFILE_FIELDS,
+  validateFlowName,
+  validateProfileFields,
+  validateProfileInput,
+  validateWelcomeFlow,
+  resolveAutomationAdapter,
+  type ChannelAutomationPort,
+} from "./channel-automation";
+import {
+  deleteWhatsAppTemplate,
+  submitWhatsAppTemplate,
+  templateBodyParamCount,
+  validateTemplateComponents,
+  type SubmitTemplateResult as TemplateSubmitResult,
+} from "./template-write";
 
 /**
  * Botara API - Fase 3.
@@ -219,6 +237,35 @@ export interface ApiDeps {
   whatsappOnboarding: (workspaceId: string, input: EmbeddedSignupInput) => Promise<EmbeddedSignupResult>;
   /** Meta Catalog sync for a WhatsApp account (Graph discovery + paging + mirror). */
   catalogSync: (input: { workspaceId: string; accountId: string; catalogId?: string }) => Promise<CatalogSyncResult>;
+  /** Meta template mirror for a WhatsApp account (WA-4: list + upsert). */
+  templateSync: (input: { workspaceId: string; accountId: string }) => Promise<TemplateSyncResult>;
+  /**
+   * WA-4 write path: submit a component tree to Meta and mirror the
+   * returned approval status. Separate from `templateSync` because it is
+   * a mutation with its own validation and a different failure contract.
+   */
+  templateSubmit: (input: {
+    workspaceId: string;
+    accountId: string;
+    name: string;
+    language: string;
+    category: string;
+    components: unknown;
+    allowCategoryChange?: boolean;
+  }) => Promise<TemplateSubmitResult>;
+  /** WA-4 write path: delete on Meta, then locally. */
+  templateDelete: (input: {
+    workspaceId: string;
+    accountId: string;
+    templateId: string;
+  }) => Promise<{ wabaId: string; deleted: boolean }>;
+  /**
+   * Provider-side account automation (IG-1 welcome flows, IG-2 messaging
+   * profile). One port for both because they share auth, error mapping and
+   * the workspace/account lookup - and because the routes must not know
+   * which Graph host a channel uses.
+   */
+  channelAutomation: ChannelAutomationPort;
   /** The configured AI provider, or null - routes answer 503, never fake. */
   getAiProvider: () => AIProvider | null;
   /** Fase 3: users, workspaces, memberships, audit (auth persistence). */
@@ -682,6 +729,153 @@ export function defaultDeps(baseEnv: EnvLike = { ...process.env }): ApiDeps {
         { workspaceId: input.workspaceId, account, catalogId: input.catalogId },
       );
     },
+    templateSync: async (input) => {
+      const db = defaultGetDatabase();
+      const account = await getChannelAccount(db, input.workspaceId, input.accountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+      }
+      if (account.channel !== "whatsapp") {
+        throw new AppError("VALIDATION", "Template sync is only available for WhatsApp accounts.", { status: 400 });
+      }
+      return syncWhatsAppTemplates(
+        {
+          fetchFn: (url, init) => fetch(url, init as RequestInit),
+          graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+          resolveAccessToken: createCatalogTokenResolver(),
+          store: {
+            upsert: async (row) => {
+              const result = await upsertTemplateFromMeta(db, row);
+              return { created: result.created };
+            },
+          },
+        },
+        { workspaceId: input.workspaceId, account },
+      );
+    },
+    templateSubmit: async (input) => {
+      const db = defaultGetDatabase();
+      const account = await getChannelAccount(db, input.workspaceId, input.accountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+      }
+      if (account.channel !== "whatsapp") {
+        throw new AppError("VALIDATION", "Template submission is only available for WhatsApp accounts.", { status: 400 });
+      }
+      return submitWhatsAppTemplate(
+        {
+          fetchFn: (url, init) => fetch(url, init as RequestInit),
+          graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+          resolveAccessToken: createCatalogTokenResolver(),
+          store: {
+            upsert: async (row) => {
+              const result = await upsertTemplateFromMeta(db, row);
+              return { row: result.row, created: result.created };
+            },
+            remove: (id) => deleteTemplate(db, input.workspaceId, id),
+          },
+        },
+        {
+          workspaceId: input.workspaceId,
+          account,
+          name: input.name,
+          language: input.language,
+          category: input.category,
+          components: input.components,
+          ...(input.allowCategoryChange ? { allowCategoryChange: true } : {}),
+        },
+      );
+    },
+    templateDelete: async (input) => {
+      const db = defaultGetDatabase();
+      const account = await getChannelAccount(db, input.workspaceId, input.accountId);
+      if (!account) {
+        throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+      }
+      if (account.channel !== "whatsapp") {
+        throw new AppError("VALIDATION", "Template deletion is only available for WhatsApp accounts.", { status: 400 });
+      }
+      const template = await getTemplate(db, input.workspaceId, input.templateId);
+      if (!template) throw new AppError("NOT_FOUND", "Template not found.", { status: 404 });
+      return deleteWhatsAppTemplate(
+        {
+          fetchFn: (url, init) => fetch(url, init as RequestInit),
+          graphVersion: process.env.META_GRAPH_VERSION ?? "v26.0",
+          resolveAccessToken: createCatalogTokenResolver(),
+          store: {
+            upsert: async (row) => {
+              const result = await upsertTemplateFromMeta(db, row);
+              return { row: result.row, created: result.created };
+            },
+            remove: (id) => deleteTemplate(db, input.workspaceId, id),
+          },
+        },
+        { workspaceId: input.workspaceId, account, template },
+      );
+    },
+    /**
+     * Instagram automation (IG-1 / IG-2) through the channel adapters.
+     *
+     * The adapters own host selection and auth (Instagram has two Graph
+     * hosts depending on auth mode), so this layer only does the two things
+     * a route must never skip: enforce the workspace boundary and refuse a
+     * channel family that has no such surface.
+     */
+    channelAutomation: (() => {
+      const resolve = (workspaceId: string, accountId: string, allowed: ChannelKey[]) =>
+        resolveAutomationAdapter(defaultGetDatabase(), workspaceId, accountId, allowed, getAdapter);
+      const unsupported = (what: string) =>
+        new AppError("VALIDATION", `${what} are not supported by this channel.`, { status: 400 });
+
+      return {
+        welcomeFlows: {
+          list: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram"]);
+            if (!adapter.welcomeFlows) throw unsupported("Welcome message flows");
+            return adapter.welcomeFlows.list({ account, maxPages: MAX_WELCOME_FLOW_PAGES });
+          },
+          get: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram"]);
+            if (!adapter.welcomeFlows) throw unsupported("Welcome message flows");
+            return adapter.welcomeFlows.get({ account, flowId: input.flowId });
+          },
+          create: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram"]);
+            if (!adapter.welcomeFlows) throw unsupported("Welcome message flows");
+            return adapter.welcomeFlows.create({ account, name: input.name, flow: input.flow });
+          },
+          update: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram"]);
+            if (!adapter.welcomeFlows) throw unsupported("Welcome message flows");
+            return adapter.welcomeFlows.update({
+              account, flowId: input.flowId, name: input.name, flow: input.flow,
+            });
+          },
+          remove: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram"]);
+            if (!adapter.welcomeFlows) throw unsupported("Welcome message flows");
+            await adapter.welcomeFlows.remove({ account, flowId: input.flowId });
+          },
+        },
+        profile: {
+          get: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram", "messenger"]);
+            if (!adapter.messengerProfile) throw unsupported("Messaging profile settings");
+            return adapter.messengerProfile.get({ account, fields: input.fields });
+          },
+          set: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram", "messenger"]);
+            if (!adapter.messengerProfile) throw unsupported("Messaging profile settings");
+            await adapter.messengerProfile.set({ account, profile: input.profile });
+          },
+          remove: async (input) => {
+            const { account, adapter } = await resolve(input.workspaceId, input.accountId, ["instagram", "messenger"]);
+            if (!adapter.messengerProfile) throw unsupported("Messaging profile settings");
+            await adapter.messengerProfile.remove({ account, fields: input.fields });
+          },
+        },
+      };
+    })(),
     getAiProvider: () => createAIProviderFromEnv(process.env),
     adminStore: new DbAdminStore(defaultGetDatabase),
     platformSettings: new PlatformSettingsService(
@@ -3037,6 +3231,13 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
               templateId: z.string().optional(),
               /** Rich block (buttons/list/carousel/product/catalog) for free-form replies. */
               rich: richBlockSchema.optional(),
+              /**
+               * Quote this message of the SAME conversation (WA-2). The
+               * local message id resolves to the provider id server-side;
+               * the provider renders the quote natively (WhatsApp context,
+               * Messenger/Instagram reply_to).
+               */
+              replyToMessageId: z.string().optional(),
             }),
           },
         },
@@ -3141,8 +3342,28 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       }
     }
 
-    const idempotencyKey = `reply:${id}:${crypto.randomUUID()}`;
-    const message = await createMessage(db, {
+    // Quoted reply (WA-2): resolve the LOCAL message id to the provider id
+    // server-side, so the composer never invents a wamid/mid and a quote
+    // can only point at a message of this very thread. A message that
+    // never reached the provider (still queued, or failed) has no external
+    // id - quoting it is a typed 400 rather than a silently dropped quote.
+    let replyToExternalId: string | undefined;
+    if (body.replyToMessageId) {
+      const quoted = await getMessage(db, id, body.replyToMessageId);
+      if (!quoted) {
+        throw new AppError("NOT_FOUND", "The quoted message is not part of this conversation.", { status: 404 });
+      }
+      if (!quoted.externalId) {
+        throw new AppError(
+          "VALIDATION",
+          "The quoted message has no provider id (it never reached the channel), so it cannot be quoted.",
+          { status: 400 },
+        );
+      }
+      replyToExternalId = quoted.externalId;
+    }
+
+    const idempotencyKey = `reply:${id}:${crypto.randomUUID()}`;    const message = await createMessage(db, {
       conversationId: id,
       direction: "out",
       type: body.kind === "template" ? "template" : body.rich ? "rich" : "text",
@@ -3179,6 +3400,7 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         // conversation id learned from inbound events; the adapter
         // refuses typed when it is missing rather than guessing.
         conversationExternalId: conversation.externalId ?? undefined,
+        replyToExternalId,
         idempotencyKey,
       });
       await updateMessageStatus(db, message.id, "sent", result.externalMessageId);
@@ -3208,6 +3430,117 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
       await updateMessageStatus(db, message.id, "failed").catch(() => undefined);
       if (err instanceof AppError) throw err;
       throw new AppError("PROVIDER_ERROR", `Provider send failed: ${err instanceof Error ? err.message : String(err)}`, { status: 502 });
+    }
+  });
+
+  /**
+   * Presence: mark the thread READ on the provider (WhatsApp blue ticks,
+   * Messenger/Instagram "seen"). Presence is cosmetic, so this endpoint is
+   * BEST-EFFORT by design: a provider refusal answers 200 with
+   * `{ read: false, reason }` instead of failing an agent's action. The
+   * adapter still throws for programming errors (missing id), which are
+   * answered as typed 400s.
+   */
+  const markConversationReadRoute = createRoute({
+    method: "post", path: "/conversations/{id}/read",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Read receipt attempted" } },
+  });
+  app.openapi(markConversationReadRoute, async (c) => {
+    requireRole(c.get("auth"), ROLES);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    const account = await getChannelAccount(db, ws, conversation.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+
+    // Webchat has no provider-side presence at all - the widget sees the
+    // thread live, so there is nothing to acknowledge.
+    if (conversation.channel === "webchat") {
+      return c.json({ read: false, reason: "unsupported_channel" });
+    }
+    const adapter = getAdapter(conversation.channel as ChannelKey);
+    if (!adapter.markRead) {
+      // Channels without a read surface (Telegram/email/webchat/TikTok
+      // today) answer honestly instead of pretending.
+      return c.json({ read: false, reason: "unsupported_channel" });
+    }
+    // WhatsApp needs the inbound wamid; Meta messaging needs the PSID and
+    // ignores the message id. Both travel - the adapter picks.
+    const rows = await listMessages(db, id);
+    const lastInbound = [...rows].reverse().find((m) => m.direction === "in" && m.externalId);
+    try {
+      await adapter.markRead({
+        account: {
+          id: account.id,
+          externalId: account.externalId,
+          tokenVaultRef: account.tokenVaultRef ?? undefined,
+        },
+        contactExternalId: conversation.contactExternalId,
+        ...(lastInbound?.externalId ? { messageExternalId: lastInbound.externalId } : {}),
+      });
+      return c.json({ read: true });
+    } catch (err) {
+      if (err instanceof AppError && err.code === "VALIDATION") throw err;
+      return c.json({
+        read: false,
+        reason: "provider_error",
+        detail: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  /**
+   * Presence: typing indicator. Same best-effort contract as /read - a
+   * failed indicator must never block or error the composer.
+   */
+  const typingRoute = createRoute({
+    method: "post", path: "/conversations/{id}/typing",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": { schema: z.object({ on: z.boolean().default(true) }) },
+        },
+      },
+    },
+    responses: { 200: { description: "Typing indicator attempted" } },
+  });
+  app.openapi(typingRoute, async (c) => {
+    requireRole(c.get("auth"), ROLES);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const { on } = c.req.valid("json");
+    const conversation = await getConversation(db, ws, id);
+    if (!conversation) throw new AppError("NOT_FOUND", "Conversation not found.", { status: 404 });
+    const account = await getChannelAccount(db, ws, conversation.channelAccountId);
+    if (!account) throw new AppError("NOT_FOUND", "Channel account not found.", { status: 404 });
+
+    if (conversation.channel === "webchat") {
+      return c.json({ typing: false, reason: "unsupported_channel" });
+    }
+    const adapter = getAdapter(conversation.channel as ChannelKey);
+    if (!adapter.typing) return c.json({ typing: false, reason: "unsupported_channel" });
+    try {
+      await adapter.typing({
+        account: {
+          id: account.id,
+          externalId: account.externalId,
+          tokenVaultRef: account.tokenVaultRef ?? undefined,
+        },
+        toExternalId: conversation.contactExternalId,
+        on,
+      });
+      return c.json({ typing: true });
+    } catch (err) {
+      return c.json({
+        typing: false,
+        reason: "provider_error",
+        detail: err instanceof Error ? err.message : String(err),
+      });
     }
   });
 
@@ -4340,6 +4673,109 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     return c.json({ template: { ...row, createdAt: iso(row.createdAt) } }, 201);
   });
 
+  /**
+   * Template sync (WA-4): mirror the WABA's REAL templates (name,
+   * language, approval status, category) from Meta into the local table.
+   * Without it the panel only knows what an operator typed by hand, so a
+   * broadcast can be built on a template that was never approved.
+   * Local rows Meta no longer returns are kept (an old broadcast may still
+   * reference them) - deletion stays explicit.
+   */
+  const syncTemplatesRoute = createRoute({
+    method: "post", path: "/templates/sync",
+    request: {
+      body: {
+        content: {
+          "application/json": { schema: z.object({ channelAccountId: z.string().min(1) }) },
+        },
+      },
+    },
+    responses: { 200: { description: "Template sync result" } },
+  });
+  app.openapi(syncTemplatesRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { channelAccountId } = c.req.valid("json");
+    const result = await deps.templateSync({ workspaceId: ws, accountId: channelAccountId });
+    return c.json(result);
+  });
+
+  /**
+   * Template submission (WA-4 write path). The component tree is validated
+   * here the way Meta will judge it (one BODY, sequential `{{n}}`
+   * placeholders, per-type button ceilings) and then POSTed; the mirrored
+   * status is Meta's answer, usually `pending`, NEVER assumed approved.
+   * A template only becomes sendable once a sync (or the review webhook)
+   * reports `approved`.
+   */
+  const submitTemplateRoute = createRoute({
+    method: "post", path: "/templates/submit",
+    request: {
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              channelAccountId: z.string().min(1),
+              name: z.string().min(1),
+              language: z.string().min(2).default("en"),
+              category: z.enum(["marketing", "utility", "authentication"]),
+              /** HEADER / BODY / FOOTER / BUTTONS, as Meta defines them. */
+              components: z.array(z.record(z.unknown())).min(1),
+              allowCategoryChange: z.boolean().optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 201: { description: "Template submitted to Meta" } },
+  });
+  app.openapi(submitTemplateRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const body = c.req.valid("json");
+    // Fail on the component tree before touching the provider: Meta's own
+    // rejection would cost a review round-trip for a mistake we can see.
+    validateTemplateComponents(body.components);
+    const result = await deps.templateSubmit({
+      workspaceId: ws,
+      accountId: body.channelAccountId,
+      name: body.name,
+      language: body.language,
+      category: body.category,
+      components: body.components,
+      ...(body.allowCategoryChange ? { allowCategoryChange: true } : {}),
+    });
+    return c.json({
+      template: { ...result.template, createdAt: iso(result.template.createdAt) },
+      wabaId: result.wabaId,
+      created: result.created,
+    }, 201);
+  });
+
+  /**
+   * Delete a template: Meta first, local row second (see
+   * `deleteWhatsAppTemplate` for why the order is not negotiable).
+   */
+  const deleteTemplateRoute = createRoute({
+    method: "delete", path: "/templates/{id}",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Template deleted" } },
+  });
+  app.openapi(deleteTemplateRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const db = deps.getDatabase();
+    const { id } = c.req.valid("param");
+    const template = await getTemplate(db, ws, id);
+    if (!template) throw new AppError("NOT_FOUND", "Template not found.", { status: 404 });
+    const result = await deps.templateDelete({
+      workspaceId: ws,
+      accountId: template.channelAccountId,
+      templateId: id,
+    });
+    return c.json({ deleted: result.deleted, wabaId: result.wabaId });
+  });
+
   const patchTemplateCategoryRoute = createRoute({
     method: "patch", path: "/templates/{id}/category",
     request: {
@@ -4420,6 +4856,35 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
     if (body.templateId) {
       const template = await getTemplate(db, ws, body.templateId);
       if (!template) throw new AppError("NOT_FOUND", "Template not found.", { status: 404 });
+
+      // Pre-send approval gate (WA-4). Meta only DELIVERS approved
+      // templates; queueing a broadcast on a pending/rejected one burns a
+      // whole fan-out into provider errors. An empty status means the row
+      // predates the mirror (the column is NOT NULL with an 'approved'
+      // default in Postgres), so it stays allowed.
+      const templateStatus = (template.status ?? "").toLowerCase();
+      if (templateStatus && templateStatus !== "approved") {
+        throw new AppError(
+          "VALIDATION",
+          `Template "${template.name}" is ${templateStatus}, not approved: Meta only delivers approved templates. Sync the account once Meta approves it, then send.`,
+          { status: 400 },
+        );
+      }
+
+      // Parameter-count gate (P2-3): a body with {{1}}..{{n}} needs exactly
+      // n values. Sending fewer fails per-recipient at the provider; sending
+      // more is rejected outright. Unknown component tree (hand-registered)
+      // is not enforced.
+      const expectedParams = templateBodyParamCount(template.components);
+      const suppliedParams = body.templateParams?.length ?? 0;
+      if (expectedParams !== null && suppliedParams !== expectedParams) {
+        throw new AppError(
+          "VALIDATION",
+          `Template "${template.name}" has ${expectedParams} body parameter(s) but ${suppliedParams} were supplied.`,
+          { status: 400 },
+        );
+      }
+
       const cat = (template.latestCategory ?? template.category ?? "utility").toLowerCase();
       if (cat === "marketing" || cat === "utility" || cat === "authentication" || cat === "service") {
         category = cat;
@@ -5062,6 +5527,176 @@ export function createApp(deps: ApiDeps = defaultDeps()) {
         updatedAt: iso(r.updatedAt),
       })),
     });
+  });
+
+  // ------------------------------ Instagram automation (IG-1 / IG-2)
+  /**
+   * Welcome message flows: the automated FIRST reply to a brand-new DM
+   * thread, stored on the provider (Meta's own automation, not Botara's
+   * flow engine - a flow here runs before any conversation exists).
+   *
+   * The provider shape is `[{ message: { text, quick_replies? } }]`; the
+   * validators in `channel-automation.ts` encode Meta's limits so the
+   * operator sees the exact cap instead of "invalid parameter".
+   */
+  const listWelcomeFlowsRoute = createRoute({
+    method: "get", path: "/channels/{id}/welcome-flows",
+    request: { params: z.object({ id: z.string() }) },
+    responses: { 200: { description: "Welcome message flows of the account" } },
+  });
+  app.openapi(listWelcomeFlowsRoute, async (c) => {
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const flows = await deps.channelAutomation.welcomeFlows.list({ workspaceId: ws, accountId: id });
+    return c.json({ flows });
+  });
+
+  const getWelcomeFlowRoute = createRoute({
+    method: "get", path: "/channels/{id}/welcome-flows/{flowId}",
+    request: { params: z.object({ id: z.string(), flowId: z.string() }) },
+    responses: { 200: { description: "One welcome message flow" } },
+  });
+  app.openapi(getWelcomeFlowRoute, async (c) => {
+    const ws = workspaceId(c);
+    const { id, flowId } = c.req.valid("param");
+    const flow = await deps.channelAutomation.welcomeFlows.get({ workspaceId: ws, accountId: id, flowId });
+    if (!flow) throw new AppError("NOT_FOUND", "Welcome flow not found.", { status: 404 });
+    return c.json({ flow });
+  });
+
+  const welcomeFlowBodySchema = z.object({
+    name: z.string().min(1),
+    flow: z.array(z.record(z.unknown())).min(1),
+  });
+
+  const createWelcomeFlowRoute = createRoute({
+    method: "post", path: "/channels/{id}/welcome-flows",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: { content: { "application/json": { schema: welcomeFlowBodySchema } } },
+    },
+    responses: { 201: { description: "Welcome flow created" } },
+  });
+  app.openapi(createWelcomeFlowRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const result = await deps.channelAutomation.welcomeFlows.create({
+      workspaceId: ws,
+      accountId: id,
+      name: validateFlowName(body.name),
+      flow: validateWelcomeFlow(body.flow),
+    });
+    return c.json({ id: result.id }, 201);
+  });
+
+  const updateWelcomeFlowRoute = createRoute({
+    method: "patch", path: "/channels/{id}/welcome-flows/{flowId}",
+    request: {
+      params: z.object({ id: z.string(), flowId: z.string() }),
+      body: { content: { "application/json": { schema: welcomeFlowBodySchema } } },
+    },
+    responses: { 200: { description: "Welcome flow updated" } },
+  });
+  app.openapi(updateWelcomeFlowRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id, flowId } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const result = await deps.channelAutomation.welcomeFlows.update({
+      workspaceId: ws,
+      accountId: id,
+      flowId,
+      name: validateFlowName(body.name),
+      flow: validateWelcomeFlow(body.flow),
+    });
+    return c.json({ id: result.id });
+  });
+
+  const deleteWelcomeFlowRoute = createRoute({
+    method: "delete", path: "/channels/{id}/welcome-flows/{flowId}",
+    request: { params: z.object({ id: z.string(), flowId: z.string() }) },
+    responses: { 200: { description: "Welcome flow deleted" } },
+  });
+  app.openapi(deleteWelcomeFlowRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id, flowId } = c.req.valid("param");
+    await deps.channelAutomation.welcomeFlows.remove({ workspaceId: ws, accountId: id, flowId });
+    return c.json({ deleted: true });
+  });
+
+  /**
+   * Messaging profile (IG-2): persistent menu, ice breakers, Get Started.
+   * `PUT` replaces only the fields it is given - `messenger_profile` is a
+   * per-field upsert, so a menu-only write must not wipe the ice breakers.
+   */
+  const getProfileRoute = createRoute({
+    method: "get", path: "/channels/{id}/messenger-profile",
+    request: {
+      params: z.object({ id: z.string() }),
+      query: z.object({ fields: z.string().optional() }),
+    },
+    responses: { 200: { description: "Messaging profile fields" } },
+  });
+  app.openapi(getProfileRoute, async (c) => {
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const { fields } = c.req.valid("query");
+    const wanted = fields ? validateProfileFields(fields.split(",").map((f) => f.trim())) : [...PROFILE_FIELDS];
+    const profile = await deps.channelAutomation.profile.get({ workspaceId: ws, accountId: id, fields: wanted });
+    return c.json({ fields: wanted, profile });
+  });
+
+  const putProfileRoute = createRoute({
+    method: "put", path: "/channels/{id}/messenger-profile",
+    request: {
+      params: z.object({ id: z.string() }),
+      body: {
+        content: {
+          "application/json": {
+            schema: z.object({
+              persistentMenu: z.object({
+                items: z.array(z.record(z.unknown())).min(1),
+                locale: z.string().optional(),
+                composerInputDisabled: z.boolean().optional(),
+              }).optional(),
+              iceBreakers: z.array(z.record(z.unknown())).min(1).optional(),
+              getStarted: z.string().min(1).optional(),
+            }),
+          },
+        },
+      },
+    },
+    responses: { 200: { description: "Messaging profile updated" } },
+  });
+  app.openapi(putProfileRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const body = c.req.valid("json");
+    const profile = validateProfileInput(body);
+    await deps.channelAutomation.profile.set({ workspaceId: ws, accountId: id, profile });
+    return c.json({ updated: true });
+  });
+
+  const deleteProfileFieldsRoute = createRoute({
+    method: "delete", path: "/channels/{id}/messenger-profile",
+    request: {
+      params: z.object({ id: z.string() }),
+      query: z.object({ fields: z.string().min(1) }),
+    },
+    responses: { 200: { description: "Profile fields removed" } },
+  });
+  app.openapi(deleteProfileFieldsRoute, async (c) => {
+    guardMutator(c);
+    const ws = workspaceId(c);
+    const { id } = c.req.valid("param");
+    const { fields } = c.req.valid("query");
+    const wanted = validateProfileFields(fields.split(",").map((f) => f.trim()));
+    await deps.channelAutomation.profile.remove({ workspaceId: ws, accountId: id, fields: wanted });
+    return c.json({ deleted: true, fields: wanted });
   });
 
   // ------------------------------------- channel connect flows (Fase 4)

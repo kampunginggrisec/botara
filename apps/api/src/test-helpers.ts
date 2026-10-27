@@ -33,6 +33,29 @@ export function testDeps(overrides: Partial<ApiDeps> = {}): ApiDeps {
     catalogSync: async () => {
       throw new AppError("CONFIGURATION", "catalog sync not configured (test).", { status: 503 });
     },
+    templateSync: async () => {
+      throw new AppError("CONFIGURATION", "template sync not configured (test).", { status: 503 });
+    },
+    templateSubmit: async () => {
+      throw new AppError("CONFIGURATION", "template submit not configured (test).", { status: 503 });
+    },
+    templateDelete: async () => {
+      throw new AppError("CONFIGURATION", "template delete not configured (test).", { status: 503 });
+    },
+    channelAutomation: {
+      welcomeFlows: {
+        async list() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async get() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async create() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async update() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async remove() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+      },
+      profile: {
+        async get() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async set() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+        async remove() { throw new AppError("CONFIGURATION", "channel automation not configured (test).", { status: 503 }); },
+      },
+    },
     getAiProvider: () => null,
     authStore: new InMemoryAuthStore(),
     emailInboundEnqueuer: { async enqueueEmailInbound() {} },

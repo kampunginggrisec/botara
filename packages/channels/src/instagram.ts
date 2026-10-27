@@ -4,7 +4,7 @@ import { evaluateLongLivedRefresh } from "./token-lifecycle";
 import {
   CHANNEL_CAPABILITIES, type AdapterHealth, type ChannelAccountRef, type ChannelAdapter,
   type CredentialProvider, type FetchLike, type InboundEvent, type MessageMedia,
-  type PublishInput, type SendInput, type SendResult,
+  type PublishInput, type SendInput, type SendResult, type WelcomeMessageFlow,
 } from "./types";
 import { richToPlainText, type RichBlock, type RichWarning } from "./rich";
 
@@ -331,6 +331,7 @@ export class InstagramAdapter implements ChannelAdapter {
     } else {
       throw new AppError("VALIDATION", "instagram.send requires text or media with a public link");
     }
+    if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", `${igUserId}/messages`, {
       recipient: { id: input.toExternalId },
       message,
@@ -396,6 +397,7 @@ export class InstagramAdapter implements ChannelAdapter {
       warnings.push("RICH_DEGRADED_TO_TEXT");
       message = { text: richToPlainText(rich) };
     }
+    if (input.replyToExternalId) message.reply_to = { mid: input.replyToExternalId };
     const json = await this.graph(input.account, "POST", `${igUserId}/messages`, {
       recipient: { id: input.toExternalId },
       message,
@@ -405,6 +407,39 @@ export class InstagramAdapter implements ChannelAdapter {
       throw new ProviderApiError("Instagram send returned no message id", { provider: "instagram", retryable: false });
     }
     return { externalMessageId: messageId, status: "sent", ...(warnings.length > 0 ? { warnings } : {}) };
+  }
+
+  // --- presence (read receipts + typing) ---------------------------------------
+
+  /**
+   * Instagram messaging rides the Messenger Platform surface, so
+   * presence is a sender action on the Send API endpoint rather than a
+   * separate resource. `mark_seen` marks the thread, not one message.
+   */
+  private async senderAction(
+    account: ChannelAccountRef,
+    igsid: string,
+    action: "mark_seen" | "typing_on" | "typing_off",
+  ): Promise<void> {
+    await this.graph(account, "POST", `${account.externalId}/messages`, {
+      recipient: { id: igsid },
+      sender_action: action,
+    });
+  }
+
+  async markRead(input: {
+    account: ChannelAccountRef;
+    contactExternalId: string;
+    messageExternalId?: string;
+  }): Promise<void> {
+    if (!input.contactExternalId) {
+      throw new AppError("VALIDATION", "instagram.markRead requires the customer IGSID (contactExternalId).");
+    }
+    await this.senderAction(input.account, input.contactExternalId, "mark_seen");
+  }
+
+  async typing(input: { account: ChannelAccountRef; toExternalId: string; on: boolean }): Promise<void> {
+    await this.senderAction(input.account, input.toExternalId, input.on ? "typing_on" : "typing_off");
   }
 
   /**
@@ -422,6 +457,126 @@ export class InstagramAdapter implements ChannelAdapter {
     });
     return { externalMessageId: String(json.message_id ?? "") };
   }
+
+  // --- welcome message flows (IG-1) ------------------------------------------
+
+  /**
+   * Welcome message flows: the automated first reply to a brand-new DM
+   * thread, stored on the provider (not in Botara's flow engine). A flow is
+   * a named array of `{ message: { text, quick_replies? } }`.
+   *
+   * Listing is bounded (100/page, 5 pages): a big ad account can hold many
+   * flows and this feeds a panel dropdown, not a data export.
+   */
+  readonly welcomeFlows: NonNullable<ChannelAdapter["welcomeFlows"]> = {
+    list: async ({ account, limit, maxPages }) => {
+      const pageSize = limit ?? 100;
+      const pages = maxPages ?? 5;
+      const out: WelcomeMessageFlow[] = [];
+      let after: string | undefined;
+      for (let page = 0; page < pages; page++) {
+        const query = new URLSearchParams({ limit: String(pageSize) });
+        if (after) query.set("after", after);
+        const json = await this.graph(
+          account, "GET", `${account.externalId}/welcome_message_flows?${query.toString()}`,
+        );
+        for (const row of (json.data as Array<Record<string, unknown>> | undefined) ?? []) {
+          const normalized = normalizeWelcomeFlow(row);
+          if (normalized) out.push(normalized);
+        }
+        const nextAfter = (json.paging as { cursors?: { after?: string } } | undefined)?.cursors?.after;
+        if (!nextAfter) break;
+        after = nextAfter;
+      }
+      return out;
+    },
+
+    /**
+     * One flow by id. The provider answers with the same `data` envelope as
+     * the list (a filter, not a resource read), so an unknown id is an
+     * empty list - normalized to null rather than an exception.
+     */
+    get: async ({ account, flowId }) => {
+      const json = await this.graph(
+        account, "GET",
+        `${account.externalId}/welcome_message_flows?${new URLSearchParams({ flow_id: flowId }).toString()}`,
+      );
+      const first = ((json.data as Array<Record<string, unknown>> | undefined) ?? [])[0];
+      return first ? normalizeWelcomeFlow(first) : null;
+    },
+
+    create: async ({ account, name, flow }) => {
+      const json = await this.graph(account, "POST", `${account.externalId}/welcome_message_flows`, {
+        name,
+        // Meta stores the flow as a JSON STRING; sending the array directly
+        // is accepted by some versions and silently stringified by others.
+        welcome_message_flow: JSON.stringify(flow),
+      });
+      const id = String(json.id ?? "");
+      if (!id) throw new ProviderApiError("Instagram welcome flow create returned no id", { provider: "instagram", retryable: false });
+      return { id };
+    },
+
+    update: async ({ account, flowId, name, flow }) => {
+      const json = await this.graph(
+        account, "POST",
+        `${account.externalId}/welcome_message_flows?${new URLSearchParams({ flow_id: flowId }).toString()}`,
+        { name, welcome_message_flow: JSON.stringify(flow) },
+      );
+      return { id: String(json.id ?? flowId) };
+    },
+
+    remove: async ({ account, flowId }) => {
+      await this.graph(
+        account, "DELETE",
+        `${account.externalId}/welcome_message_flows?${new URLSearchParams({ flow_id: flowId }).toString()}`,
+      );
+    },
+  };
+
+  // --- messaging profile (IG-2) ----------------------------------------------
+
+  /**
+   * Persistent menu + ice breakers. The endpoint is the Messenger Platform
+   * `messenger_profile`, addressed by the IG user id and tagged
+   * `platform: "instagram"` - without that tag the same call would be
+   * applied to a linked Page profile instead.
+   */
+  readonly messengerProfile: NonNullable<ChannelAdapter["messengerProfile"]> = {
+    get: async ({ account, fields }) => {
+      const query = new URLSearchParams({ fields: fields.join(",") });
+      return this.graph(account, "GET", `${account.externalId}/messenger_profile?${query.toString()}`);
+    },
+
+    set: async ({ account, profile }) => {
+      const body: Record<string, unknown> = { platform: "instagram" };
+      if (profile.persistentMenu) {
+        body.persistent_menu = [{
+          locale: profile.persistentMenu.locale ?? "default",
+          composer_input_disabled: profile.persistentMenu.composerInputDisabled ?? false,
+          call_to_actions: profile.persistentMenu.items,
+        }];
+      }
+      if (profile.iceBreakers) {
+        body.ice_breakers = profile.iceBreakers;
+      }
+      if (profile.getStarted) {
+        body.get_started = { payload: profile.getStarted };
+      }
+      await this.graph(account, "POST", `${account.externalId}/messenger_profile`, body);
+    },
+
+    /**
+     * Delete only the named fields. The provider takes `fields` as a
+     * JSON-ish list, so each name is quoted; sending a bare comma list
+     * deletes nothing and answers success, which is worse than an error.
+     */
+    remove: async ({ account, fields }) => {
+      const query = new URLSearchParams({ fields: JSON.stringify(fields) });
+      await this.graph(account, "DELETE", `${account.externalId}/messenger_profile?${query.toString()}`);
+    },
+  };
+
 
   async moderate(input: {
     account: ChannelAccountRef;
@@ -601,4 +756,35 @@ export class InstagramAdapter implements ChannelAdapter {
     }
     return events;
   }
+}
+
+/**
+ * Normalize one provider welcome-flow row.
+ *
+ * `welcome_message_flow` arrives as a JSON STRING (that is how the API
+ * stores it) - parsing is best-effort: a row whose body is unparseable
+ * still lists (so the panel can show and delete it) but exposes an empty
+ * flow rather than crashing the whole list.
+ */
+function normalizeWelcomeFlow(row: Record<string, unknown>): WelcomeMessageFlow | null {
+  const id = String(row.id ?? "");
+  const name = typeof row.name === "string" ? row.name : "";
+  if (!id || !name) return null;
+  const raw = row.welcome_message_flow;
+  let flow: unknown[] = [];
+  if (Array.isArray(raw)) {
+    flow = raw;
+  } else if (typeof raw === "string") {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) flow = parsed;
+    } catch { /* keep the empty flow: the row is still listable and deletable */ }
+  }
+  return {
+    id,
+    name,
+    flow,
+    ...(typeof row.last_update_time === "string" ? { lastUpdateTime: row.last_update_time } : {}),
+    ...(typeof row.is_used_in_ad === "boolean" ? { isUsedInAd: row.is_used_in_ad } : {}),
+  };
 }

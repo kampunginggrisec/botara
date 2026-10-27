@@ -263,6 +263,14 @@ export const savedReplies = pgTable("saved_replies", {
     .where(sql`${t.shortcut} is not null`),
 ]);
 
+/**
+ * One entry of a WhatsApp template's component tree. Deliberately loose:
+ * Meta adds component fields faster than this repo can type them, and the
+ * value is stored/sent verbatim (the API validates the shape it accepts
+ * before it ever reaches the column).
+ */
+export type TemplateComponentRow = Record<string, unknown>;
+
 export const templates = pgTable("templates", {
   id: uuid("id").primaryKey().defaultRandom(),
   workspaceId: uuid("workspace_id").notNull().references(() => workspaces.id),
@@ -284,6 +292,15 @@ export const templates = pgTable("templates", {
    */
   messagingAccountId: varchar("messaging_account_id", { length: 200 }),
   status: varchar("status", { length: 40 }).notNull().default("draft"),
+  /**
+   * Provider component tree (HEADER / BODY / FOOTER / BUTTONS) exactly as
+   * submitted to Meta. Null for hand-registered templates and for rows
+   * mirrored before the composer existed. The Broadcast composer and the
+   * pre-send parameter-count check both read it.
+   */
+  components: jsonb("components").$type<TemplateComponentRow[]>(),
+  /** Meta's `rejected_reason`, surfaced next to the status in the panel. */
+  rejectedReason: varchar("rejected_reason", { length: 200 }),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

@@ -59,9 +59,9 @@ describe("outbound webhook emitter", () => {
     expect(delivery.endpointId).toBe(mine);
     expect(delivery.workspaceId).toBe("ws-1");
     expect(delivery.status).toBe("pending");
-    expect(enqueued).toEqual([delivery.id]);
+    expect(enqueued).toEqual([String(delivery.id)]);
     const payload = delivery.payload as { id: string; type: string; workspaceId: string; data: { preview: string } };
-    expect(payload.id).toBe(delivery.id);
+    expect(payload.id).toBe(String(delivery.id));
     expect(payload.type).toBe("message.received");
     expect(payload.workspaceId).toBe("ws-1");
     expect(payload.data.preview).toBe("halo");
@@ -166,18 +166,25 @@ describe("dispatcher webhook emission", () => {
     // event won the insert race and createConversation returned THAT
     // thread (createdNew=false). The webhook must stay silent about a
     // "creation" that never happened here.
+    // A real UUID: InMemoryDispatchStore infers its id as the
+    // `crypto.randomUUID()` template-literal type, so the override has to
+    // return that shape rather than an arbitrary string.
+    const WINNER_ID = "11111111-1111-4111-8111-111111111111";
+    type CreatedConversation = Awaited<ReturnType<InMemoryDispatchStore["createConversation"]>>;
     class RaceLosingStore extends InMemoryDispatchStore {
-      override async createConversation(input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string }) {
-        const winner = { id: "conv-winner", ...input };
+      override async createConversation(
+        input: { workspaceId: string; channelAccountId: string; contactId: string; externalId?: string },
+      ): Promise<CreatedConversation> {
+        const winner: CreatedConversation = { id: WINNER_ID, ...input, createdNew: false };
         this.conversations.set(winner.id, winner);
-        return { ...winner, createdNew: false };
+        return winner;
       }
     }
     const emitted: Emitted[] = [];
     const { dispatcher } = dispatcherRig(new RaceLosingStore(), emitted);
     await dispatcher.dispatch([igMessage("halo")]);
     expect(emitted.map((e) => e.type)).toEqual(["message.received"]);
-    expect(emitted[0]!.data.conversationId).toBe("conv-winner");
+    expect(emitted[0]!.data.conversationId).toBe(WINNER_ID);
   });
 
   test("an exploding emitter never breaks dispatch", async () => {

@@ -4,6 +4,8 @@ export {
   type PublishInput, type AdapterHealth, type ChannelAdapter, type MessageMedia,
   type MessageAttachment, type MessageStatusError, type MessageReferral, type ChannelSecrets,
   type CredentialProvider, type FetchLike, type RealAdapterOptions,
+  type WelcomeMessageFlow, type WelcomeFlowsCapability,
+  type PersistentMenuItem, type IceBreaker, type MessengerProfileInput, type MessengerProfileCapability,
 } from "./types";
 export {
   richBlockSchema, richButtonSchema, richButtonsBlockSchema, richListBlockSchema,

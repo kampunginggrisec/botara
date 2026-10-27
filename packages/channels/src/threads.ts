@@ -31,6 +31,12 @@ export interface ThreadsAdapterOptions {
   /** API surface version segment under graph.threads.net (Threads uses v1.0). */
   apiVersion?: string;
   host?: string;
+  /**
+   * Carousel container polling bounds: every carousel ITEM must reach
+   * FINISHED before the carousel container is created. Injectable sleep
+   * so tests never wait in real time.
+   */
+  containerPoll?: { attempts?: number; delayMs?: number; sleep?: (ms: number) => Promise<void> };
 }
 
 /** Pure refresh-eligibility decision for a Threads long-lived token. */
@@ -74,12 +80,19 @@ export class ThreadsAdapter implements ChannelAdapter {
   private readonly credentials: CredentialProvider;
   private readonly fetchFn: FetchLike;
   private readonly host: string;
+  private readonly pollAttempts: number;
+  private readonly pollDelayMs: number;
+  private readonly pollSleep: (ms: number) => Promise<void>;
 
   constructor(options: ThreadsAdapterOptions) {
     this.credentials = options.credentials;
     this.fetchFn = options.fetchFn ?? ((input, init) => fetch(input, init));
     this.apiVersion = options.apiVersion ?? "v1.0";
     this.host = (options.host ?? "https://graph.threads.net").replace(/\/$/, "");
+    this.pollAttempts = options.containerPoll?.attempts ?? 10;
+    this.pollDelayMs = options.containerPoll?.delayMs ?? 3000;
+    this.pollSleep = options.containerPoll?.sleep
+      ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   }
 
   private base(): string {
@@ -263,10 +276,49 @@ export class ThreadsAdapter implements ChannelAdapter {
 
   async publish(input: PublishInput): Promise<{ externalPostId: string }> {
     const userId = input.account.externalId;
-    const mediaUrl = input.mediaUrls?.[0];
+    const mediaUrls = input.mediaUrls ?? [];
+    const mediaUrl = mediaUrls[0];
     const isVideo = mediaUrl
       ? input.mediaType === "video" || /\.(mp4|mov)(\?|$)/i.test(mediaUrl)
       : false;
+
+    // Carousel: 2+ media items. Each item is its own container flagged
+    // is_carousel_item and MUST be FINISHED before the carousel container
+    // references it, so items are polled (bounded) first.
+    if (mediaUrls.length > 1) {
+      if (input.replyToExternalId) {
+        throw new AppError(
+          "VALIDATION",
+          "threads.publish: a carousel cannot be published as a reply in one call - publish it as a post and reply separately",
+        );
+      }
+      const children: string[] = [];
+      for (const url of mediaUrls) {
+        const itemIsVideo = input.mediaType === "video" || /\.(mp4|mov)(\?|$)/i.test(url);
+        const item = await this.graph(input.account, "POST", `${userId}/threads`, {
+          media_type: itemIsVideo ? "VIDEO" : "IMAGE",
+          ...(itemIsVideo ? { video_url: url } : { image_url: url }),
+          is_carousel_item: true,
+        });
+        const itemId = item.id as string | undefined;
+        if (!itemId) {
+          throw new ProviderApiError("Threads carousel item returned no id", { provider: "threads", retryable: false });
+        }
+        await this.waitForContainerFinished(input.account, itemId);
+        children.push(itemId);
+      }
+      const carousel = await this.graph(input.account, "POST", `${userId}/threads`, {
+        media_type: "CAROUSEL",
+        children: children.join(","),
+        ...(input.text ? { text: input.text } : {}),
+        ...(input.quoteExternalId ? { quote_post_id: input.quoteExternalId } : {}),
+      });
+      const carouselId = carousel.id as string | undefined;
+      if (!carouselId) {
+        throw new ProviderApiError("Threads carousel container returned no id", { provider: "threads", retryable: false });
+      }
+      return this.publishContainer(input.account, carouselId);
+    }
 
     // One-step fast path: a plain text post (no media, no reply, no quote)
     // can publish directly from container creation with auto_publish_text.
@@ -297,7 +349,15 @@ export class ThreadsAdapter implements ChannelAdapter {
     if (!creationId) {
       throw new ProviderApiError("Threads container creation returned no id", { provider: "threads", retryable: false });
     }
-    const published = await this.graph(input.account, "POST", `${userId}/threads_publish`, {
+    return this.publishContainer(input.account, creationId);
+  }
+
+  /** Step 2 of every container flow: threads_publish an existing container. */
+  private async publishContainer(
+    account: ChannelAccountRef,
+    creationId: string,
+  ): Promise<{ externalPostId: string }> {
+    const published = await this.graph(account, "POST", `${account.externalId}/threads_publish`, {
       creation_id: creationId,
     });
     const postId = published.id as string | undefined;
@@ -305,6 +365,30 @@ export class ThreadsAdapter implements ChannelAdapter {
       throw new ProviderApiError("Threads threads_publish returned no id", { provider: "threads", retryable: false });
     }
     return { externalPostId: postId };
+  }
+
+  /**
+   * Poll a container until FINISHED (carousel items must be ready before
+   * the carousel container is created). ERROR/EXPIRED fail non-retryably;
+   * exhausting the attempts fails retryably so the worker can requeue.
+   */
+  async waitForContainerFinished(account: ChannelAccountRef, containerId: string): Promise<void> {
+    for (let attempt = 1; attempt <= this.pollAttempts; attempt++) {
+      const json = await this.graph(account, "GET", `${containerId}?fields=status,error_message`);
+      const status = typeof json.status === "string" ? json.status : "UNKNOWN";
+      if (status === "FINISHED" || status === "PUBLISHED") return;
+      if (status === "ERROR" || status === "EXPIRED") {
+        throw new ProviderApiError(
+          `Threads container ${containerId} failed processing (status ${status})`,
+          { provider: "threads", retryable: false },
+        );
+      }
+      if (attempt < this.pollAttempts) await this.pollSleep(this.pollDelayMs);
+    }
+    throw new ProviderApiError(
+      `Threads container ${containerId} was not FINISHED after ${this.pollAttempts} status checks`,
+      { provider: "threads", retryable: true },
+    );
   }
 
   // --- moderation --------------------------------------------------------------------------------
