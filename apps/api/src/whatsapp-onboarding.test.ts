@@ -6,13 +6,13 @@ import {
 
 const BUSINESS_TOKEN = ["EAA", "business", "token", "xyz"].join("-");
 
-interface RecordedCall { url: string }
+interface RecordedCall { url: string; init?: RequestInit }
 
 function mockGraph() {
   const calls: RecordedCall[] = [];
-  const fetchFn: FetchLike = async (input) => {
+  const fetchFn: FetchLike = async (input, init) => {
     const url = String(input);
-    calls.push({ url });
+    calls.push({ url, init });
     let body: unknown = {};
     if (url.includes("/oauth/access_token")) {
       body = { access_token: BUSINESS_TOKEN, token_type: "bearer" };
@@ -70,6 +70,8 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
       // Best-effort business-profile picture lookup per number.
       "/v26.0/pn-1/whatsapp_business_profile",
       "/v26.0/pn-2/whatsapp_business_profile",
+      // The app is subscribed to the WABA once accounts persist (ES-1).
+      "/v26.0/waba-1/subscribed_apps",
       // Coexistence session: contacts + history sync requested per number.
       "/v26.0/pn-1/smb_app_data",
       "/v26.0/pn-1/smb_app_data",
@@ -205,6 +207,46 @@ describe("embedded signup v4 exchange (mocked Graph)", () => {
     expect(result.syncRequests).toEqual([
       { phoneNumberId: "pn-1", smbAppStateSync: "failed", history: "failed" },
     ]);
+  });
+
+  test("subscribes the app to the WABA with the signup token after accounts persist (ES-1)", async () => {
+    const { deps, calls } = fakeDeps();
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.appSubscription).toBe("subscribed");
+    const sub = calls.find((c) => c.url.includes("/subscribed_apps"));
+    expect(sub).toBeDefined();
+    expect(new URL(sub!.url).pathname).toBe("/v26.0/waba-1/subscribed_apps");
+    expect(sub!.init?.method).toBe("POST");
+    expect((sub!.init?.headers as Record<string, string>).Authorization).toBe(`Bearer ${BUSINESS_TOKEN}`);
+    // Exactly once per WABA, not once per phone number (2 numbers here).
+    expect(calls.filter((c) => c.url.includes("/subscribed_apps"))).toHaveLength(1);
+  });
+
+  test("a failing subscribed_apps call never fails the signup; the outcome is reported (ES-1)", async () => {
+    const base = mockGraph();
+    const fetchFn: FetchLike = async (input, init) => {
+      if (String(input).includes("/subscribed_apps")) {
+        return new Response(JSON.stringify({ error: { message: "no permission", code: 200 } }), { status: 403 });
+      }
+      return base.fetchFn(input, init);
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.appSubscription).toBe("failed");
+    expect(result.accounts).toHaveLength(2);
+    expect(persisted).toHaveLength(2);
+  });
+
+  test("a throwing subscribed_apps call never fails the signup either (ES-1)", async () => {
+    const base = mockGraph();
+    const fetchFn: FetchLike = async (input, init) => {
+      if (String(input).includes("/subscribed_apps")) throw new Error("network down");
+      return base.fetchFn(input, init);
+    };
+    const { deps, persisted } = fakeDeps({ fetchFn });
+    const result = await exchangeEmbeddedSignup(deps, "ws-1", { code: "c" });
+    expect(result.appSubscription).toBe("failed");
+    expect(persisted).toHaveLength(2);
   });
 
   test("missing app credentials -> 503 CONFIGURATION before any HTTP call", async () => {

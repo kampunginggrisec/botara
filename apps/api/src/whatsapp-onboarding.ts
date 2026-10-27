@@ -17,7 +17,12 @@ import {
  *   3. GET /{version}/{wabaId}/phone_numbers    discover the onboarded numbers
  *   4. vault.store(token)                       raw token goes ONLY into the vault
  *   5. persist one channel_accounts row per phone number (vault ref, never the token)
- *   6. coexistence only: POST /{phone}/smb_app_data for both sync types
+ *   6. POST /{version}/{wabaId}/subscribed_apps  subscribe the app to the WABA
+ *      (best-effort, outcome reported in the result; Meta only delivers a
+ *      WABA's webhooks to subscribed apps, so this is a required step -
+ *      the one-off test-number provisioning script had it, the production
+ *      exchange was missing it: ES-1 in the 2026-10-27 Postman audit)
+ *   7. coexistence only: POST /{phone}/smb_app_data for both sync types
  *      (contacts + history) - best-effort, outcomes reported in the result
  *
  * The returned summary contains NO token material - a test asserts this.
@@ -99,6 +104,13 @@ export interface EmbeddedSignupResult {
    * Best-effort - a "failed" outcome never fails the onboarding itself.
    */
   syncRequests?: CoexistenceSyncRequests[];
+  /**
+   * Whether the app was subscribed to the WABA (step 6). Best-effort
+   * like the sync requests: "failed" is reported here, never fatal -
+   * the accounts persist and send fine either way; only inbound
+   * webhooks depend on the subscription having landed.
+   */
+  appSubscription: "subscribed" | "failed";
   // Deliberately NO access token / vault internals in this summary.
 }
 
@@ -297,7 +309,27 @@ export async function exchangeEmbeddedSignup(
     });
   }
 
-  // 6) Coexistence: ask Meta for the phone's contacts and chat history.
+  // 6) Subscribe the app to the WABA (ES-1). An app only receives a
+  // WABA's webhooks once it is subscribed to that WABA; Meta's Embedded
+  // Signup collection lists this under Step 2 "required endpoints".
+  // Without it the number connects and sends but inbound messages never
+  // arrive — the same failure shape as the 2026-10-27 test-number
+  // incident, where only the provisioning script made this call.
+  // Best-effort, mirroring the provision script: the outcome is
+  // reported in the result and a failure never rolls back the signup.
+  let appSubscription: "subscribed" | "failed" = "failed";
+  try {
+    const res = await deps.fetchFn(`${base}/${version}/${wabaId}/subscribed_apps`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    const json = (await res.json().catch(() => ({}))) as GraphJson;
+    if (res.ok && !json.error) appSubscription = "subscribed";
+  } catch {
+    appSubscription = "failed";
+  }
+
+  // 7) Coexistence: ask Meta for the phone's contacts and chat history.
   // Nothing arrives until requested (POST /{phone-number-id}/smb_app_data),
   // Meta only accepts the request shortly after onboarding, and each sync
   // type can be requested once - error 135000 means it was already
@@ -334,5 +366,5 @@ export async function exchangeEmbeddedSignup(
     }
   }
 
-  return { wabaId, isCoexistence, accounts, ...(syncRequests ? { syncRequests } : {}) };
+  return { wabaId, isCoexistence, accounts, appSubscription, ...(syncRequests ? { syncRequests } : {}) };
 }

@@ -223,6 +223,7 @@ describe("api app - Fase 2 routes under Fase 3 auth", () => {
           wabaId: "waba-1",
           isCoexistence: true,
           accounts: [{ phoneNumberId: "pn-1", channelAccountId: "db-1" }],
+          appSubscription: "subscribed",
         };
       },
     }));
