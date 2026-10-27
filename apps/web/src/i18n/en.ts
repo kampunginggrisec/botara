@@ -595,6 +595,8 @@ export const en = {
   "channels.whatsapp.title": "WhatsApp (Embedded Signup)",
   "channels.whatsapp.body": "Connect a WhatsApp Business number with Meta's Embedded Signup v4 - no manual token handling.",
   "channels.whatsapp.button": "Connect WhatsApp",
+  "channels.whatsapp.coexistenceBody": "Already use the WhatsApp Business app on your phone? Connect that same number instead - you keep using the app, and your chats and contacts sync to Botara.",
+  "channels.whatsapp.coexistenceButton": "Connect WhatsApp Business App",
   "channels.whatsapp.notConfigured": "Meta app not configured - set META_APP_ID and WHATSAPP_EMBEDDED_CONFIG_ID on the server first (see docs/app-review/submission-checklist.md).",
   "channels.whatsapp.launchFailed": "Could not launch Embedded Signup.",
   "channels.whatsapp.noCode": "Embedded Signup finished without an authorization code.",

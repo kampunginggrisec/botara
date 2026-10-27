@@ -593,6 +593,8 @@ export const id: Dictionary = {
   "channels.whatsapp.title": "WhatsApp (Embedded Signup)",
   "channels.whatsapp.body": "Hubungkan nomor WhatsApp Business dengan Embedded Signup v4 dari Meta - tanpa menangani token manual.",
   "channels.whatsapp.button": "Hubungkan WhatsApp",
+  "channels.whatsapp.coexistenceBody": "Sudah memakai aplikasi WhatsApp Business di HP? Hubungkan nomor yang sama itu - aplikasi tetap bisa dipakai, dan chat serta kontakmu tersinkron ke Botara.",
+  "channels.whatsapp.coexistenceButton": "Hubungkan Aplikasi WhatsApp Business",
   "channels.whatsapp.notConfigured": "Aplikasi Meta belum dikonfigurasi - atur META_APP_ID dan WHATSAPP_EMBEDDED_CONFIG_ID di server dulu (lihat docs/app-review/submission-checklist.md).",
   "channels.whatsapp.launchFailed": "Gagal membuka Embedded Signup.",
   "channels.whatsapp.noCode": "Embedded Signup selesai tanpa kode otorisasi.",

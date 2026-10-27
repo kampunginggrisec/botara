@@ -4667,7 +4667,7 @@ function ChannelsPage() {
     }
   };
 
-  const launchWhatsApp = async () => {
+  const launchWhatsApp = async (mode: "standard" | "coexistence" = "standard") => {
     if (!config?.metaAppId || !config.whatsappEmbeddedConfigId) return;
     setError(null);
     try {
@@ -4684,7 +4684,10 @@ function ChannelsPage() {
               resolve({
                 phoneNumberId: d.phone_number_id as string | undefined,
                 wabaId: d.waba_id as string | undefined,
-                isCoexistence: Boolean(d.is_coexistence),
+                // Keep "absent" distinct from false: the coexistence finish
+                // event does not always carry the flag, and the launch mode
+                // is the authoritative fallback for it (applied at exchange).
+                isCoexistence: d.is_coexistence === undefined ? undefined : Boolean(d.is_coexistence),
               });
             }
           } catch { /* not a signup message */ }
@@ -4697,7 +4700,12 @@ function ChannelsPage() {
           config_id: config.whatsappEmbeddedConfigId,
           response_type: "code",
           override_default_response_type: true,
-          extras: { setup: {} },
+          // Coexistence launches Meta's WhatsApp Business app onboarding
+          // path: the user connects the number already active in the app
+          // (QR scan in the app) instead of registering a platform number.
+          extras: mode === "coexistence"
+            ? { setup: {}, featureType: "whatsapp_business_app_onboarding", sessionInfoVersion: "3" }
+            : { setup: {} },
         });
       });
       if (!code) {
@@ -4710,7 +4718,13 @@ function ChannelsPage() {
         sessionPromise,
         new Promise<Record<string, never>>((resolve) => setTimeout(() => resolve({}), 1500)),
       ]);
-      await api.exchangeWhatsAppSignup({ code, sessionInfo: session });
+      await api.exchangeWhatsAppSignup({
+        code,
+        sessionInfo: {
+          ...session,
+          isCoexistence: session.isCoexistence ?? (mode === "coexistence" ? true : undefined),
+        },
+      });
       const text = t("channels.whatsapp.exchanged");
       setNotice(text);
       pushToast("ok", text);
@@ -5040,7 +5054,11 @@ function ChannelsPage() {
           <div className="font-medium text-sm">{t("channels.whatsapp.title")}</div>
           <p className={`mt-1 ${mutedCls}`}>{t("channels.whatsapp.body")}</p>
           {config?.metaAppId && config?.whatsappEmbeddedConfigId ? (
-            <button onClick={() => void launchWhatsApp()} className={`mt-3 ${primaryBtn}`}>{t("channels.whatsapp.button")}</button>
+            <>
+              <button onClick={() => void launchWhatsApp()} className={`mt-3 ${primaryBtn}`}>{t("channels.whatsapp.button")}</button>
+              <p className={`mt-4 ${mutedCls}`}>{t("channels.whatsapp.coexistenceBody")}</p>
+              <button onClick={() => void launchWhatsApp("coexistence")} className="mt-3 rounded-md border border-slate-300 text-sm px-4 py-2 disabled:opacity-50 dark:border-slate-700">{t("channels.whatsapp.coexistenceButton")}</button>
+            </>
           ) : (
             <div className="mt-3 rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-200">
               {t("channels.whatsapp.notConfigured")}
